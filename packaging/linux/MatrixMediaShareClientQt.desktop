@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Matrix Media Share Client
+GenericName=Matrix media share and download client
+Comment=Cross-platform Qt client for browsing, sharing, and downloading Matrix and IPFS media
+Exec=MatrixMediaShareClientQt
+Icon=matrix-media-archiver
+Terminal=false
+Categories=Network;Utility;
+StartupNotify=true
