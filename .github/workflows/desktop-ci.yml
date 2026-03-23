@@ -2,25 +2,8 @@ name: Desktop CI
 
 on:
   push:
-    branches:
-      - main
-      - master
     tags:
       - "v*"
-    paths:
-      - ".github/workflows/desktop-ci.yml"
-      - "ARM_BUILD_README.md"
-      - "CMakeLists.txt"
-      - "README.md"
-      - "VERSION.txt"
-      - "backend/**"
-      - "build-linux-arm64.command"
-      - "cmake/**"
-      - "packaging/**"
-      - "scripts/**"
-      - "src/**"
-      - "tests/**"
-  pull_request:
     paths:
       - ".github/workflows/desktop-ci.yml"
       - "ARM_BUILD_README.md"
@@ -228,7 +211,7 @@ jobs:
 
   build-windows-arm64:
     name: Build Windows (arm64)
-    runs-on: windows-11-arm
+    runs-on: windows-2022
     defaults:
       run:
         shell: pwsh
@@ -336,7 +319,7 @@ jobs:
         run: |
           QT_BASE_DIR="${RUNNER_TEMP}/qt"
           python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" mac desktop "${QT_VERSION}" clang_64
-          QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/clang_64"
+          QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/macos"
           echo "QT_ROOT_DIR=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "${QT_ROOT_DIR}/bin" >> "$GITHUB_PATH"
@@ -393,7 +376,7 @@ jobs:
         run: |
           QT_BASE_DIR="${RUNNER_TEMP}/qt"
           python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" mac desktop "${QT_VERSION}" clang_64
-          QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/clang_64"
+          QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/macos"
           echo "QT_ROOT_DIR=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "${QT_ROOT_DIR}/bin" >> "$GITHUB_PATH"

@@ -124,6 +124,7 @@ export APPIMAGE_EXTRACT_AND_RUN=1
 export QMAKE="${QMAKE_BIN}"
 export EXTRA_QT_PLUGINS="sqldrivers"
 export LINUXDEPLOY_OUTPUT_VERSION="${VERSION:-${APP_VERSION}}"
+export LD_LIBRARY_PATH="${QT_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="${QT_PREFIX}"
 cmake --build "${BUILD_DIR}" --config Release
