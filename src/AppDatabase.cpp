@@ -276,6 +276,50 @@ bool AppDatabase::saveSettings(const AppSettings &settings)
     return query.exec();
 }
 
+UpdateCheckState AppDatabase::loadUpdateCheckState() const
+{
+    UpdateCheckState state;
+
+    QSqlQuery query(database_);
+    query.prepare(QStringLiteral(
+        "SELECT last_checked_at, latest_version, latest_release_url, latest_release_name, latest_published_at, last_error "
+        "FROM update_check_state WHERE id = 1"));
+    if (!query.exec() || !query.next()) {
+        return state;
+    }
+
+    state.lastCheckedAt = QDateTime::fromString(query.value(0).toString(), Qt::ISODateWithMs);
+    state.latestVersion = query.value(1).toString();
+    state.latestReleaseUrl = query.value(2).toString();
+    state.latestReleaseName = query.value(3).toString();
+    state.latestPublishedAt = QDateTime::fromString(query.value(4).toString(), Qt::ISODateWithMs);
+    state.lastError = query.value(5).toString();
+    return state;
+}
+
+bool AppDatabase::saveUpdateCheckState(const UpdateCheckState &state)
+{
+    QSqlQuery query(database_);
+    query.prepare(QStringLiteral(
+        "INSERT INTO update_check_state ("
+        "id, last_checked_at, latest_version, latest_release_url, latest_release_name, latest_published_at, last_error"
+        ") VALUES (1, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "last_checked_at = excluded.last_checked_at, "
+        "latest_version = excluded.latest_version, "
+        "latest_release_url = excluded.latest_release_url, "
+        "latest_release_name = excluded.latest_release_name, "
+        "latest_published_at = excluded.latest_published_at, "
+        "last_error = excluded.last_error"));
+    query.addBindValue(state.lastCheckedAt.toUTC().toString(Qt::ISODateWithMs));
+    query.addBindValue(state.latestVersion);
+    query.addBindValue(state.latestReleaseUrl);
+    query.addBindValue(state.latestReleaseName);
+    query.addBindValue(state.latestPublishedAt.toUTC().toString(Qt::ISODateWithMs));
+    query.addBindValue(state.lastError);
+    return query.exec();
+}
+
 QVector<RoomRecord> AppDatabase::fetchRooms() const
 {
     QVector<RoomRecord> rooms;
@@ -670,6 +714,17 @@ void AppDatabase::initializeSchema()
         "level TEXT NOT NULL,"
         "subsystem TEXT NOT NULL,"
         "message TEXT NOT NULL"
+        ")"));
+
+    execute(QStringLiteral(
+        "CREATE TABLE IF NOT EXISTS update_check_state ("
+        "id INTEGER PRIMARY KEY CHECK (id = 1),"
+        "last_checked_at TEXT,"
+        "latest_version TEXT NOT NULL DEFAULT '',"
+        "latest_release_url TEXT NOT NULL DEFAULT '',"
+        "latest_release_name TEXT NOT NULL DEFAULT '',"
+        "latest_published_at TEXT,"
+        "last_error TEXT NOT NULL DEFAULT ''"
         ")"));
 
     execute(QStringLiteral(

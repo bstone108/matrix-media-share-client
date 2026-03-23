@@ -14,6 +14,8 @@ public:
 
     AppSettings loadSettings(const QString &defaultDestinationRootPath);
     bool saveSettings(const AppSettings &settings);
+    UpdateCheckState loadUpdateCheckState() const;
+    bool saveUpdateCheckState(const UpdateCheckState &state);
 
     QVector<RoomRecord> fetchRooms() const;
     QVector<AttachmentDiscovery> fetchDiscoveries() const;

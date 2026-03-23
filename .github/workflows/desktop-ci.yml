@@ -89,7 +89,7 @@ jobs:
         run: |
           QT_BASE_DIR="${RUNNER_TEMP}/qt"
           python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" linux desktop "${QT_VERSION}" linux_gcc_64
-          QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/linux_gcc_64"
+          QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/gcc_64"
           echo "QT_ROOT_DIR=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "${QT_ROOT_DIR}/bin" >> "$GITHUB_PATH"
@@ -149,7 +149,7 @@ jobs:
         run: |
           QT_BASE_DIR="${RUNNER_TEMP}/qt"
           python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" linux_arm64 desktop "${QT_VERSION}" linux_gcc_arm64
-          QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/linux_gcc_arm64"
+          QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/gcc_arm64"
           echo "QT_ROOT_DIR=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "${QT_ROOT_DIR}/bin" >> "$GITHUB_PATH"
@@ -211,7 +211,7 @@ jobs:
         run: |
           $qtBaseDir = Join-Path $env:RUNNER_TEMP "qt"
           python -m aqt install-qt --outputdir $qtBaseDir windows desktop $env:QT_VERSION win64_msvc2022_64
-          $qtRootDir = Join-Path $qtBaseDir "$env:QT_VERSION\\win64_msvc2022_64"
+          $qtRootDir = Join-Path $qtBaseDir "$env:QT_VERSION\\msvc2022_64"
           "QT_ROOT_DIR=$qtRootDir" >> $env:GITHUB_ENV
           "CMAKE_PREFIX_PATH=$qtRootDir" >> $env:GITHUB_ENV
           (Join-Path $qtRootDir "bin") >> $env:GITHUB_PATH
@@ -272,10 +272,14 @@ jobs:
       - name: Install Qt
         run: |
           $qtBaseDir = Join-Path $env:RUNNER_TEMP "qt"
+          python -m aqt install-qt --outputdir $qtBaseDir windows desktop $env:QT_VERSION win64_msvc2022_64
           python -m aqt install-qt --outputdir $qtBaseDir windows desktop $env:QT_VERSION win64_msvc2022_arm64_cross_compiled
-          $qtRootDir = Join-Path $qtBaseDir "$env:QT_VERSION\\win64_msvc2022_arm64_cross_compiled"
+          $qtHostRootDir = Join-Path $qtBaseDir "$env:QT_VERSION\\msvc2022_64"
+          $qtRootDir = Join-Path $qtBaseDir "$env:QT_VERSION\\msvc2022_arm64"
+          "QT_HOST_ROOT_DIR=$qtHostRootDir" >> $env:GITHUB_ENV
           "QT_ROOT_DIR=$qtRootDir" >> $env:GITHUB_ENV
-          "CMAKE_PREFIX_PATH=$qtRootDir" >> $env:GITHUB_ENV
+          "CMAKE_PREFIX_PATH=$qtRootDir;$qtHostRootDir" >> $env:GITHUB_ENV
+          (Join-Path $qtHostRootDir "bin") >> $env:GITHUB_PATH
           (Join-Path $qtRootDir "bin") >> $env:GITHUB_PATH
 
       - name: Package Windows zip
@@ -462,7 +466,7 @@ jobs:
           APP_VERSION: ${{ needs.build-linux.outputs.app_version }}
         run: |
           tag="v${APP_VERSION}"
-          title="MatrixMediaShareClientQt ${APP_VERSION}"
+          title="Matrix Media Share Client ${APP_VERSION}"
           notes="Automated desktop release for ${APP_VERSION}."
           mapfile -d '' assets < <(find release-artifacts -type f -print0)
           if gh release view "${tag}" --repo "${GH_REPO}" >/dev/null 2>&1; then

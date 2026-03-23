@@ -536,3 +536,12 @@ struct GatewayStatusSnapshot {
     qint64 p50TtfbMs = 0;
     bool selectedAsPrimary = false;
 };
+
+struct UpdateCheckState {
+    QDateTime lastCheckedAt;
+    QString latestVersion;
+    QString latestReleaseUrl;
+    QString latestReleaseName;
+    QDateTime latestPublishedAt;
+    QString lastError;
+};

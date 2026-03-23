@@ -36,7 +36,7 @@ if(WIN32 AND MINGW)
     find_package(
         Qt6 ${MATRIX_MEDIA_ARCHIVER_MIN_QT_VERSION}
         REQUIRED
-        COMPONENTS Core Gui Widgets Test
+        COMPONENTS Core Gui Widgets Network Test
         OPTIONAL_COMPONENTS Sql
     )
 
@@ -74,7 +74,7 @@ if(WIN32 AND MINGW)
         )
     endif()
 else()
-    find_package(Qt6 ${MATRIX_MEDIA_ARCHIVER_MIN_QT_VERSION} REQUIRED COMPONENTS Core Gui Widgets Sql Test)
+    find_package(Qt6 ${MATRIX_MEDIA_ARCHIVER_MIN_QT_VERSION} REQUIRED COMPONENTS Core Gui Widgets Network Sql Test)
 endif()
 
 find_program(CARGO_EXECUTABLE NAMES cargo HINTS /opt/homebrew/opt/rustup/bin)
@@ -240,6 +240,7 @@ target_link_libraries(MatrixMediaShareClientQt
         Qt6::Core
         Qt6::Gui
         Qt6::Widgets
+        Qt6::Network
         Qt6::Sql
 )
 

@@ -80,6 +80,17 @@ New-Item -ItemType Directory -Force -Path $buildsDir | Out-Null
 
 rustup target add $rustTarget
 
+$qtPrefixEntries = New-Object System.Collections.Generic.List[string]
+if ($env:QT_ROOT_DIR -and (Test-Path $env:QT_ROOT_DIR)) {
+    $qtPrefixEntries.Add((Resolve-Path $env:QT_ROOT_DIR).Path)
+}
+if ($env:QT_HOST_ROOT_DIR -and (Test-Path $env:QT_HOST_ROOT_DIR)) {
+    $resolvedHostRoot = (Resolve-Path $env:QT_HOST_ROOT_DIR).Path
+    if (-not $qtPrefixEntries.Contains($resolvedHostRoot)) {
+        $qtPrefixEntries.Add($resolvedHostRoot)
+    }
+}
+
 $cmakeConfigureArgs = @(
     "-S", $rootDir,
     "-B", $buildDir,
@@ -87,6 +98,12 @@ $cmakeConfigureArgs = @(
     "-A", $cmakeArch,
     "-DMATRIX_MEDIA_ARCHIVER_BACKEND_RUST_TARGET=$rustTarget"
 )
+if ($qtPrefixEntries.Count -gt 0) {
+    $cmakeConfigureArgs += "-DCMAKE_PREFIX_PATH=$($qtPrefixEntries -join ';')"
+}
+if ($env:QT_HOST_ROOT_DIR -and (Test-Path $env:QT_HOST_ROOT_DIR)) {
+    $cmakeConfigureArgs += "-DQT_HOST_PATH=$((Resolve-Path $env:QT_HOST_ROOT_DIR).Path)"
+}
 & cmake @cmakeConfigureArgs
 
 $cmakeBuildArgs = @(
@@ -112,7 +129,19 @@ if (-not (Test-Path $backendExe)) {
     throw "Built Rust backend not found at $backendExe"
 }
 
-$windeployqt = (Get-Command windeployqt.exe -ErrorAction Stop).Source
+$windeployqt = $null
+foreach ($candidate in @(
+    $(if ($env:QT_HOST_ROOT_DIR) { Join-Path $env:QT_HOST_ROOT_DIR "bin\\windeployqt.exe" }),
+    $(if ($env:QT_ROOT_DIR) { Join-Path $env:QT_ROOT_DIR "bin\\windeployqt.exe" })
+)) {
+    if ($candidate -and (Test-Path $candidate)) {
+        $windeployqt = (Resolve-Path $candidate).Path
+        break
+    }
+}
+if (-not $windeployqt) {
+    $windeployqt = (Get-Command windeployqt.exe -ErrorAction Stop).Source
+}
 $qtBinDir = Split-Path -Parent $windeployqt
 
 if (Test-Path $stageDir) {

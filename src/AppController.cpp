@@ -3,11 +3,24 @@
 #include "MatrixClientBackend.h"
 #include "ProcessMatrixClientBackend.h"
 
+#include <QCoreApplication>
+#include <QDesktopServices>
 #include <QDir>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLocale>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QUrl>
 
 namespace {
+constexpr auto kLatestReleaseApiUrl = "https://api.github.com/repos/bstone108/matrix-media-share-client/releases/latest";
+constexpr auto kReleasesPageUrl = "https://github.com/bstone108/matrix-media-share-client/releases";
+constexpr qint64 kWeeklyUpdateCheckIntervalSeconds = 7LL * 24LL * 60LL * 60LL;
+
 QString defaultDestinationRootPath()
 {
     QString downloads = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
@@ -15,6 +28,87 @@ QString defaultDestinationRootPath()
         downloads = QDir::homePath() + QStringLiteral("/Downloads");
     }
     return downloads + QStringLiteral("/Matrix Media Share Client");
+}
+
+QString normalizeReleaseVersion(QString version)
+{
+    version = version.trimmed();
+    if (version.startsWith(QLatin1Char('v'), Qt::CaseInsensitive)) {
+        version.remove(0, 1);
+    }
+    return version;
+}
+
+QVector<int> parseVersionParts(const QString &version)
+{
+    QVector<int> parts;
+    for (const QString &segment : normalizeReleaseVersion(version).split(QLatin1Char('.'), Qt::SkipEmptyParts)) {
+        bool ok = false;
+        const int value = segment.toInt(&ok);
+        if (!ok) {
+            return {};
+        }
+        parts.append(value);
+    }
+    return parts;
+}
+
+int compareVersionStrings(const QString &lhs, const QString &rhs)
+{
+    const QVector<int> lhsParts = parseVersionParts(lhs);
+    const QVector<int> rhsParts = parseVersionParts(rhs);
+    if (lhsParts.isEmpty() || rhsParts.isEmpty()) {
+        return QString::compare(normalizeReleaseVersion(lhs), normalizeReleaseVersion(rhs), Qt::CaseInsensitive);
+    }
+
+    const int segmentCount = qMax(lhsParts.size(), rhsParts.size());
+    for (int index = 0; index < segmentCount; ++index) {
+        const int lhsValue = index < lhsParts.size() ? lhsParts.at(index) : 0;
+        const int rhsValue = index < rhsParts.size() ? rhsParts.at(index) : 0;
+        if (lhsValue < rhsValue) {
+            return -1;
+        }
+        if (lhsValue > rhsValue) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+bool isUpdateCheckDue(const UpdateCheckState &state)
+{
+    if (!state.lastCheckedAt.isValid()) {
+        return true;
+    }
+    return state.lastCheckedAt.secsTo(QDateTime::currentDateTimeUtc()) >= kWeeklyUpdateCheckIntervalSeconds;
+}
+
+QString releaseSummaryText(const UpdateCheckState &state)
+{
+    if (state.latestVersion.trimmed().isEmpty()) {
+        return QStringLiteral("No published GitHub release yet.");
+    }
+
+    QString label = state.latestVersion.trimmed();
+    const QString releaseName = state.latestReleaseName.trimmed();
+    if (!releaseName.isEmpty() && releaseName != label) {
+        label = QStringLiteral("%1 (%2)").arg(releaseName, label);
+    }
+
+    if (state.latestPublishedAt.isValid()) {
+        return QStringLiteral("%1, published %2")
+            .arg(label, QLocale().toString(state.latestPublishedAt.toLocalTime(), QLocale::ShortFormat));
+    }
+    return label;
+}
+
+QString replyMessage(const QByteArray &payload)
+{
+    const QJsonDocument document = QJsonDocument::fromJson(payload);
+    if (!document.isObject()) {
+        return {};
+    }
+    return document.object().value(QStringLiteral("message")).toString().trimmed();
 }
 }
 
@@ -24,6 +118,7 @@ AppController::AppController(QObject *parent)
     , secretStore_(paths_)
     , backend_(std::make_unique<ProcessMatrixClientBackend>(paths_, this))
     , refreshTimer_(new QTimer(this))
+    , updateNetworkManager_(new QNetworkAccessManager(this))
 {
     refreshTimer_->setInterval(1000);
     connect(refreshTimer_, &QTimer::timeout, this, &AppController::refresh);
@@ -47,11 +142,18 @@ void AppController::initialize()
 {
     settings_ = database_.loadSettings(defaultDestinationRootPath());
     password_ = secretStore_.loadPassword();
+    updateCheckState_ = database_.loadUpdateCheckState();
     refresh();
     updateRefreshTimer();
 
     if (settings_.desiredPowerState) {
         togglePower(true);
+    }
+
+    if (isUpdateCheckDue(updateCheckState_)) {
+        QTimer::singleShot(0, this, [this]() {
+            checkForUpdates(false);
+        });
     }
 }
 
@@ -158,6 +260,64 @@ QString AppController::connectionStatusText() const
 QString AppController::lastErrorMessage() const
 {
     return lastErrorMessage_;
+}
+
+QString AppController::currentVersion() const
+{
+    return QCoreApplication::applicationVersion();
+}
+
+const UpdateCheckState &AppController::updateCheckState() const
+{
+    return updateCheckState_;
+}
+
+bool AppController::isUpdateCheckInProgress() const
+{
+    return updateCheckInProgress_;
+}
+
+bool AppController::updateAvailable() const
+{
+    return compareVersionStrings(updateCheckState_.latestVersion, currentVersion()) > 0;
+}
+
+QString AppController::updateStatusText() const
+{
+    if (updateCheckInProgress_) {
+        return QStringLiteral("Checking GitHub releases...");
+    }
+    if (!updateCheckState_.lastError.trimmed().isEmpty()) {
+        return QStringLiteral("Last update check failed: %1").arg(updateCheckState_.lastError.trimmed());
+    }
+    if (updateCheckState_.latestVersion.trimmed().isEmpty()) {
+        if (!updateCheckState_.lastCheckedAt.isValid()) {
+            return QStringLiteral("Update check pending.");
+        }
+        return QStringLiteral("No published GitHub release yet.");
+    }
+
+    const int comparison = compareVersionStrings(updateCheckState_.latestVersion, currentVersion());
+    if (comparison > 0) {
+        return QStringLiteral("Update available: %1").arg(updateCheckState_.latestVersion);
+    }
+    if (comparison < 0) {
+        return QStringLiteral("This build is newer than the latest published release.");
+    }
+    return QStringLiteral("Up to date.");
+}
+
+QString AppController::latestReleaseSummaryText() const
+{
+    return releaseSummaryText(updateCheckState_);
+}
+
+QString AppController::latestReleasePageUrl() const
+{
+    if (!updateCheckState_.latestReleaseUrl.trimmed().isEmpty()) {
+        return updateCheckState_.latestReleaseUrl.trimmed();
+    }
+    return QString::fromLatin1(kReleasesPageUrl);
 }
 
 void AppController::togglePower(const bool enabled)
@@ -437,6 +597,81 @@ void AppController::declineVerification()
         logWarning(QStringLiteral("verification"), errorMessage);
         emit stateChanged();
     }
+}
+
+void AppController::checkForUpdates(const bool force)
+{
+    if (updateCheckInProgress_) {
+        return;
+    }
+    if (!force && !isUpdateCheckDue(updateCheckState_)) {
+        return;
+    }
+
+    updateCheckInProgress_ = true;
+    emit stateChanged();
+
+    QNetworkRequest request(QUrl(QString::fromLatin1(kLatestReleaseApiUrl)));
+    request.setHeader(
+        QNetworkRequest::UserAgentHeader,
+        QStringLiteral("MatrixMediaShareClientQt/%1").arg(currentVersion()));
+    request.setRawHeader("Accept", "application/vnd.github+json");
+    request.setRawHeader("X-GitHub-Api-Version", "2022-11-28");
+
+    QNetworkReply *reply = updateNetworkManager_->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        const QByteArray payload = reply->readAll();
+        const int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        UpdateCheckState nextState = updateCheckState_;
+        nextState.lastCheckedAt = QDateTime::currentDateTimeUtc();
+        nextState.lastError.clear();
+
+        if (reply->error() == QNetworkReply::NoError && httpStatus >= 200 && httpStatus < 300) {
+            const QJsonDocument document = QJsonDocument::fromJson(payload);
+            const QJsonObject object = document.object();
+            nextState.latestVersion = normalizeReleaseVersion(object.value(QStringLiteral("tag_name")).toString());
+            nextState.latestReleaseUrl = object.value(QStringLiteral("html_url")).toString().trimmed();
+            nextState.latestReleaseName = object.value(QStringLiteral("name")).toString().trimmed();
+            nextState.latestPublishedAt = QDateTime::fromString(
+                object.value(QStringLiteral("published_at")).toString(),
+                Qt::ISODate);
+
+            if (!nextState.latestVersion.isEmpty() && compareVersionStrings(nextState.latestVersion, currentVersion()) > 0) {
+                logInfo(
+                    QStringLiteral("updates"),
+                    QStringLiteral("Update available: %1 (current: %2).").arg(nextState.latestVersion, currentVersion()));
+            } else if (!nextState.latestVersion.isEmpty()) {
+                logInfo(
+                    QStringLiteral("updates"),
+                    QStringLiteral("Update check complete. Latest published release is %1.").arg(nextState.latestVersion));
+            } else {
+                logInfo(QStringLiteral("updates"), QStringLiteral("Update check complete. No published release found."));
+            }
+        } else if (httpStatus == 404 || replyMessage(payload) == QStringLiteral("Not Found")) {
+            nextState.latestVersion.clear();
+            nextState.latestReleaseUrl.clear();
+            nextState.latestReleaseName.clear();
+            nextState.latestPublishedAt = {};
+            logInfo(QStringLiteral("updates"), QStringLiteral("No published GitHub release found yet."));
+        } else {
+            const QString message = replyMessage(payload);
+            nextState.lastError = !message.isEmpty() ? message : reply->errorString().trimmed();
+            logWarning(
+                QStringLiteral("updates"),
+                QStringLiteral("Update check failed: %1").arg(nextState.lastError));
+        }
+
+        database_.saveUpdateCheckState(nextState);
+        updateCheckState_ = nextState;
+        updateCheckInProgress_ = false;
+        reply->deleteLater();
+        emit stateChanged();
+    });
+}
+
+void AppController::openLatestReleasePage()
+{
+    QDesktopServices::openUrl(QUrl(latestReleasePageUrl()));
 }
 
 void AppController::dismissError()

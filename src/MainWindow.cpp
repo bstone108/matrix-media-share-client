@@ -19,6 +19,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QLocale>
 #include <QMessageBox>
 #include <QMimeData>
 #include <QPlainTextEdit>
@@ -63,6 +64,14 @@ QString uploadLimitText(const qint64 bytes)
 bool isSavedState(const DownloadJobState state)
 {
     return state == DownloadJobState::Completed || state == DownloadJobState::DuplicateCompleted;
+}
+
+QString displayDateTime(const QDateTime &timestamp)
+{
+    if (!timestamp.isValid()) {
+        return QStringLiteral("Never");
+    }
+    return QLocale().toString(timestamp.toLocalTime(), QLocale::ShortFormat);
 }
 
 }
@@ -256,10 +265,13 @@ QWidget *MainWindow::buildBrowserPage()
     connectionLabel_ = new QLabel(page);
     ipfsStatusLabel_ = new QLabel(page);
     uploadLimitLabel_ = new QLabel(page);
+    updateBannerLabel_ = new QLabel(page);
+    updateBannerLabel_->setWordWrap(true);
     statusRow->addWidget(powerToggle_);
     statusRow->addWidget(connectionLabel_);
     statusRow->addWidget(ipfsStatusLabel_);
     statusRow->addWidget(uploadLimitLabel_);
+    statusRow->addWidget(updateBannerLabel_);
     statusRow->addStretch();
     layout->addLayout(statusRow);
 
@@ -422,6 +434,12 @@ QWidget *MainWindow::buildSettingsPage()
     passwordEdit_->setEchoMode(QLineEdit::Password);
     primaryGatewayEdit_ = new QLineEdit(content);
     preferredGatewaysEdit_ = new QTextEdit(content);
+    currentVersionLabel_ = new QLabel(content);
+    updateStatusLabel_ = new QLabel(content);
+    latestReleaseLabel_ = new QLabel(content);
+    lastCheckedLabel_ = new QLabel(content);
+    checkUpdatesButton_ = new QPushButton(QStringLiteral("Check For Updates"), content);
+    openLatestReleaseButton_ = new QPushButton(QStringLiteral("Open Latest Release"), content);
     preferredGatewaysEdit_->setFixedHeight(90);
     messageLimitSpin_ = new QSpinBox(content);
     messageLimitSpin_->setMaximum(1'000'000);
@@ -454,6 +472,10 @@ QWidget *MainWindow::buildSettingsPage()
     configureWideLineEdit(passwordEdit_);
     configureWideLineEdit(primaryGatewayEdit_);
     preferredGatewaysEdit_->setMinimumWidth(540);
+    for (QLabel *label : {currentVersionLabel_, updateStatusLabel_, latestReleaseLabel_, lastCheckedLabel_}) {
+        label->setWordWrap(true);
+        label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    }
 
     auto addPathPickerRow = [this, content, form, &configureWideLineEdit](
                                 const QString &label,
@@ -495,6 +517,10 @@ QWidget *MainWindow::buildSettingsPage()
     form->addRow(QStringLiteral("Homeserver"), homeserverEdit_);
     form->addRow(QStringLiteral("Username"), usernameEdit_);
     form->addRow(QStringLiteral("Password"), passwordEdit_);
+    form->addRow(QStringLiteral("Current Version"), currentVersionLabel_);
+    form->addRow(QStringLiteral("Update Status"), updateStatusLabel_);
+    form->addRow(QStringLiteral("Latest Release"), latestReleaseLabel_);
+    form->addRow(QStringLiteral("Last Checked"), lastCheckedLabel_);
     form->addRow(QStringLiteral("Archive Scan Enabled"), archiveScanEnabledCheck_);
     form->addRow(QStringLiteral("Archive Scan High Priority"), archiveHighPriorityCheck_);
     form->addRow(QStringLiteral("Primary Gateway"), primaryGatewayEdit_);
@@ -517,6 +543,8 @@ QWidget *MainWindow::buildSettingsPage()
     auto *resetButton = new QPushButton(QStringLiteral("Reset History Scans"), content);
     buttonRow->addWidget(saveButton);
     buttonRow->addWidget(resetButton);
+    buttonRow->addWidget(checkUpdatesButton_);
+    buttonRow->addWidget(openLatestReleaseButton_);
     buttonRow->addStretch();
     contentLayout->addLayout(buttonRow);
     contentLayout->addStretch();
@@ -528,6 +556,10 @@ QWidget *MainWindow::buildSettingsPage()
         controller_->saveSettings(gatherSettingsFromUi(), passwordEdit_->text());
     });
     connect(resetButton, &QPushButton::clicked, controller_, &AppController::resetHistoryScans);
+    connect(checkUpdatesButton_, &QPushButton::clicked, this, [this]() {
+        controller_->checkForUpdates(true);
+    });
+    connect(openLatestReleaseButton_, &QPushButton::clicked, controller_, &AppController::openLatestReleasePage);
 
     return page;
 }
@@ -613,6 +645,11 @@ void MainWindow::populateBrowserPage()
     connectionLabel_->setText(QStringLiteral("Matrix: %1").arg(controller_->connectionStatusText()));
     ipfsStatusLabel_->setText(QStringLiteral("IPFS: %1").arg(ipfsRuntimeStateTitle(runtime.ipfs.state)));
     uploadLimitLabel_->setText(QStringLiteral("Upload Limit: %1").arg(uploadLimitText(runtime.uploadSizeLimitBytes)));
+    if (controller_->updateAvailable() || controller_->isUpdateCheckInProgress()) {
+        updateBannerLabel_->setText(QStringLiteral("Updates: %1").arg(controller_->updateStatusText()));
+    } else {
+        updateBannerLabel_->clear();
+    }
 
     const QString previousRoomId = shareRoomCombo_->currentData().toString();
     shareRoomCombo_->blockSignals(true);
@@ -728,6 +765,12 @@ void MainWindow::populateSettingsPage()
     startHiddenCheck_->setChecked(settings.startHidden);
     autoJoinSpacesCheck_->setChecked(settings.autoJoinSpaceRooms);
     autoDownloadCheck_->setChecked(settings.autoDownloadNewMedia);
+    currentVersionLabel_->setText(controller_->currentVersion());
+    updateStatusLabel_->setText(controller_->updateStatusText());
+    latestReleaseLabel_->setText(controller_->latestReleaseSummaryText());
+    lastCheckedLabel_->setText(displayDateTime(controller_->updateCheckState().lastCheckedAt));
+    checkUpdatesButton_->setEnabled(!controller_->isUpdateCheckInProgress());
+    openLatestReleaseButton_->setEnabled(!controller_->latestReleasePageUrl().trimmed().isEmpty());
     settingsPageInitialized_ = true;
 }
 

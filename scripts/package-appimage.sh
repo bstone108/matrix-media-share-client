@@ -85,12 +85,16 @@ mkdir -p "${DIST_DIR}" "${TOOLS_DIR}" "${BUILDS_DIR}"
 
 QMAKE_BIN="${QMAKE:-}"
 if [[ -z "${QMAKE_BIN}" ]]; then
-  if command -v qmake6 >/dev/null 2>&1; then
+  if [[ -n "${QT_ROOT_DIR:-}" && -x "${QT_ROOT_DIR}/bin/qmake6" ]]; then
+    QMAKE_BIN="${QT_ROOT_DIR}/bin/qmake6"
+  elif [[ -n "${QT_ROOT_DIR:-}" && -x "${QT_ROOT_DIR}/bin/qmake" ]]; then
+    QMAKE_BIN="${QT_ROOT_DIR}/bin/qmake"
+  elif command -v qmake6 >/dev/null 2>&1; then
     QMAKE_BIN="$(command -v qmake6)"
   elif command -v qmake >/dev/null 2>&1; then
     QMAKE_BIN="$(command -v qmake)"
   else
-    echo "Could not find qmake/qmake6 on PATH. Install Qt 6 first." >&2
+    echo "Could not find qmake/qmake6. Set QT_ROOT_DIR or install Qt 6 first." >&2
     exit 1
   fi
 fi

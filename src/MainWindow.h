@@ -72,6 +72,7 @@ private:
     QLabel *connectionLabel_ = nullptr;
     QLabel *ipfsStatusLabel_ = nullptr;
     QLabel *uploadLimitLabel_ = nullptr;
+    QLabel *updateBannerLabel_ = nullptr;
     QLabel *browserDropHintLabel_ = nullptr;
     QComboBox *shareRoomCombo_ = nullptr;
     QListWidget *discoveriesList_ = nullptr;
@@ -95,6 +96,10 @@ private:
     QLineEdit *manualDownloadsEdit_ = nullptr;
     QLineEdit *primaryGatewayEdit_ = nullptr;
     QTextEdit *preferredGatewaysEdit_ = nullptr;
+    QLabel *currentVersionLabel_ = nullptr;
+    QLabel *updateStatusLabel_ = nullptr;
+    QLabel *latestReleaseLabel_ = nullptr;
+    QLabel *lastCheckedLabel_ = nullptr;
     QSpinBox *messageLimitSpin_ = nullptr;
     QSpinBox *retryCooldownSpin_ = nullptr;
     QSpinBox *retryLimitSpin_ = nullptr;
@@ -108,6 +113,8 @@ private:
     QCheckBox *archiveHighPriorityCheck_ = nullptr;
     QCheckBox *autoJoinSpacesCheck_ = nullptr;
     QCheckBox *autoDownloadCheck_ = nullptr;
+    QPushButton *checkUpdatesButton_ = nullptr;
+    QPushButton *openLatestReleaseButton_ = nullptr;
 
     QLabel *verificationStatusLabel_ = nullptr;
     QLabel *verificationDeviceIdLabel_ = nullptr;

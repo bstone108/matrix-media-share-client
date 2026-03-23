@@ -24,7 +24,9 @@ fi
 APP_VERSION="$(tr -d '\r\n' < "${VERSION_FILE}")"
 
 if [[ -z "${QT_PREFIX:-}" ]]; then
-  if command -v qmake6 >/dev/null 2>&1; then
+  if [[ -n "${QT_ROOT_DIR:-}" ]]; then
+    QT_PREFIX="${QT_ROOT_DIR}"
+  elif command -v qmake6 >/dev/null 2>&1; then
     QT_PREFIX="$(qmake6 -query QT_INSTALL_PREFIX)"
   elif command -v qmake >/dev/null 2>&1; then
     QT_PREFIX="$(qmake -query QT_INSTALL_PREFIX)"
@@ -36,7 +38,9 @@ if [[ -z "${QT_PREFIX:-}" ]]; then
 fi
 
 if [[ -z "${MACDEPLOYQT_BIN:-}" ]]; then
-  if command -v macdeployqt >/dev/null 2>&1; then
+  if [[ -n "${QT_ROOT_DIR:-}" && -x "${QT_ROOT_DIR}/bin/macdeployqt" ]]; then
+    MACDEPLOYQT_BIN="${QT_ROOT_DIR}/bin/macdeployqt"
+  elif command -v macdeployqt >/dev/null 2>&1; then
     MACDEPLOYQT_BIN="$(command -v macdeployqt)"
   else
     MACDEPLOYQT_BIN="${QT_PREFIX}/bin/macdeployqt"

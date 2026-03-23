@@ -11,6 +11,7 @@
 #include <memory>
 
 class QTimer;
+class QNetworkAccessManager;
 
 class AppController : public QObject
 {
@@ -37,6 +38,13 @@ public:
 
     QString connectionStatusText() const;
     QString lastErrorMessage() const;
+    QString currentVersion() const;
+    const UpdateCheckState &updateCheckState() const;
+    bool isUpdateCheckInProgress() const;
+    bool updateAvailable() const;
+    QString updateStatusText() const;
+    QString latestReleaseSummaryText() const;
+    QString latestReleasePageUrl() const;
 
 public slots:
     void togglePower(bool enabled);
@@ -58,6 +66,8 @@ public slots:
     void startSasVerification();
     void approveVerification();
     void declineVerification();
+    void checkForUpdates(bool force = true);
+    void openLatestReleasePage();
     void dismissError();
 
 signals:
@@ -86,4 +96,7 @@ private:
     int waitingQueueCount_ = 0;
     QString lastErrorMessage_;
     bool refreshQueued_ = false;
+    UpdateCheckState updateCheckState_;
+    bool updateCheckInProgress_ = false;
+    QNetworkAccessManager *updateNetworkManager_ = nullptr;
 };
