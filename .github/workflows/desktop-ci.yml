@@ -37,7 +37,6 @@ on:
   workflow_dispatch:
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   APP_NAME: MatrixMediaShareClientQt
   QT_VERSION: "6.10.2"
 
@@ -69,6 +68,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install aqtinstall
+        run: python3 -m pip install --user "aqtinstall==3.3.*" "py7zr==1.0.*"
+
       - name: Restore Rust cache
         uses: actions/cache@v5
         with:
@@ -84,12 +86,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake curl desktop-file-utils libgl1-mesa-dev libxcb-cursor0 ninja-build patchelf zip
 
       - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          arch: "linux_gcc_64"
-          cache: "true"
-          setup-python: "false"
+        run: |
+          QT_BASE_DIR="${RUNNER_TEMP}/qt"
+          python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" linux desktop "${QT_VERSION}" linux_gcc_64
+          QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/linux_gcc_64"
+          echo "QT_ROOT_DIR=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
+          echo "${QT_ROOT_DIR}/bin" >> "$GITHUB_PATH"
 
       - name: Package AppImage
         run: ./scripts/package-appimage.sh
@@ -125,6 +128,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install aqtinstall
+        run: python3 -m pip install --user "aqtinstall==3.3.*" "py7zr==1.0.*"
+
       - name: Restore Rust cache
         uses: actions/cache@v5
         with:
@@ -140,13 +146,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake curl desktop-file-utils libgl1-mesa-dev libxcb-cursor0 ninja-build patchelf zip
 
       - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: "linux_arm64"
-          arch: "linux_gcc_arm64"
-          cache: "true"
-          setup-python: "false"
+        run: |
+          QT_BASE_DIR="${RUNNER_TEMP}/qt"
+          python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" linux_arm64 desktop "${QT_VERSION}" linux_gcc_arm64
+          QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/linux_gcc_arm64"
+          echo "QT_ROOT_DIR=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
+          echo "${QT_ROOT_DIR}/bin" >> "$GITHUB_PATH"
 
       - name: Package AppImage
         run: ARCH=aarch64 ./scripts/package-appimage.sh
@@ -187,6 +193,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install aqtinstall
+        run: python -m pip install --user "aqtinstall==3.3.*" "py7zr==1.0.*"
+
       - name: Restore Rust cache
         uses: actions/cache@v5
         with:
@@ -199,12 +208,13 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          arch: "win64_msvc2022_64"
-          cache: "true"
-          setup-python: "false"
+        run: |
+          $qtBaseDir = Join-Path $env:RUNNER_TEMP "qt"
+          python -m aqt install-qt --outputdir $qtBaseDir windows desktop $env:QT_VERSION win64_msvc2022_64
+          $qtRootDir = Join-Path $qtBaseDir "$env:QT_VERSION\\win64_msvc2022_64"
+          "QT_ROOT_DIR=$qtRootDir" >> $env:GITHUB_ENV
+          "CMAKE_PREFIX_PATH=$qtRootDir" >> $env:GITHUB_ENV
+          (Join-Path $qtRootDir "bin") >> $env:GITHUB_PATH
 
       - name: Package Windows zip
         run: ./scripts/package-windows.ps1
@@ -245,6 +255,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install aqtinstall
+        run: python -m pip install --user "aqtinstall==3.3.*" "py7zr==1.0.*"
+
       - name: Restore Rust cache
         uses: actions/cache@v5
         with:
@@ -257,13 +270,13 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: "windows_arm64"
-          arch: "win64_msvc2022_arm64"
-          cache: "true"
-          setup-python: "false"
+        run: |
+          $qtBaseDir = Join-Path $env:RUNNER_TEMP "qt"
+          python -m aqt install-qt --outputdir $qtBaseDir windows desktop $env:QT_VERSION win64_msvc2022_arm64_cross_compiled
+          $qtRootDir = Join-Path $qtBaseDir "$env:QT_VERSION\\win64_msvc2022_arm64_cross_compiled"
+          "QT_ROOT_DIR=$qtRootDir" >> $env:GITHUB_ENV
+          "CMAKE_PREFIX_PATH=$qtRootDir" >> $env:GITHUB_ENV
+          (Join-Path $qtRootDir "bin") >> $env:GITHUB_PATH
 
       - name: Package Windows zip
         run: |
@@ -301,6 +314,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install aqtinstall
+        run: python3 -m pip install --user "aqtinstall==3.3.*" "py7zr==1.0.*"
+
       - name: Restore Rust cache
         uses: actions/cache@v5
         with:
@@ -313,12 +329,13 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          arch: "clang_64"
-          cache: "true"
-          setup-python: "false"
+        run: |
+          QT_BASE_DIR="${RUNNER_TEMP}/qt"
+          python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" mac desktop "${QT_VERSION}" clang_64
+          QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/clang_64"
+          echo "QT_ROOT_DIR=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
+          echo "${QT_ROOT_DIR}/bin" >> "$GITHUB_PATH"
 
       - name: Package macOS zip
         run: ./scripts/package-macos.sh
@@ -354,6 +371,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install aqtinstall
+        run: python3 -m pip install --user "aqtinstall==3.3.*" "py7zr==1.0.*"
+
       - name: Restore Rust cache
         uses: actions/cache@v5
         with:
@@ -366,12 +386,13 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          arch: "clang_64"
-          cache: "true"
-          setup-python: "false"
+        run: |
+          QT_BASE_DIR="${RUNNER_TEMP}/qt"
+          python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" mac desktop "${QT_VERSION}" clang_64
+          QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/clang_64"
+          echo "QT_ROOT_DIR=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
+          echo "${QT_ROOT_DIR}/bin" >> "$GITHUB_PATH"
 
       - name: Package macOS zip
         run: ./scripts/package-macos.sh
