@@ -68,6 +68,9 @@ use crate::{
 const ROOM_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const DOWNLOAD_IDLE_DELAY: Duration = Duration::from_secs(1);
 const DOWNLOAD_ERROR_DELAY: Duration = Duration::from_secs(2);
+const ROOM_THUMBNAIL_WARM_BATCH_SIZE: i64 = 48;
+const ROOM_THUMBNAIL_WARM_ITEM_DELAY: Duration = Duration::from_millis(120);
+const ROOM_THUMBNAIL_WARM_BATCH_DELAY: Duration = Duration::from_millis(500);
 const SHARE_QUEUE_DELAY: Duration = Duration::from_secs(10);
 const MAX_DISCOVERY_CACHE_ENTRIES: usize = 12_000;
 const MANUAL_IPFS_ROOM_ID: &str = "__manual_ipfs__";
@@ -119,6 +122,7 @@ struct RunningContext {
 struct RoomWorkerState {
     live_task: Option<JoinHandle<()>>,
     history_task: Option<JoinHandle<()>>,
+    thumbnail_task: Option<JoinHandle<()>>,
     live_watcher_active: bool,
     history_mode: RoomHistoryMode,
     history_detail: String,
@@ -129,6 +133,7 @@ impl RoomWorkerState {
         Self {
             live_task: None,
             history_task: None,
+            thumbnail_task: None,
             live_watcher_active: false,
             history_mode: RoomHistoryMode::Idle,
             history_detail: "Idle".to_owned(),
@@ -3075,6 +3080,8 @@ async fn focus_room_now(context: &Arc<RunningContext>, room_id: &str) -> Result<
         .await?;
     }
 
+    ensure_room_thumbnail_warmer(context, room_id).await;
+
     context
         .database
         .insert_log(
@@ -3084,6 +3091,36 @@ async fn focus_room_now(context: &Arc<RunningContext>, room_id: &str) -> Result<
         )
         .await?;
     Ok(())
+}
+
+async fn ensure_room_thumbnail_warmer(context: &Arc<RunningContext>, room_id: &str) {
+    let mut workers = context.room_workers.lock().await;
+    let entry = workers
+        .entry(room_id.to_owned())
+        .or_insert_with(RoomWorkerState::new);
+    if entry.thumbnail_task.is_some() {
+        return;
+    }
+
+    let room_id_clone = room_id.to_owned();
+    let context_clone = context.clone();
+    entry.thumbnail_task = Some(tokio::spawn(async move {
+        if let Err(error) = warm_room_thumbnail_cache(context_clone.clone(), &room_id_clone).await {
+            let _ = context_clone
+                .database
+                .insert_log(
+                    AppLogLevel::Warning,
+                    "thumbnails",
+                    &format!("Background thumbnail warmup failed for {room_id_clone}: {error:#}"),
+                )
+                .await;
+        }
+
+        let mut workers = context_clone.room_workers.lock().await;
+        if let Some(worker) = workers.get_mut(&room_id_clone) {
+            worker.thumbnail_task = None;
+        }
+    }));
 }
 
 async fn ensure_room_worker(
@@ -3182,6 +3219,9 @@ async fn stop_room_worker(context: &Arc<RunningContext>, room_id: &str) {
             handle.abort();
         }
         if let Some(handle) = worker.history_task.take() {
+            handle.abort();
+        }
+        if let Some(handle) = worker.thumbnail_task.take() {
             handle.abort();
         }
     }
@@ -3813,6 +3853,93 @@ async fn enrich_ipfs_discovery_thumbnail_from_landing_page(
             ),
         )
         .await?;
+    Ok(())
+}
+
+async fn warm_room_thumbnail_cache(
+    context: Arc<RunningContext>,
+    room_id: &str,
+) -> Result<()> {
+    loop {
+        if context.focused_room_id.read().await.as_deref() != Some(room_id) {
+            break;
+        }
+
+        let discoveries = context
+            .database
+            .fetch_room_discoveries_missing_thumbnails(room_id, ROOM_THUMBNAIL_WARM_BATCH_SIZE)
+            .await?;
+        if discoveries.is_empty() {
+            break;
+        }
+
+        let mut made_progress = false;
+        for discovery in discoveries {
+            if context.focused_room_id.read().await.as_deref() != Some(room_id) {
+                return Ok(());
+            }
+
+            let mut current = discovery;
+            if should_fetch_ipfs_landing_page_thumbnail(&current) {
+                match enrich_ipfs_discovery_thumbnail_from_landing_page(&context, &current).await {
+                    Ok(()) => {
+                        if let Some(updated) = context
+                            .database
+                            .discovery_record(&current.room_id, &current.event_id)
+                            .await?
+                        {
+                            current = updated;
+                        }
+                        made_progress = true;
+                    }
+                    Err(error) => {
+                        let _ = context
+                            .database
+                            .insert_log(
+                                AppLogLevel::Warning,
+                                "thumbnails",
+                                &format!(
+                                    "Failed background landing-page thumbnail lookup for {} in {}: {error:#}",
+                                    current.event_id, current.room_id
+                                ),
+                            )
+                            .await;
+                    }
+                }
+            }
+
+            if should_cache_discovery_thumbnail(&current) {
+                match cache_discovery_thumbnail(&context, &current).await {
+                    Ok(Some(_)) => {
+                        made_progress = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = context
+                            .database
+                            .insert_log(
+                                AppLogLevel::Warning,
+                                "thumbnails",
+                                &format!(
+                                    "Failed background thumbnail cache for {} in {}: {error:#}",
+                                    current.event_id, current.room_id
+                                ),
+                            )
+                            .await;
+                    }
+                }
+            }
+
+            sleep(ROOM_THUMBNAIL_WARM_ITEM_DELAY).await;
+        }
+
+        if !made_progress {
+            break;
+        }
+
+        sleep(ROOM_THUMBNAIL_WARM_BATCH_DELAY).await;
+    }
+
     Ok(())
 }
 

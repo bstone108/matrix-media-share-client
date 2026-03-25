@@ -632,6 +632,24 @@ impl AppDatabase {
         Ok(())
     }
 
+    pub async fn fetch_room_discoveries_missing_thumbnails(
+        &self,
+        room_id: &str,
+        limit: i64,
+    ) -> Result<Vec<AttachmentDiscovery>> {
+        let connection = self.inner.lock().await;
+        let mut statement = connection.prepare(
+            "SELECT room_id, event_id, origin_ts, source_kind, direct_url, mxc_url, fallback_source_url, thumbnail_source_url, thumbnail_cached_path, original_filename, mime_type, category
+             FROM discovered_attachments
+             WHERE room_id = ?1
+               AND (thumbnail_cached_path IS NULL OR TRIM(thumbnail_cached_path) = '')
+             ORDER BY origin_ts DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![room_id, limit], Self::map_discovery_record)?;
+        collect_rows(rows)
+    }
+
     pub async fn prune_discovery_cache(&self, max_entries: usize) -> Result<Vec<String>> {
         let connection = self.inner.lock().await;
         let mut statement = connection.prepare(

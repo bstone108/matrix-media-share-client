@@ -311,16 +311,23 @@ set(MATRIX_MEDIA_ARCHIVER_QT_SOURCES
     src/SecretStore.h
     src/VideoFrameWidget.cpp
     src/VideoFrameWidget.h
+    src/WebVideoWidget.h
     src/main.cpp
     ${MATRIX_MEDIA_ARCHIVER_APP_ICON_QRC}
 )
 
 if(APPLE)
     list(APPEND MATRIX_MEDIA_ARCHIVER_QT_SOURCES
+        src/WebVideoWidget.mm
         ${MATRIX_MEDIA_ARCHIVER_APP_ICON_ICNS}
     )
     set_source_files_properties(${MATRIX_MEDIA_ARCHIVER_APP_ICON_ICNS}
         PROPERTIES MACOSX_PACKAGE_LOCATION "Resources"
+    )
+    set_source_files_properties(src/WebVideoWidget.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+else()
+    list(APPEND MATRIX_MEDIA_ARCHIVER_QT_SOURCES
+        src/WebVideoWidget.cpp
     )
 endif()
 
@@ -356,6 +363,10 @@ target_compile_definitions(MatrixMediaShareClientQt
 )
 
 if(APPLE)
+    find_library(MATRIX_MEDIA_ARCHIVER_WEBKIT_FRAMEWORK WebKit)
+    if(MATRIX_MEDIA_ARCHIVER_WEBKIT_FRAMEWORK)
+        target_link_libraries(MatrixMediaShareClientQt PRIVATE ${MATRIX_MEDIA_ARCHIVER_WEBKIT_FRAMEWORK})
+    endif()
     set_target_properties(MatrixMediaShareClientQt PROPERTIES
         MACOSX_BUNDLE_ICON_FILE MatrixMediaArchiverQt.icns
     )

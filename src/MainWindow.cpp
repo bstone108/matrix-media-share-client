@@ -2,6 +2,7 @@
 
 #include "AppController.h"
 #include "VideoFrameWidget.h"
+#include "WebVideoWidget.h"
 
 #include <QAbstractItemView>
 #include <QBuffer>
@@ -106,6 +107,38 @@ QString displayDateTime(const QDateTime &timestamp)
         return QStringLiteral("Never");
     }
     return QLocale().toString(timestamp.toLocalTime(), QLocale::ShortFormat);
+}
+
+bool looksLikeIpfsUrl(const QString &value)
+{
+    const QString trimmed = value.trimmed();
+    return trimmed.startsWith(QStringLiteral("ipfs://"), Qt::CaseInsensitive)
+        || trimmed.contains(QStringLiteral("/ipfs/"), Qt::CaseInsensitive);
+}
+
+QString discoverySourceKindTitle(const AttachmentDiscovery &discovery)
+{
+    if (discovery.sourceKind == MediaSourceKind::Ipfs
+        || looksLikeIpfsUrl(discovery.directUrl)
+        || looksLikeIpfsUrl(discovery.mxcUrl)) {
+        return QStringLiteral("ipfs");
+    }
+    return mediaSourceKindTitle(discovery.sourceKind);
+}
+
+bool shouldUseWebVideoFallback(const ViewerSnapshot &viewer)
+{
+#ifdef Q_OS_MACOS
+    const QString mime = viewer.mimeType.trimmed().toLower();
+    const QString path = viewer.localPath.trimmed().toLower();
+    return mime == QStringLiteral("video/webm")
+        || mime == QStringLiteral("application/webm")
+        || path.endsWith(QStringLiteral(".webm"))
+        || path.endsWith(QStringLiteral(".ogv"));
+#else
+    Q_UNUSED(viewer);
+    return false;
+#endif
 }
 
 QColor categoryAccent(const MediaCategory category)
@@ -269,13 +302,6 @@ QPixmap renderDiscoveryTile(
             painter.setPen(QColor(QStringLiteral("#f8fafc")));
             painter.drawText(bounds.adjusted(16, 16, -16, -36), Qt::AlignLeft | Qt::AlignBottom, progressText);
         }
-    } else if (!subline.trimmed().isEmpty()) {
-        QFont sublineFont = painter.font();
-        sublineFont.setBold(true);
-        sublineFont.setPointSizeF(sublineFont.pointSizeF() - 1.0);
-        painter.setFont(sublineFont);
-        painter.setPen(QColor(QStringLiteral("#f8fafc")));
-        painter.drawText(bounds.adjusted(16, 16, -16, -20), Qt::AlignLeft | Qt::AlignBottom, subline.toUpper());
     }
 
     painter.setClipping(false);
@@ -1537,6 +1563,9 @@ void MainWindow::refreshViewerDialog()
         if (viewerVideoWidget_ != nullptr) {
             viewerVideoWidget_->clearFrame();
         }
+        if (viewerWebVideoWidget_ != nullptr) {
+            viewerWebVideoWidget_->clearMedia();
+        }
         viewerLoadedSessionId_ = 0;
         viewerLoadedLocalPath_.clear();
         viewerLoadedState_ = ViewerState::Idle;
@@ -1622,12 +1651,14 @@ void MainWindow::ensureViewerDialog()
     viewerImageScrollArea_->setWidget(viewerImageLabel_);
 
     viewerVideoWidget_ = new VideoFrameWidget(viewerDialog_);
+    viewerWebVideoWidget_ = new WebVideoWidget(viewerDialog_);
     viewerFallbackLabel_ = new QLabel(viewerDialog_);
     viewerFallbackLabel_->setAlignment(Qt::AlignCenter);
     viewerFallbackLabel_->setWordWrap(true);
 
     viewerContentStack_->addWidget(viewerImageScrollArea_);
     viewerContentStack_->addWidget(viewerVideoWidget_);
+    viewerContentStack_->addWidget(viewerWebVideoWidget_);
     viewerContentStack_->addWidget(viewerFallbackLabel_);
 
     auto *closeButton = new QPushButton(QStringLiteral("Close"), viewerDialog_);
@@ -1668,6 +1699,9 @@ void MainWindow::ensureViewerDialog()
         if (viewerVideoWidget_ != nullptr) {
             viewerVideoWidget_->clearFrame();
         }
+        if (viewerWebVideoWidget_ != nullptr) {
+            viewerWebVideoWidget_->clearMedia();
+        }
         if (viewerDialog_ != nullptr) {
             viewerDialog_->hide();
         }
@@ -1687,6 +1721,9 @@ void MainWindow::ensureViewerDialog()
         if (viewerVideoWidget_ != nullptr) {
             viewerVideoWidget_->clearFrame();
         }
+        if (viewerWebVideoWidget_ != nullptr) {
+            viewerWebVideoWidget_->clearMedia();
+        }
     });
 }
 
@@ -1705,6 +1742,9 @@ void MainWindow::loadViewerMedia(const ViewerSnapshot &viewer)
     }
     if (viewerVideoWidget_ != nullptr) {
         viewerVideoWidget_->clearFrame();
+    }
+    if (viewerWebVideoWidget_ != nullptr) {
+        viewerWebVideoWidget_->clearMedia();
     }
 
     QScreen *targetScreen = windowHandle() != nullptr ? windowHandle()->screen() : QGuiApplication::primaryScreen();
@@ -1743,14 +1783,22 @@ void MainWindow::loadViewerMedia(const ViewerSnapshot &viewer)
                || viewer.category == MediaCategory::Audio
                || viewer.mimeType.startsWith(QStringLiteral("video/"))
                || viewer.mimeType.startsWith(QStringLiteral("audio/"))) {
+        const bool isVideo = viewer.category == MediaCategory::Videos || viewer.mimeType.startsWith(QStringLiteral("video/"));
+        const bool usingWebFallback = isVideo
+            && viewerWebVideoWidget_ != nullptr
+            && viewerWebVideoWidget_->isAvailable()
+            && shouldUseWebVideoFallback(viewer)
+            && viewerWebVideoWidget_->loadMediaFile(viewer.localPath, viewer.mimeType);
         viewerContentStack_->setCurrentWidget(
-            viewer.category == MediaCategory::Videos || viewer.mimeType.startsWith(QStringLiteral("video/"))
-                ? static_cast<QWidget *>(viewerVideoWidget_)
+            isVideo
+                ? (usingWebFallback
+                    ? static_cast<QWidget *>(viewerWebVideoWidget_)
+                    : static_cast<QWidget *>(viewerVideoWidget_))
                 : static_cast<QWidget *>(viewerFallbackLabel_));
         if (viewer.category == MediaCategory::Audio || viewer.mimeType.startsWith(QStringLiteral("audio/"))) {
             viewerFallbackLabel_->setText(QStringLiteral("Playing audio in the built-in viewer..."));
         }
-        if (viewerMediaPlayer_ != nullptr) {
+        if (!usingWebFallback && viewerMediaPlayer_ != nullptr) {
             viewerMediaPlayer_->setSource(QUrl::fromLocalFile(viewer.localPath));
             viewerMediaPlayer_->play();
         }
@@ -2029,7 +2077,7 @@ void MainWindow::applyDiscoveryPresentation(QListWidgetItem *item, const Attachm
     const QString title = discovery.originalFilename.isEmpty() ? discovery.eventId : discovery.originalFilename;
     const QString tileLabel = QStringLiteral("%1 | %2")
                                   .arg(mediaCategoryTitle(discovery.category).toUpper(),
-                                       mediaSourceKindTitle(discovery.sourceKind).toUpper());
+                                       discoverySourceKindTitle(discovery).toUpper());
     const QString sourceUrl = discovery.directUrl.isEmpty() ? discovery.mxcUrl : discovery.directUrl;
     const QString cacheKey = browserThumbnailKey(discovery);
     const ActiveDownloadSnapshot *activeDownload = activeDownloadForDiscovery(discovery);

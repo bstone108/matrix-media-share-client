@@ -97,6 +97,7 @@ The built-in viewer download is special:
 - opening media for viewing skips the normal download queue
 - it downloads directly for the viewer so it can start as soon as possible
 - it still shows progress in the UI while it downloads
+- on macOS, WebM playback uses an in-app web viewer fallback when the normal Qt video backend cannot handle it
 
 ## Logs
 
@@ -454,6 +455,8 @@ Foreground thumbnails should win first.
 
 Background work should only run when the foreground queue is clear.
 
+When you stay in one room, the app should also keep warming missing thumbnails for that active room in the background until it fills in more of the cache.
+
 ## Active Room Refresh
 
 The room you are actively viewing should be refreshed in real time and treated as the priority room.
@@ -543,6 +546,8 @@ Common examples:
   - you may be seeing the intentional 10-second share delay
 - viewer does not open immediately
   - check whether it is downloading directly for viewing
+- WebM does not play on macOS
+  - the built-in web fallback should handle it now, so check Logs if it still fails
 - missing media previews
   - watch Logs for thumbnail cache activity
 
