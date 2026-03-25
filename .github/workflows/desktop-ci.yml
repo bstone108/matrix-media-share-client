@@ -80,6 +80,7 @@ jobs:
             desktop-file-utils \
             libgl1-mesa-dev \
             libgstreamer-plugins-base1.0-0 \
+            libgstreamer-plugins-bad1.0-0 \
             libgstreamer1.0-0 \
             libpulse-dev \
             libpulse0 \
@@ -170,6 +171,7 @@ jobs:
             desktop-file-utils \
             libgl1-mesa-dev \
             libgstreamer-plugins-base1.0-0 \
+            libgstreamer-plugins-bad1.0-0 \
             libgstreamer1.0-0 \
             libpulse-dev \
             libpulse0 \
