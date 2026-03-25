@@ -32,6 +32,9 @@ pub enum Command {
     ImportIpfsLink {
         link: String,
     },
+    DeleteSharedItem {
+        sha256: String,
+    },
     OpenDiscovery {
         room_id: String,
         event_id: String,

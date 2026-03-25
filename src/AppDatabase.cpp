@@ -164,6 +164,16 @@ QString normalizedText(const QString &value)
     return value.isNull() ? QStringLiteral("") : value;
 }
 
+AppSettings normalizedSettings(AppSettings settings)
+{
+    const QString destinationRootPath = normalizedText(settings.destinationRootPath).trimmed().isEmpty()
+        ? normalizedText(settings.manualDownloadRootPath)
+        : normalizedText(settings.destinationRootPath);
+    settings.destinationRootPath = destinationRootPath;
+    settings.manualDownloadRootPath = settings.destinationRootPath;
+    return settings;
+}
+
 AttachmentDiscovery readDiscoveryRecord(const QSqlQuery &query)
 {
     AttachmentDiscovery discovery;
@@ -190,6 +200,32 @@ ActivityLogEntry readActivityLogEntry(const QSqlQuery &query)
     entry.subsystem = query.value(3).toString();
     entry.message = query.value(4).toString();
     return entry;
+}
+
+SharedItemRecord readSharedItemRecord(const QSqlQuery &query)
+{
+    SharedItemRecord item;
+    item.sha256 = query.value(0).toString();
+    item.sourceKind = query.value(1).toString() == QStringLiteral("archive")
+        ? MediaSourceKind::LocalFile
+        : query.value(1).toString() == QStringLiteral("downloads")
+            ? MediaSourceKind::LocalFile
+            : MediaSourceKind::LocalFile;
+    item.sourcePath = query.value(2).toString();
+    item.bundlePath = query.value(3).toString();
+    item.libraryPath = query.value(4).toString();
+    item.archivePath = query.value(5).toString();
+    item.fileCid = query.value(6).toString();
+    item.thumbnailCid = query.value(7).toString();
+    item.pageCid = query.value(8).toString();
+    item.landingPageUrl = query.value(9).toString();
+    item.roomId = query.value(10).toString();
+    item.category = parseMediaCategory(query.value(11).toString());
+    item.originalFilename = query.value(12).toString();
+    item.mimeType = query.value(13).toString();
+    item.fileSize = query.value(14).toLongLong();
+    item.updatedAt = QDateTime::fromString(query.value(15).toString(), Qt::ISODateWithMs);
+    return item;
 }
 }
 
@@ -255,28 +291,27 @@ AppSettings AppDatabase::loadSettings(const QString &defaultDestinationRootPath)
         settings.previewWorkerCount = query.value(QStringLiteral("preview_worker_count")).toInt();
         settings.autoJoinSpaceRooms = query.value(QStringLiteral("auto_join_space_rooms")).toBool();
         settings.autoDownloadNewMedia = query.value(QStringLiteral("auto_download_new_media")).toBool();
+        settings.selfHealEnabled = query.value(QStringLiteral("self_heal_enabled")).toBool();
         settings.desiredPowerState = query.value(QStringLiteral("desired_power_state")).toBool();
         lastErrorText_.clear();
-        return settings;
+        return normalizedSettings(settings);
     }
 
     const AppSettings defaults = AppSettings::defaults(defaultDestinationRootPath);
     if (saveSettings(defaults)) {
         lastErrorText_.clear();
     }
-    return defaults;
+    return normalizedSettings(defaults);
 }
 
 bool AppDatabase::saveSettings(const AppSettings &settings)
 {
-    AppSettings sanitizedSettings = settings;
+    AppSettings sanitizedSettings = normalizedSettings(settings);
     sanitizedSettings.homeserverUrl = normalizedText(sanitizedSettings.homeserverUrl);
     sanitizedSettings.username = normalizedText(sanitizedSettings.username);
     sanitizedSettings.ownerUserId = normalizedText(sanitizedSettings.ownerUserId);
-    sanitizedSettings.destinationRootPath = normalizedText(sanitizedSettings.destinationRootPath);
     sanitizedSettings.libraryRootPath = normalizedText(sanitizedSettings.libraryRootPath);
     sanitizedSettings.archiveRootPath = normalizedText(sanitizedSettings.archiveRootPath);
-    sanitizedSettings.manualDownloadRootPath = normalizedText(sanitizedSettings.manualDownloadRootPath);
     sanitizedSettings.primaryGatewayUrl = normalizedText(sanitizedSettings.primaryGatewayUrl);
 
     QSqlQuery deleteQuery(database_);
@@ -293,8 +328,8 @@ bool AppDatabase::saveSettings(const AppSettings &settings)
         "retry_cooldown_minutes, retry_limit, download_worker_count, "
         "failed_job_retention_value, failed_job_retention_unit, primary_gateway_url, preferred_gateway_urls, "
         "autostart_enabled, minimize_to_tray, start_hidden, bandwidth_limit_kib_per_sec, preview_worker_count, "
-        "auto_join_space_rooms, auto_download_new_media, desired_power_state, updated_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        "auto_join_space_rooms, auto_download_new_media, self_heal_enabled, desired_power_state, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
     query.addBindValue(sanitizedSettings.homeserverUrl);
     query.addBindValue(sanitizedSettings.username);
     query.addBindValue(sanitizedSettings.ownerUserId);
@@ -322,6 +357,7 @@ bool AppDatabase::saveSettings(const AppSettings &settings)
     query.addBindValue(sanitizedSettings.previewWorkerCount);
     query.addBindValue(sanitizedSettings.autoJoinSpaceRooms ? 1 : 0);
     query.addBindValue(sanitizedSettings.autoDownloadNewMedia ? 1 : 0);
+    query.addBindValue(sanitizedSettings.selfHealEnabled ? 1 : 0);
     query.addBindValue(sanitizedSettings.desiredPowerState ? 1 : 0);
     query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
     if (!query.exec()) {
@@ -478,7 +514,7 @@ QVector<DownloadJobRecord> AppDatabase::fetchJobs() const
     const QString now = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
     query.prepare(QStringLiteral(
         "SELECT id, media_item_id, room_id, event_id, mxc_url, source_kind, direct_url, original_filename, mime_type, category, state, retry_count, "
-        "next_eligible_at, last_failure_at, last_error, sha256, saved_relative_path, created_at, updated_at "
+        "next_eligible_at, last_failure_at, received_bytes, total_bytes, last_error, sha256, saved_relative_path, created_at, updated_at "
         "FROM download_jobs "
         "ORDER BY "
         "CASE state "
@@ -512,15 +548,35 @@ QVector<DownloadJobRecord> AppDatabase::fetchJobs() const
         job.retryCount = query.value(11).toInt();
         job.nextEligibleAt = QDateTime::fromString(query.value(12).toString(), Qt::ISODateWithMs);
         job.lastFailureAt = QDateTime::fromString(query.value(13).toString(), Qt::ISODateWithMs);
-        job.lastError = query.value(14).toString();
-        job.sha256 = query.value(15).toString();
-        job.savedRelativePath = query.value(16).toString();
-        job.createdAt = QDateTime::fromString(query.value(17).toString(), Qt::ISODateWithMs);
-        job.updatedAt = QDateTime::fromString(query.value(18).toString(), Qt::ISODateWithMs);
+        job.receivedBytes = query.value(14).toLongLong();
+        job.totalBytes = query.value(15).isNull() ? -1 : query.value(15).toLongLong();
+        job.lastError = query.value(16).toString();
+        job.sha256 = query.value(17).toString();
+        job.savedRelativePath = query.value(18).toString();
+        job.createdAt = QDateTime::fromString(query.value(19).toString(), Qt::ISODateWithMs);
+        job.updatedAt = QDateTime::fromString(query.value(20).toString(), Qt::ISODateWithMs);
         jobs.append(job);
     }
 
     return jobs;
+}
+
+QVector<SharedItemRecord> AppDatabase::fetchSharedItems() const
+{
+    QVector<SharedItemRecord> items;
+    QSqlQuery query(database_);
+    query.prepare(QStringLiteral(
+        "SELECT sha256, source_kind, source_path, bundle_path, library_path, archive_path, "
+        "file_cid, thumbnail_cid, page_cid, landing_page_url, room_id, category, original_filename, mime_type, file_size, updated_at "
+        "FROM tracked_uploads "
+        "ORDER BY updated_at DESC, sha256 ASC"));
+    if (!query.exec()) {
+        return items;
+    }
+    while (query.next()) {
+        items.append(readSharedItemRecord(query));
+    }
+    return items;
 }
 
 QVector<ActivityLogEntry> AppDatabase::fetchRecentLogs(const int limit) const
@@ -747,6 +803,7 @@ void AppDatabase::initializeSchema()
         "preview_worker_count INTEGER NOT NULL DEFAULT 1,"
         "auto_join_space_rooms INTEGER NOT NULL DEFAULT 0,"
         "auto_download_new_media INTEGER NOT NULL DEFAULT 0,"
+        "self_heal_enabled INTEGER NOT NULL DEFAULT 0,"
         "desired_power_state INTEGER NOT NULL,"
         "updated_at TEXT NOT NULL"
         ")"));
@@ -826,6 +883,10 @@ void AppDatabase::initializeSchema()
         execute(QStringLiteral(
             "ALTER TABLE app_settings ADD COLUMN flat_folder_layout INTEGER NOT NULL DEFAULT 0"));
     }
+    if (!columnExists(database_, QStringLiteral("app_settings"), QStringLiteral("self_heal_enabled"))) {
+        execute(QStringLiteral(
+            "ALTER TABLE app_settings ADD COLUMN self_heal_enabled INTEGER NOT NULL DEFAULT 0"));
+    }
 
     execute(QStringLiteral(
         "CREATE TABLE IF NOT EXISTS download_jobs ("
@@ -843,6 +904,8 @@ void AppDatabase::initializeSchema()
         "retry_count INTEGER NOT NULL DEFAULT 0,"
         "next_eligible_at TEXT,"
         "last_failure_at TEXT,"
+        "received_bytes INTEGER NOT NULL DEFAULT 0,"
+        "total_bytes INTEGER,"
         "last_error TEXT,"
         "sha256 TEXT,"
         "saved_relative_path TEXT,"
@@ -850,6 +913,14 @@ void AppDatabase::initializeSchema()
         "updated_at TEXT NOT NULL,"
         "UNIQUE(room_id, event_id)"
         ")"));
+    if (!columnExists(database_, QStringLiteral("download_jobs"), QStringLiteral("received_bytes"))) {
+        execute(QStringLiteral(
+            "ALTER TABLE download_jobs ADD COLUMN received_bytes INTEGER NOT NULL DEFAULT 0"));
+    }
+    if (!columnExists(database_, QStringLiteral("download_jobs"), QStringLiteral("total_bytes"))) {
+        execute(QStringLiteral(
+            "ALTER TABLE download_jobs ADD COLUMN total_bytes INTEGER"));
+    }
 
     execute(QStringLiteral(
         "CREATE TABLE IF NOT EXISTS activity_log ("
@@ -873,6 +944,42 @@ void AppDatabase::initializeSchema()
         "latest_published_at TEXT,"
         "last_error TEXT NOT NULL DEFAULT ''"
         ")"));
+
+    execute(QStringLiteral(
+        "CREATE TABLE IF NOT EXISTS tracked_uploads ("
+        "sha256 TEXT PRIMARY KEY,"
+        "source_kind TEXT NOT NULL DEFAULT 'library',"
+        "source_path TEXT NOT NULL,"
+        "bundle_path TEXT,"
+        "library_path TEXT,"
+        "archive_path TEXT,"
+        "file_cid TEXT,"
+        "thumbnail_cid TEXT,"
+        "page_cid TEXT,"
+        "landing_page_url TEXT,"
+        "room_id TEXT NOT NULL,"
+        "category TEXT NOT NULL,"
+        "original_filename TEXT,"
+        "mime_type TEXT,"
+        "file_size INTEGER NOT NULL DEFAULT 0,"
+        "created_at TEXT NOT NULL,"
+        "updated_at TEXT NOT NULL"
+        ")"));
+    if (!columnExists(database_, QStringLiteral("tracked_uploads"), QStringLiteral("bundle_path"))) {
+        execute(QStringLiteral("ALTER TABLE tracked_uploads ADD COLUMN bundle_path TEXT"));
+    }
+    if (!columnExists(database_, QStringLiteral("tracked_uploads"), QStringLiteral("file_cid"))) {
+        execute(QStringLiteral("ALTER TABLE tracked_uploads ADD COLUMN file_cid TEXT"));
+    }
+    if (!columnExists(database_, QStringLiteral("tracked_uploads"), QStringLiteral("thumbnail_cid"))) {
+        execute(QStringLiteral("ALTER TABLE tracked_uploads ADD COLUMN thumbnail_cid TEXT"));
+    }
+    if (!columnExists(database_, QStringLiteral("tracked_uploads"), QStringLiteral("page_cid"))) {
+        execute(QStringLiteral("ALTER TABLE tracked_uploads ADD COLUMN page_cid TEXT"));
+    }
+    if (!columnExists(database_, QStringLiteral("tracked_uploads"), QStringLiteral("landing_page_url"))) {
+        execute(QStringLiteral("ALTER TABLE tracked_uploads ADD COLUMN landing_page_url TEXT"));
+    }
 
     execute(QStringLiteral(
         "CREATE TABLE IF NOT EXISTS space_auto_joins ("

@@ -22,6 +22,7 @@ public:
     QVector<AttachmentDiscovery> fetchDiscoveries() const;
     QVector<AttachmentDiscovery> fetchDiscoveriesPage(const QString &roomId, int offset, int limit) const;
     int fetchDiscoveryCount(const QString &roomId = QString()) const;
+    QVector<SharedItemRecord> fetchSharedItems() const;
     QVector<DownloadJobRecord> fetchJobs() const;
     QVector<ActivityLogEntry> fetchRecentLogs(int limit = 500) const;
     QVector<ActivityLogEntry> fetchLogsPage(int offset, int limit, bool problemsOnly) const;

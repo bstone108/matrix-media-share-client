@@ -189,6 +189,7 @@ QJsonObject settingsToJson(const AppSettings &settings)
         {QStringLiteral("previewWorkerCount"), settings.previewWorkerCount},
         {QStringLiteral("autoJoinSpaceRooms"), settings.autoJoinSpaceRooms},
         {QStringLiteral("autoDownloadNewMedia"), settings.autoDownloadNewMedia},
+        {QStringLiteral("selfHealEnabled"), settings.selfHealEnabled},
         {QStringLiteral("desiredPowerState"), settings.desiredPowerState},
     };
 }
@@ -476,6 +477,21 @@ bool ProcessMatrixClientBackend::importIpfsLink(const QString &link, QString &er
         },
         errorMessage,
         60000);
+}
+
+bool ProcessMatrixClientBackend::deleteSharedItem(const QString &sha256, QString &errorMessage)
+{
+    if (!ensureProcess(errorMessage)) {
+        return false;
+    }
+
+    return sendCommand(
+        QJsonObject {
+            {QStringLiteral("type"), QStringLiteral("deleteSharedItem")},
+            {QStringLiteral("sha256"), sha256},
+        },
+        errorMessage,
+        120000);
 }
 
 bool ProcessMatrixClientBackend::openDiscovery(const QString &roomId, const QString &eventId, QString &errorMessage)

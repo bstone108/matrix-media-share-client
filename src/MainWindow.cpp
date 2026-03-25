@@ -178,6 +178,24 @@ QString dataSizeText(const qint64 bytes)
     return QLocale().formattedDataSize(bytes);
 }
 
+QString transferProgressText(const qint64 receivedBytes, const qint64 totalBytes)
+{
+    if (totalBytes > 0) {
+        const double fraction = qBound(
+            0.0,
+            static_cast<double>(receivedBytes) / static_cast<double>(totalBytes),
+            1.0);
+        return QStringLiteral("%1 of %2 (%3%)")
+            .arg(dataSizeText(receivedBytes),
+                 dataSizeText(totalBytes),
+                 QString::number(fraction * 100.0, 'f', 0));
+    }
+    if (receivedBytes > 0) {
+        return dataSizeText(receivedBytes);
+    }
+    return QString();
+}
+
 QPixmap renderDiscoveryTile(
     const QSize &size,
     const QString &headline,
@@ -793,26 +811,36 @@ QWidget *MainWindow::buildLibraryPage()
     auto *page = new QWidget(this);
     auto *layout = new QVBoxLayout(page);
     libraryList_ = new QListWidget(page);
-    openLibraryButton_ = new QPushButton(QStringLiteral("Open Selected File"), page);
+    libraryList_->setViewMode(QListView::IconMode);
+    libraryList_->setResizeMode(QListView::Adjust);
+    libraryList_->setMovement(QListView::Static);
+    libraryList_->setIconSize(QSize(kDiscoveryTileWidth, kDiscoveryTileHeight));
+    libraryList_->setGridSize(QSize(kDiscoveryGridWidth, kDiscoveryGridHeight));
+    libraryList_->setSpacing(12);
+    libraryList_->setWordWrap(true);
+    libraryList_->setTextElideMode(Qt::ElideRight);
+    libraryList_->setSelectionMode(QAbstractItemView::SingleSelection);
+    libraryList_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    openLibraryButton_ = new QPushButton(QStringLiteral("Open Selected"), page);
+    deleteLibraryButton_ = new QPushButton(QStringLiteral("Delete Selected"), page);
+    auto *buttonRow = new QHBoxLayout();
+    buttonRow->addWidget(openLibraryButton_);
+    buttonRow->addWidget(deleteLibraryButton_);
+    buttonRow->addStretch();
     layout->addWidget(libraryList_, 1);
-    layout->addWidget(openLibraryButton_);
+    layout->addLayout(buttonRow);
 
-    connect(openLibraryButton_, &QPushButton::clicked, this, [this]() {
-        const QListWidgetItem *item = libraryList_->currentItem();
-        if (item == nullptr) {
-            return;
+    connect(openLibraryButton_, &QPushButton::clicked, this, &MainWindow::openSelectedSharedItem);
+    connect(deleteLibraryButton_, &QPushButton::clicked, this, &MainWindow::deleteSelectedSharedItem);
+    connect(libraryList_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) {
+        if (item != nullptr) {
+            openSelectedSharedItem();
         }
-        const QString relativePath = item->data(Qt::UserRole).toString();
-        if (relativePath.isEmpty()) {
-            return;
-        }
-        const QString fullPath = QDir::isAbsolutePath(relativePath)
-            ? relativePath
-            : controller_->settings().destinationRootPath + QStringLiteral("/") + relativePath;
-        QDesktopServices::openUrl(QUrl::fromLocalFile(fullPath));
     });
     connect(libraryList_, &QListWidget::currentRowChanged, this, [this]() {
-        openLibraryButton_->setEnabled(libraryList_->currentItem() != nullptr);
+        const bool hasSelection = libraryList_->currentItem() != nullptr;
+        openLibraryButton_->setEnabled(hasSelection);
+        deleteLibraryButton_->setEnabled(hasSelection);
     });
 
     return page;
@@ -926,6 +954,7 @@ QWidget *MainWindow::buildSettingsPage()
     startHiddenCheck_ = new QCheckBox(content);
     archiveScanEnabledCheck_ = new QCheckBox(content);
     archiveHighPriorityCheck_ = new QCheckBox(content);
+    selfHealCheck_ = new QCheckBox(content);
     flatFolderLayoutCheck_ = new QCheckBox(content);
     autoJoinSpacesCheck_ = new QCheckBox(content);
     autoDownloadCheck_ = new QCheckBox(content);
@@ -978,10 +1007,9 @@ QWidget *MainWindow::buildSettingsPage()
         });
     };
 
-    addPathPickerRow(QStringLiteral("Destination Root"), destinationEdit_, QStringLiteral("Choose Destination Root"));
-    addPathPickerRow(QStringLiteral("Shared Files Root"), libraryEdit_, QStringLiteral("Choose Shared Files Root"));
+    addPathPickerRow(QStringLiteral("Downloads Root"), destinationEdit_, QStringLiteral("Choose Downloads Root"));
+    addPathPickerRow(QStringLiteral("Shared Files Root (Managed)"), libraryEdit_, QStringLiteral("Choose Shared Files Root"));
     addPathPickerRow(QStringLiteral("Archive Root"), archiveEdit_, QStringLiteral("Choose Archive Root"));
-    addPathPickerRow(QStringLiteral("Downloads Root"), manualDownloadsEdit_, QStringLiteral("Choose Downloads Root"));
 
     form->addRow(QStringLiteral("Homeserver"), homeserverEdit_);
     form->addRow(QStringLiteral("Username"), usernameEdit_);
@@ -992,6 +1020,7 @@ QWidget *MainWindow::buildSettingsPage()
     form->addRow(QStringLiteral("Last Checked"), lastCheckedLabel_);
     form->addRow(QStringLiteral("Archive Scan Enabled"), archiveScanEnabledCheck_);
     form->addRow(QStringLiteral("Archive Scan High Priority"), archiveHighPriorityCheck_);
+    form->addRow(QStringLiteral("Self-Heal Shared Files"), selfHealCheck_);
     form->addRow(QStringLiteral("Flat Folder Layout"), flatFolderLayoutCheck_);
     form->addRow(QStringLiteral("Primary Gateway"), primaryGatewayEdit_);
     form->addRow(QStringLiteral("Preferred Gateways"), preferredGatewaysEdit_);
@@ -1040,7 +1069,7 @@ QWidget *MainWindow::buildSettingsPage()
     form->insertRow(7, QStringLiteral("Settings Database"), settingsDatabasePathLabel_);
     form->insertRow(8, QStringLiteral("Secret Store"), secretStorePathLabel_);
 
-    for (QLineEdit *edit : {homeserverEdit_, usernameEdit_, passwordEdit_, destinationEdit_, libraryEdit_, archiveEdit_, manualDownloadsEdit_, primaryGatewayEdit_}) {
+    for (QLineEdit *edit : {homeserverEdit_, usernameEdit_, passwordEdit_, destinationEdit_, libraryEdit_, archiveEdit_, primaryGatewayEdit_}) {
         connect(edit, &QLineEdit::textChanged, this, [this]() {
             markSettingsDirty();
         });
@@ -1053,7 +1082,7 @@ QWidget *MainWindow::buildSettingsPage()
             markSettingsDirty();
         });
     }
-    for (QCheckBox *check : {archiveScanEnabledCheck_, archiveHighPriorityCheck_, flatFolderLayoutCheck_, autostartCheck_, minimizeToTrayCheck_, startHiddenCheck_, autoJoinSpacesCheck_, autoDownloadCheck_}) {
+    for (QCheckBox *check : {archiveScanEnabledCheck_, archiveHighPriorityCheck_, selfHealCheck_, flatFolderLayoutCheck_, autostartCheck_, minimizeToTrayCheck_, startHiddenCheck_, autoJoinSpacesCheck_, autoDownloadCheck_}) {
         connect(check, &QCheckBox::toggled, this, [this](bool) {
             markSettingsDirty();
         });
@@ -1197,16 +1226,65 @@ void MainWindow::populateBrowserPage()
 
 void MainWindow::populateLibraryPage()
 {
-    libraryList_->clear();
-    for (const DownloadJobRecord &job : controller_->jobs()) {
-        if (!isSavedState(job.state) || job.savedRelativePath.isEmpty()) {
-            continue;
-        }
-        auto *item = new QListWidgetItem(jobTitle(job), libraryList_);
-        item->setData(Qt::UserRole, job.savedRelativePath);
-        item->setToolTip(job.savedRelativePath);
+    if (libraryList_ == nullptr) {
+        return;
     }
-    openLibraryButton_->setEnabled(libraryList_->currentItem() != nullptr);
+
+    const QVector<SharedItemRecord> items = controller_->sharedItems();
+    const QString signature = sharedItemSignature(items);
+    const QString selectedSha = libraryList_->currentItem() != nullptr
+        ? libraryList_->currentItem()->data(Qt::UserRole).toString()
+        : QString();
+
+    if (signature == sharedItemsSignature_) {
+        const bool hasSelection = libraryList_->currentItem() != nullptr;
+        openLibraryButton_->setEnabled(hasSelection);
+        if (deleteLibraryButton_ != nullptr) {
+            deleteLibraryButton_->setEnabled(hasSelection);
+        }
+        return;
+    }
+
+    sharedItemsSignature_ = signature;
+    sharedItemIconCache_.clear();
+
+    QSignalBlocker blocker(libraryList_);
+    libraryList_->setUpdatesEnabled(false);
+    libraryList_->clear();
+
+    int selectedRow = -1;
+    for (int index = 0; index < items.size(); ++index) {
+        const SharedItemRecord &item = items.at(index);
+        auto *listItem = new QListWidgetItem(sharedItemIcon(item), QStringLiteral("%1 | %2")
+            .arg(mediaCategoryTitle(item.category).toUpper(), sharedItemOriginLabel(item).toUpper()));
+        listItem->setData(Qt::UserRole, item.sha256);
+        listItem->setData(Qt::UserRole + 1, sharedItemLocalPath(item));
+        listItem->setData(Qt::UserRole + 2, item.originalFilename);
+        listItem->setData(Qt::UserRole + 3, item.mimeType);
+        listItem->setData(Qt::UserRole + 4, static_cast<int>(item.category));
+        listItem->setToolTip(
+            QStringLiteral("%1\nHash: %2\nSource: %3\nUpdated: %4")
+                .arg(
+                    item.originalFilename.isEmpty() ? item.sha256.left(16) : item.originalFilename,
+                    item.sha256,
+                    QDir::toNativeSeparators(sharedItemLocalPath(item)),
+                    displayDateTime(item.updatedAt)));
+        libraryList_->addItem(listItem);
+        if (!selectedSha.isEmpty() && item.sha256 == selectedSha) {
+            selectedRow = index;
+        }
+    }
+
+    if (selectedRow >= 0) {
+        libraryList_->setCurrentRow(selectedRow);
+    }
+
+    libraryList_->setUpdatesEnabled(true);
+    const bool hasSelection = libraryList_->currentItem() != nullptr;
+    openLibraryButton_->setEnabled(hasSelection);
+    if (deleteLibraryButton_ != nullptr) {
+        deleteLibraryButton_->setEnabled(hasSelection);
+    }
 }
 
 void MainWindow::populateRoomSidebar()
@@ -1274,10 +1352,13 @@ void MainWindow::populateTransfersPage()
 
     activeDownloadsList_->clear();
     for (const ActiveDownloadSnapshot &download : controller_->runtime().activeDownloads) {
-        activeDownloadsList_->addItem(QStringLiteral("Worker %1: %2 (%3 bytes)")
-                                          .arg(download.workerId)
-                                          .arg(download.filename)
-                                          .arg(download.receivedBytes));
+        const QString progress = transferProgressText(download.receivedBytes, download.totalBytes);
+        activeDownloadsList_->addItem(
+            progress.isEmpty()
+                ? QStringLiteral("Worker %1: %2").arg(download.workerId).arg(download.filename)
+                : QStringLiteral("Worker %1: %2 (%3)")
+                      .arg(download.workerId)
+                      .arg(download.filename, progress));
     }
 
     QVector<DownloadJobRecord> waitingJobs;
@@ -1293,9 +1374,14 @@ void MainWindow::populateTransfersPage()
     waitingJobsTable_->setRowCount(waitingJobs.size());
     for (int row = 0; row < waitingJobs.size(); ++row) {
         const DownloadJobRecord &job = waitingJobs.at(row);
+        QString stateText = downloadJobStateTitle(job.state);
+        const QString progress = transferProgressText(job.receivedBytes, job.totalBytes);
+        if (!progress.isEmpty()) {
+            stateText += QStringLiteral(" (%1)").arg(progress);
+        }
         waitingJobsTable_->setItem(row, 0, new QTableWidgetItem(jobTitle(job)));
         waitingJobsTable_->setItem(row, 1, new QTableWidgetItem(job.roomId));
-        waitingJobsTable_->setItem(row, 2, new QTableWidgetItem(downloadJobStateTitle(job.state)));
+        waitingJobsTable_->setItem(row, 2, new QTableWidgetItem(stateText));
         waitingJobsTable_->setItem(row, 3, new QTableWidgetItem(job.lastError));
     }
 
@@ -1370,8 +1456,8 @@ void MainWindow::populateSettingsPage()
     archiveEdit_->setText(settings.archiveRootPath);
     archiveScanEnabledCheck_->setChecked(settings.archiveScanEnabled);
     archiveHighPriorityCheck_->setChecked(settings.archiveScanHighPriority);
+    selfHealCheck_->setChecked(settings.selfHealEnabled);
     flatFolderLayoutCheck_->setChecked(settings.flatFolderLayout);
-    manualDownloadsEdit_->setText(settings.manualDownloadRootPath);
     primaryGatewayEdit_->setText(settings.primaryGatewayUrl);
     preferredGatewaysEdit_->setPlainText(settings.preferredGatewayUrls.join(QStringLiteral("\n")));
     messageLimitSpin_->setValue(settings.messageLimit);
@@ -1435,8 +1521,13 @@ void MainWindow::populateVerificationPage()
 
 void MainWindow::refreshViewerDialog()
 {
-    const ViewerSnapshot &viewer = controller_->runtime().viewer;
-    if (viewer.state == ViewerState::Idle || viewer.sessionId == 0) {
+    const ViewerSnapshot runtimeViewer = controller_->runtime().viewer;
+    const bool runtimeViewerActive = runtimeViewer.state != ViewerState::Idle && runtimeViewer.sessionId != 0;
+    const bool localViewerActive = localViewerActive_ && localViewerSnapshot_.state != ViewerState::Idle
+        && localViewerSnapshot_.sessionId != 0;
+    const ViewerSnapshot viewer = runtimeViewerActive ? runtimeViewer : localViewerSnapshot_;
+
+    if ((!runtimeViewerActive && !localViewerActive) || viewer.state == ViewerState::Idle || viewer.sessionId == 0) {
         if (viewerDialog_ != nullptr) {
             viewerDialog_->hide();
         }
@@ -1452,7 +1543,7 @@ void MainWindow::refreshViewerDialog()
         return;
     }
 
-    if (viewer.sessionId == viewerDismissedSessionId_) {
+    if (runtimeViewerActive && viewer.sessionId == viewerDismissedSessionId_) {
         return;
     }
 
@@ -1564,7 +1655,13 @@ void MainWindow::ensureViewerDialog()
     });
 
     connect(closeButton, &QPushButton::clicked, this, [this]() {
-        viewerDismissedSessionId_ = controller_->runtime().viewer.sessionId;
+        const ViewerSnapshot runtimeViewer = controller_->runtime().viewer;
+        if (runtimeViewer.state != ViewerState::Idle && runtimeViewer.sessionId != 0) {
+            viewerDismissedSessionId_ = runtimeViewer.sessionId;
+        } else {
+            localViewerActive_ = false;
+            localViewerSnapshot_ = ViewerSnapshot {};
+        }
         if (viewerMediaPlayer_ != nullptr) {
             viewerMediaPlayer_->stop();
         }
@@ -1577,7 +1674,13 @@ void MainWindow::ensureViewerDialog()
     });
     connect(viewerDialog_, &QDialog::finished, this, [this](int result) {
         Q_UNUSED(result);
-        viewerDismissedSessionId_ = controller_->runtime().viewer.sessionId;
+        const ViewerSnapshot runtimeViewer = controller_->runtime().viewer;
+        if (runtimeViewer.state != ViewerState::Idle && runtimeViewer.sessionId != 0) {
+            viewerDismissedSessionId_ = runtimeViewer.sessionId;
+        } else {
+            localViewerActive_ = false;
+            localViewerSnapshot_ = ViewerSnapshot {};
+        }
         if (viewerMediaPlayer_ != nullptr) {
             viewerMediaPlayer_->stop();
         }
@@ -1679,6 +1782,192 @@ void MainWindow::loadViewerMedia(const ViewerSnapshot &viewer)
     viewerDialog_->setGeometry(geometry);
 }
 
+void MainWindow::openSelectedSharedItem()
+{
+    if (libraryList_ == nullptr || libraryList_->currentItem() == nullptr) {
+        return;
+    }
+
+    const QListWidgetItem *item = libraryList_->currentItem();
+    const QString filePath = item->data(Qt::UserRole + 1).toString();
+    if (filePath.trimmed().isEmpty()) {
+        controller_->recordWarning(QStringLiteral("shared-files"), QStringLiteral("The selected shared item has no available local file."));
+        return;
+    }
+
+    openLocalViewerFile(
+        filePath,
+        item->data(Qt::UserRole + 2).toString(),
+        item->data(Qt::UserRole + 3).toString(),
+        static_cast<MediaCategory>(item->data(Qt::UserRole + 4).toInt()));
+}
+
+void MainWindow::deleteSelectedSharedItem()
+{
+    if (libraryList_ == nullptr || libraryList_->currentItem() == nullptr) {
+        return;
+    }
+
+    const QString sha256 = libraryList_->currentItem()->data(Qt::UserRole).toString().trimmed();
+    if (sha256.isEmpty()) {
+        controller_->recordWarning(QStringLiteral("shared-files"), QStringLiteral("The selected shared item could not be identified for cleanup."));
+        return;
+    }
+
+    controller_->deleteSharedItem(sha256);
+}
+
+QString MainWindow::sharedItemLocalPath(const SharedItemRecord &item) const
+{
+    const QStringList candidates = {
+        item.sourcePath,
+        item.libraryPath,
+        item.archivePath,
+    };
+
+    for (const QString &candidate : candidates) {
+        if (!candidate.trimmed().isEmpty() && QFileInfo::exists(candidate)) {
+            return candidate;
+        }
+    }
+
+    if (!item.bundlePath.trimmed().isEmpty()) {
+        const QDir bundleDir(item.bundlePath);
+        const QFileInfoList entries = bundleDir.entryInfoList(QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
+        for (const QFileInfo &entry : entries) {
+            const QString lowerName = entry.fileName().toLower();
+            if (lowerName == QStringLiteral("index.html") || lowerName == QStringLiteral("thumbnail.jpg")) {
+                continue;
+            }
+            return entry.absoluteFilePath();
+        }
+    }
+
+    return {};
+}
+
+QString MainWindow::sharedItemThumbnailPath(const SharedItemRecord &item) const
+{
+    if (!item.bundlePath.trimmed().isEmpty()) {
+        const QString bundleThumbnail = QDir(item.bundlePath).filePath(QStringLiteral("thumbnail.jpg"));
+        if (QFileInfo::exists(bundleThumbnail)) {
+            return bundleThumbnail;
+        }
+    }
+
+    const QString localPath = sharedItemLocalPath(item);
+    if (!localPath.isEmpty()
+        && (item.category == MediaCategory::Images || item.mimeType.startsWith(QStringLiteral("image/")))) {
+        return localPath;
+    }
+    return {};
+}
+
+QString MainWindow::sharedItemOriginLabel(const SharedItemRecord &item) const
+{
+    const QString sourcePath = item.sourcePath.trimmed();
+    const QString archivePath = item.archivePath.trimmed();
+    const QString libraryPath = item.libraryPath.trimmed();
+    const QString downloadsRoot = controller_->settings().destinationRootPath.trimmed();
+    const QString sharedRoot = controller_->settings().libraryRootPath.trimmed();
+
+    if (!archivePath.isEmpty() && sourcePath == archivePath) {
+        return QStringLiteral("Archive");
+    }
+    if (!libraryPath.isEmpty() && sourcePath == libraryPath) {
+        return QStringLiteral("Shared");
+    }
+    if (!downloadsRoot.isEmpty() && sourcePath.startsWith(downloadsRoot, Qt::CaseInsensitive)) {
+        return QStringLiteral("Downloads");
+    }
+    if (!sharedRoot.isEmpty() && sourcePath.startsWith(sharedRoot, Qt::CaseInsensitive)) {
+        return QStringLiteral("Shared");
+    }
+    if (!archivePath.isEmpty()) {
+        return QStringLiteral("Archive");
+    }
+    return QStringLiteral("Shared");
+}
+
+QString MainWindow::sharedItemSignature(const QVector<SharedItemRecord> &items) const
+{
+    QStringList tokens;
+    tokens.reserve(items.size());
+    for (const SharedItemRecord &item : items) {
+        tokens.append(QStringLiteral("%1|%2|%3")
+                          .arg(item.sha256,
+                               item.updatedAt.toString(Qt::ISODateWithMs),
+                               item.sourcePath));
+    }
+    return tokens.join(QChar(0x1f));
+}
+
+QIcon MainWindow::sharedItemIcon(const SharedItemRecord &item)
+{
+    const QString cacheKey = QStringLiteral("%1|%2|%3")
+        .arg(item.sha256, item.updatedAt.toString(Qt::ISODateWithMs), sharedItemLocalPath(item));
+    const auto cached = sharedItemIconCache_.constFind(cacheKey);
+    if (cached != sharedItemIconCache_.cend()) {
+        return cached.value();
+    }
+
+    QIcon icon;
+    const QString previewPath = sharedItemThumbnailPath(item);
+    if (!previewPath.isEmpty()) {
+        const QImage image = loadAutoTransformedImageFromFile(previewPath);
+        const QPixmap preview = QPixmap::fromImage(image);
+        if (!preview.isNull()) {
+            icon = QIcon(renderDiscoveryTile(
+                QSize(kDiscoveryTileWidth, kDiscoveryTileHeight),
+                item.originalFilename.isEmpty() ? item.sha256.left(16) : item.originalFilename,
+                QString(),
+                categoryAccent(item.category),
+                &preview,
+                item.category == MediaCategory::Videos || item.mimeType.startsWith(QStringLiteral("video/"))));
+        }
+    }
+
+    if (icon.isNull()) {
+        icon = QIcon(renderDiscoveryTile(
+            QSize(kDiscoveryTileWidth, kDiscoveryTileHeight),
+            item.originalFilename.isEmpty() ? item.sha256.left(16) : item.originalFilename,
+            QString(),
+            categoryAccent(item.category),
+            nullptr,
+            item.category == MediaCategory::Videos || item.mimeType.startsWith(QStringLiteral("video/"))));
+    }
+
+    sharedItemIconCache_.insert(cacheKey, icon);
+    return icon;
+}
+
+void MainWindow::openLocalViewerFile(
+    const QString &filePath,
+    const QString &displayName,
+    const QString &mimeType,
+    const MediaCategory category)
+{
+    ViewerSnapshot snapshot;
+    snapshot.sessionId = nextLocalViewerSessionId_++;
+    snapshot.fileName = displayName.isEmpty() ? QFileInfo(filePath).fileName() : displayName;
+    snapshot.mimeType = mimeType;
+    snapshot.category = category;
+    snapshot.localPath = filePath;
+
+    if (QFileInfo::exists(filePath)) {
+        snapshot.state = ViewerState::Ready;
+        snapshot.totalBytes = QFileInfo(filePath).size();
+        snapshot.receivedBytes = snapshot.totalBytes;
+    } else {
+        snapshot.state = ViewerState::Error;
+        snapshot.error = QStringLiteral("The file is no longer available at %1").arg(QDir::toNativeSeparators(filePath));
+    }
+
+    localViewerSnapshot_ = snapshot;
+    localViewerActive_ = true;
+    refreshViewerDialog();
+}
+
 AppSettings MainWindow::gatherSettingsFromUi() const
 {
     AppSettings settings = controller_->settings();
@@ -1691,7 +1980,8 @@ AppSettings MainWindow::gatherSettingsFromUi() const
     settings.archiveRootPath = archiveEdit_->text().trimmed();
     settings.archiveScanEnabled = archiveScanEnabledCheck_->isChecked();
     settings.archiveScanHighPriority = archiveHighPriorityCheck_->isChecked();
-    settings.manualDownloadRootPath = manualDownloadsEdit_->text().trimmed();
+    settings.selfHealEnabled = selfHealCheck_->isChecked();
+    settings.manualDownloadRootPath = settings.destinationRootPath;
     settings.primaryGatewayUrl = primaryGatewayEdit_->text().trimmed();
     settings.preferredGatewayUrls = preferredGatewaysEdit_->toPlainText().split('\n', Qt::SkipEmptyParts);
     settings.messageLimit = messageLimitSpin_->value();
@@ -1754,9 +2044,10 @@ void MainWindow::applyDiscoveryPresentation(QListWidgetItem *item, const Attachm
                 0.0,
                 static_cast<double>(activeDownload->receivedBytes) / static_cast<double>(activeDownload->totalBytes),
                 1.0);
-            progressText = QStringLiteral("%1%").arg(QString::number(progressFraction * 100.0, 'f', 0));
+            progressText = transferProgressText(activeDownload->receivedBytes, activeDownload->totalBytes);
         } else {
             progressFraction = 0.2;
+            progressText = transferProgressText(activeDownload->receivedBytes, activeDownload->totalBytes);
         }
         secondaryText = activeDownload->workerId == 0
             ? QStringLiteral("Opening %1").arg(progressText.isEmpty() ? QStringLiteral("...") : progressText)
@@ -1783,8 +2074,16 @@ void MainWindow::applyDiscoveryPresentation(QListWidgetItem *item, const Attachm
             secondaryText = QStringLiteral("Downloaded");
             break;
         case DownloadJobState::Downloading:
-            secondaryText = QStringLiteral("Downloading");
-            progressFraction = 0.2;
+            progressText = transferProgressText(job->receivedBytes, job->totalBytes);
+            secondaryText = progressText.isEmpty()
+                ? QStringLiteral("Downloading")
+                : QStringLiteral("Downloading %1").arg(progressText);
+            progressFraction = job->totalBytes > 0
+                ? qBound(
+                      0.0,
+                      static_cast<double>(job->receivedBytes) / static_cast<double>(job->totalBytes),
+                      1.0)
+                : 0.2;
             break;
         }
     }

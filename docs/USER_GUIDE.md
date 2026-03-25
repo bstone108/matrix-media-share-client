@@ -64,17 +64,22 @@ Important:
 - the app does not auto-join everything by default
 - Browser and Rooms share the room sidebar on the left
 
-## Library
+## Shared Files
 
-This page is for things you have already saved locally.
+This page is for the app-managed files it is actively sharing.
 
 Think of it as:
 
-- your local kept copies
-- things you downloaded on purpose
-- things the app is actively tracking for your use
+- a visual page of shared items with thumbnails
+- a quick place to open shared items in the built-in viewer
+- a management page for the app’s own shared copies
 
-This is different from `Shared Files Root`, which is a storage location. The Library page is the app’s view of saved media, not just a plain folder listing.
+Important:
+
+- deleting from this page only removes the app-managed copy in `Shared Files Root`
+- it does not delete matching files from `Downloads Root`
+- it does not delete anything from `Archive Root`
+- the archive is always treated as your folder, not the app’s folder
 
 ## Transfers
 
@@ -179,12 +184,13 @@ This is mainly for uploads and long-term sharing.
 
 ## Downloads Root
 
-This is for manual IPFS imports and direct manual download actions.
+This is the single final download location for regular downloads and manual IPFS imports.
 
 In simple terms:
 
-- if you paste an IPFS link manually
-- the file goes here
+- if you download something from a room, it goes here
+- if you paste an IPFS link manually, it also goes here
+- IPFS downloads follow the same destination rules as regular downloads
 
 ## Folders The App Manages Automatically
 
@@ -196,7 +202,7 @@ The app also keeps its own internal support folders for:
 - secrets storage
 - temporary viewer downloads
 - cached thumbnails
-- generated IPFS landing pages
+- generated IPFS landing pages and other managed share resources
 - bundled Kubo/IPFS data
 
 Those are managed automatically under the app’s support path.
@@ -235,13 +241,26 @@ Where normal room downloads are saved.
 
 Where the app keeps managed copies of files it is sharing.
 
+How it is organized:
+
+- the app manages this folder automatically
+- each media type gets its own folder
+- inside that is a subfolder named after the file hash
+- thumbnails, landing pages, and related share resources live inside that hash folder
+
+Important:
+
+- this is an app-managed folder
+- the client may rearrange misplaced files inside it
+- the client may purge stray files in it that do not belong to tracked shared items
+
 ## Archive Root
 
 Optional external media library path for dedupe and long-term reuse.
 
 ## Downloads Root
 
-Where manual IPFS imports are saved.
+Where regular downloads and manual IPFS imports are saved.
 
 ## Archive Scan Enabled
 
@@ -355,6 +374,22 @@ If enabled, newly discovered media can be queued automatically.
 
 If disabled, browsing stays selective and manual.
 
+## Self-Heal Shared Files
+
+This is off by default.
+
+When on:
+
+- if a managed shared copy goes missing
+- and the app knows how to recover it from IPFS
+- it can re-download that managed copy at low priority so it can keep sharing it
+
+Important:
+
+- this only affects the app-managed `Shared Files Root`
+- it does not write into `Archive Root`
+- it does not take over your normal downloads
+
 ## Current Version / Update Status / Latest Release / Last Checked
 
 These are for the built-in update checker.
@@ -440,6 +475,19 @@ If you also have an `Archive Root`:
 - then keep using the archive copy instead
 
 That helps save space.
+
+## Shared Files Deletion
+
+If you delete an item from the `Shared Files` page:
+
+- the app removes the tracked shared item
+- it cleans up the matching managed bundle from `Shared Files Root`
+
+What it does not do:
+
+- it does not delete anything from `Downloads Root`
+- it does not delete anything from `Archive Root`
+- it does not modify your archive
 
 ## IPFS Links Versus Raw Media
 

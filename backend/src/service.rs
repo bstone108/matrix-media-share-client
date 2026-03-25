@@ -42,7 +42,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{Mutex, RwLock, Semaphore, mpsc},
     task::JoinHandle,
-    time::sleep,
+    time::{sleep, timeout},
 };
 use uuid::Uuid;
 
@@ -57,7 +57,7 @@ use crate::{
         ViewerState,
         VerificationEmoji, VerificationSnapshot, VerificationStatus,
     },
-    gateway_registry::BOOTSTRAP_PRIMARY_GATEWAY,
+    gateway_registry::{BOOTSTRAP_PRIMARY_GATEWAY, page_url, raw_file_url},
     ipfs_service::IpfsService,
     media_classification,
     protocol::{Command, ServerEvent},
@@ -70,6 +70,14 @@ const DOWNLOAD_IDLE_DELAY: Duration = Duration::from_secs(1);
 const DOWNLOAD_ERROR_DELAY: Duration = Duration::from_secs(2);
 const SHARE_QUEUE_DELAY: Duration = Duration::from_secs(10);
 const MAX_DISCOVERY_CACHE_ENTRIES: usize = 12_000;
+const MANUAL_IPFS_ROOM_ID: &str = "__manual_ipfs__";
+const MANUAL_IPFS_FOLDER_LABEL: &str = "Imported IPFS";
+const DOWNLOAD_PROGRESS_PERSIST_BYTES: i64 = 256 * 1024;
+const HASH_ROOT_ARCHIVE: &str = "archive";
+const HASH_ROOT_DOWNLOADS: &str = "downloads";
+const HASH_ROOT_SHARED: &str = "shared";
+const MANAGED_SHARE_SCAN_INTERVAL: Duration = Duration::from_secs(300);
+const MANAGED_SHARE_ITEM_DELAY: Duration = Duration::from_millis(500);
 
 pub enum CommandOutcome {
     Continue,
@@ -249,6 +257,10 @@ impl BackendService {
             Command::ImportIpfsLink { link } => {
                 let running = self.running_context()?;
                 import_ipfs_link(&running, &link).await?;
+                Ok(CommandOutcome::Continue)
+            }
+            Command::DeleteSharedItem { sha256 } => {
+                delete_shared_item(&self.database, &self.paths, self.running.as_ref(), &sha256).await?;
                 Ok(CommandOutcome::Continue)
             }
             Command::OpenDiscovery { room_id, event_id } => {
@@ -476,6 +488,7 @@ impl BackendService {
             tokio::spawn(watch_verification_state(context.clone())),
             tokio::spawn(periodic_room_refresh(context.clone())),
             tokio::spawn(archive_scan_loop(context.clone())),
+            tokio::spawn(managed_share_maintenance_loop(context.clone())),
         ];
         self.running = Some(RunningService { context, handles });
 
@@ -704,6 +717,7 @@ impl DownloadManager {
         let settings = self.settings.read().await.clone();
         let temp_path = download_media_to_temp(
             &self.client,
+            &self.database,
             &self.paths,
             &self.runtime,
             worker_id,
@@ -722,6 +736,7 @@ impl DownloadManager {
 
         let result = async {
             validate_downloaded_media(&temp_path, job.category).await?;
+            let final_size = tokio_fs::metadata(&temp_path).await?.len() as i64;
             let sha256 = sha256_file(&temp_path).await?;
 
             if let Some(existing) = self
@@ -730,7 +745,12 @@ impl DownloadManager {
                 .await?
             {
                 self.database
-                    .mark_job_duplicate(job.id, &sha256, existing.saved_relative_path.as_deref())
+                    .mark_job_duplicate(
+                        job.id,
+                        &sha256,
+                        existing.saved_relative_path.as_deref(),
+                        final_size,
+                    )
                     .await?;
                 self.database
                     .insert_log(
@@ -752,25 +772,21 @@ impl DownloadManager {
                 job.mime_type.as_deref(),
             );
             let final_name = ext.map_or_else(|| sha256.clone(), |ext| format!("{sha256}.{ext}"));
-            let (final_path, stored_path) = if job.source_kind == crate::domain::MediaSourceKind::Ipfs {
-                let downloads_root = configured_downloads_root(&settings, &self.paths);
-                tokio_fs::create_dir_all(&downloads_root).await?;
-                let final_path = downloads_root.join(final_name);
-                let stored_path = final_path.to_string_lossy().to_string();
-                (final_path, stored_path)
-            } else {
-                let category_folder = self
-                    .room_catalog
-                    .category_folder(&job.room_id, job.category, &settings)
-                    .await?;
-                let final_path = category_folder.join(final_name);
-                let stored_path = relative_storage_path(&settings.destination_root_path, &final_path);
-                (final_path, stored_path)
-            };
+            let destination_root = configured_destination_root(&settings, &self.paths);
+            let destination_folder = download_job_destination_folder(
+                &self.room_catalog,
+                &self.paths,
+                &settings,
+                &job.room_id,
+                job.category,
+            )
+            .await?;
+            let final_path = destination_folder.join(final_name);
+            let stored_path = relative_storage_path(&destination_root.to_string_lossy(), &final_path);
 
             if final_path.exists() {
                 self.database
-                    .mark_job_duplicate(job.id, &sha256, Some(&stored_path))
+                    .mark_job_duplicate(job.id, &sha256, Some(&stored_path), final_size)
                     .await?;
                 return Ok(());
             }
@@ -788,7 +804,7 @@ impl DownloadManager {
             }
 
             self.database
-                .mark_job_completed(job.id, &sha256, &stored_path)
+                .mark_job_completed(job.id, &sha256, &stored_path, final_size)
                 .await?;
             self.database
                 .insert_log(
@@ -985,10 +1001,13 @@ fn runtime_user_id_from_settings(settings: &AppSettings) -> Option<String> {
 
 #[derive(Clone)]
 struct PreparedShareSource {
+    sha256: String,
+    category: MediaCategory,
     file_name: String,
     content_type: Mime,
     file_size: i64,
     source_path: PathBuf,
+    bundle_path: PathBuf,
 }
 
 async fn queue_share_requests(
@@ -1115,6 +1134,7 @@ async fn archive_scan_loop(context: Arc<RunningContext>) {
         } else {
             Duration::from_millis(250)
         };
+        let mut seen_archive_paths = HashSet::new();
 
         for archive_path in discovered_paths {
             let metadata = match tokio_fs::metadata(&archive_path).await {
@@ -1122,7 +1142,12 @@ async fn archive_scan_loop(context: Arc<RunningContext>) {
                 _ => continue,
             };
 
-            let sha256 = match sha256_file(&archive_path).await {
+            let canonical_archive_path = tokio_fs::canonicalize(&archive_path)
+                .await
+                .unwrap_or_else(|_| archive_path.clone());
+            seen_archive_paths.insert(canonical_archive_path.to_string_lossy().to_string());
+
+            let sha256 = match sha256_with_cache(&context.database, &canonical_archive_path, HASH_ROOT_ARCHIVE).await {
                 Ok(sha256) => sha256,
                 Err(error) => {
                     let _ = context
@@ -1141,7 +1166,7 @@ async fn archive_scan_loop(context: Arc<RunningContext>) {
                 .modified()
                 .ok()
                 .map(DateTime::<Utc>::from);
-            let archive_path_string = archive_path.to_string_lossy().to_string();
+            let archive_path_string = canonical_archive_path.to_string_lossy().to_string();
             if context
                 .database
                 .upsert_archive_file(
@@ -1153,7 +1178,7 @@ async fn archive_scan_loop(context: Arc<RunningContext>) {
                 .await
                 .is_ok()
             {
-                let _ = repoint_tracked_upload_to_archive(&context, &sha256, &archive_path).await;
+                let _ = repoint_tracked_upload_to_archive(&context, &sha256, &canonical_archive_path).await;
             }
 
             if per_file_delay > Duration::ZERO {
@@ -1161,8 +1186,504 @@ async fn archive_scan_loop(context: Arc<RunningContext>) {
             }
         }
 
+        let _ = context
+            .database
+            .prune_archive_files_to_paths(&seen_archive_paths)
+            .await;
+        let _ = context
+            .database
+            .prune_file_hash_cache_for_root_kind(HASH_ROOT_ARCHIVE, &seen_archive_paths)
+            .await;
+
         sleep(Duration::from_secs(300)).await;
     }
+}
+
+async fn managed_share_maintenance_loop(context: Arc<RunningContext>) {
+    loop {
+        if let Err(error) = maintain_managed_share_store(&context).await {
+            let _ = context
+                .database
+                .insert_log(
+                    AppLogLevel::Warning,
+                    "shared-files",
+                    &format!("Managed shared-files maintenance failed: {error:#}"),
+                )
+                .await;
+        }
+        sleep(MANAGED_SHARE_SCAN_INTERVAL).await;
+    }
+}
+
+async fn maintain_managed_share_store(context: &Arc<RunningContext>) -> Result<()> {
+    let settings = context.settings.read().await.clone();
+    let shared_root = configured_library_root(&settings, &context.paths);
+    tokio_fs::create_dir_all(&shared_root).await?;
+    let tracked_uploads = context.database.fetch_tracked_uploads().await?;
+    let mut valid_categories = HashSet::new();
+    let mut valid_bundles_by_category: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut valid_shared_media_paths = HashSet::new();
+
+    for mut record in tracked_uploads {
+        let category_key = record.category.as_storage_key().to_owned();
+        valid_categories.insert(category_key.clone());
+        valid_bundles_by_category
+            .entry(category_key.clone())
+            .or_default()
+            .insert(record.sha256.clone());
+
+        let bundle_path = managed_share_bundle_dir(&settings, &context.paths, record.category, &record.sha256);
+        tokio_fs::create_dir_all(&bundle_path).await?;
+        let mut allowed_names = HashSet::from([
+            String::from("index.html"),
+            String::from("thumbnail.jpg"),
+        ]);
+        let expected_media_path = managed_share_media_path(
+            &bundle_path,
+            &record.sha256,
+            media_classification::preferred_extension(
+                record.original_filename.as_deref(),
+                record.mime_type.as_deref(),
+            )
+            .as_deref(),
+        );
+        let expected_media_name = expected_media_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if !expected_media_name.is_empty()
+            && (record.source_kind == LocalAssetSourceKind::Library || record.library_path.is_some())
+        {
+            allowed_names.insert(expected_media_name.clone());
+        }
+
+        let mut changed = false;
+        let bundle_path_string = bundle_path.to_string_lossy().to_string();
+        if record.bundle_path.as_deref() != Some(bundle_path_string.as_str()) {
+            record.bundle_path = Some(bundle_path_string);
+            changed = true;
+        }
+
+        if let Some(library_path) = record.library_path.clone() {
+            let current_library_path = PathBuf::from(&library_path);
+            if current_library_path != expected_media_path
+                && tokio_fs::try_exists(&current_library_path).await.unwrap_or(false)
+            {
+                move_file_cross_filesystem(&current_library_path, &expected_media_path).await?;
+                remember_file_hash(
+                    &context.database,
+                    &expected_media_path,
+                    HASH_ROOT_SHARED,
+                    &record.sha256,
+                )
+                .await?;
+                record.library_path = Some(expected_media_path.to_string_lossy().to_string());
+                if record.source_kind == LocalAssetSourceKind::Library {
+                    record.source_path = expected_media_path.to_string_lossy().to_string();
+                }
+                if !expected_media_name.is_empty() {
+                    allowed_names.insert(expected_media_name.clone());
+                }
+                changed = true;
+            }
+        }
+
+        if record.source_kind == LocalAssetSourceKind::Library
+            && tokio_fs::try_exists(&expected_media_path).await.unwrap_or(false)
+        {
+            valid_shared_media_paths.insert(expected_media_path.to_string_lossy().to_string());
+            remember_file_hash(
+                &context.database,
+                &expected_media_path,
+                HASH_ROOT_SHARED,
+                &record.sha256,
+            )
+            .await?;
+            if record.library_path.as_deref() != Some(expected_media_path.to_string_lossy().as_ref()) {
+                record.library_path = Some(expected_media_path.to_string_lossy().to_string());
+                record.source_path = expected_media_path.to_string_lossy().to_string();
+                changed = true;
+            }
+        }
+
+        let source_exists = match record.source_kind {
+            LocalAssetSourceKind::Library => {
+                tokio_fs::try_exists(&expected_media_path).await.unwrap_or(false)
+            }
+            LocalAssetSourceKind::Downloads | LocalAssetSourceKind::Archive => {
+                tokio_fs::try_exists(&record.source_path).await.unwrap_or(false)
+            }
+        };
+
+        if !source_exists && settings.self_heal_enabled {
+            if let Some(file_cid) = record.file_cid.as_deref() {
+                let recovered = fetch_ipfs_artifact_to_path(
+                    context,
+                    &settings,
+                    file_cid,
+                    None,
+                    &expected_media_path,
+                )
+                .await;
+                if recovered.is_ok() {
+                    remember_file_hash(
+                        &context.database,
+                        &expected_media_path,
+                        HASH_ROOT_SHARED,
+                        &record.sha256,
+                    )
+                    .await?;
+                    record.source_kind = LocalAssetSourceKind::Library;
+                    record.source_path = expected_media_path.to_string_lossy().to_string();
+                    record.library_path = Some(expected_media_path.to_string_lossy().to_string());
+                    if !expected_media_name.is_empty() {
+                        allowed_names.insert(expected_media_name.clone());
+                    }
+                    changed = true;
+                    valid_shared_media_paths.insert(expected_media_path.to_string_lossy().to_string());
+                    context
+                        .database
+                        .insert_log(
+                            AppLogLevel::Info,
+                            "shared-files",
+                            &format!(
+                                "Self-healed managed copy for {} into {}.",
+                                record.sha256,
+                                expected_media_path.display()
+                            ),
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        let thumbnail_path = managed_share_thumbnail_path(&bundle_path);
+        if !tokio_fs::try_exists(&thumbnail_path).await.unwrap_or(false) {
+            if let Some(thumbnail_cid) = record.thumbnail_cid.as_deref() {
+                let _ = fetch_ipfs_artifact_to_path(
+                    context,
+                    &settings,
+                    thumbnail_cid,
+                    Some("image/jpeg"),
+                    &thumbnail_path,
+                )
+                .await;
+            }
+        }
+
+        let landing_page_path = managed_share_landing_page_path(&bundle_path);
+        if !tokio_fs::try_exists(&landing_page_path).await.unwrap_or(false) {
+            if let Some(page_cid) = record.page_cid.as_deref() {
+                let _ = fetch_ipfs_landing_page_to_path(
+                    context,
+                    &settings,
+                    page_cid,
+                    record.landing_page_url.as_deref(),
+                    &landing_page_path,
+                )
+                .await;
+            }
+        }
+
+        purge_managed_bundle_contents(&bundle_path, &allowed_names).await?;
+
+        if changed {
+            record.updated_at = Utc::now();
+            context.database.upsert_tracked_upload(&record).await?;
+        }
+
+        sleep(MANAGED_SHARE_ITEM_DELAY).await;
+    }
+
+    purge_managed_share_root(
+        &shared_root,
+        &valid_categories,
+        &valid_bundles_by_category,
+    )
+    .await?;
+    let _ = context
+        .database
+        .prune_file_hash_cache_for_root_kind(HASH_ROOT_SHARED, &valid_shared_media_paths)
+        .await;
+
+    Ok(())
+}
+
+async fn delete_shared_item(
+    database: &AppDatabase,
+    paths: &AppPaths,
+    running: Option<&RunningService>,
+    sha256: &str,
+) -> Result<()> {
+    let Some(record) = database.find_tracked_upload_by_sha256(sha256).await? else {
+        return Ok(());
+    };
+
+    let settings = if let Some(running) = running {
+        running.context.settings.read().await.clone()
+    } else {
+        database
+            .load_settings(paths.manual_downloads_path.to_string_lossy().as_ref())
+            .await?
+    };
+    let shared_root = configured_library_root(&settings, paths);
+    let expected_bundle_path = managed_share_bundle_dir(&settings, paths, record.category, &record.sha256);
+    let bundle_path = record
+        .bundle_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or(expected_bundle_path);
+
+    if bundle_path.is_absolute() && bundle_path.starts_with(&shared_root) {
+        remove_managed_path(&bundle_path).await;
+        remove_empty_parent_dirs(&bundle_path, &shared_root).await;
+    }
+
+    for candidate in [
+        record.library_path.as_deref(),
+        Some(record.source_path.as_str()),
+    ] {
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        let candidate_path = PathBuf::from(candidate);
+        if !candidate_path.is_absolute()
+            || !candidate_path.starts_with(&shared_root)
+            || candidate_path.starts_with(&bundle_path)
+        {
+            continue;
+        }
+
+        remove_managed_path(&candidate_path).await;
+        remove_empty_parent_dirs(&candidate_path, &shared_root).await;
+    }
+
+    if let Some(library_path) = record.library_path.as_deref() {
+        let library_path = PathBuf::from(library_path);
+        if library_path.is_absolute() && library_path.starts_with(&shared_root) {
+            let _ = database
+                .remove_file_hash_cache_entry(library_path.to_string_lossy().as_ref())
+                .await;
+        }
+    }
+
+    if record.source_kind == LocalAssetSourceKind::Library {
+        let source_path = PathBuf::from(&record.source_path);
+        if source_path.is_absolute() && source_path.starts_with(&shared_root) {
+            let _ = database
+                .remove_file_hash_cache_entry(source_path.to_string_lossy().as_ref())
+                .await;
+        }
+    }
+
+    database.remove_tracked_upload(sha256).await?;
+    database
+        .insert_log(
+            AppLogLevel::Info,
+            "shared-files",
+            &format!("Removed managed shared item {sha256} from Shared Files."),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn remove_managed_path(path: &Path) {
+    match tokio_fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.is_dir() => {
+            let _ = tokio_fs::remove_dir_all(path).await;
+        }
+        Ok(_) => {
+            let _ = tokio_fs::remove_file(path).await;
+        }
+        Err(_) => {}
+    }
+}
+
+async fn remove_empty_parent_dirs(path: &Path, stop_root: &Path) {
+    let mut current = path.parent().map(Path::to_path_buf);
+    while let Some(dir) = current {
+        if dir == stop_root {
+            break;
+        }
+
+        match tokio_fs::read_dir(&dir).await {
+            Ok(mut entries) => match entries.next_entry().await {
+                Ok(None) => {
+                    let _ = tokio_fs::remove_dir(&dir).await;
+                    current = dir.parent().map(Path::to_path_buf);
+                }
+                Ok(Some(_)) | Err(_) => break,
+            },
+            Err(_) => break,
+        }
+    }
+}
+
+async fn purge_managed_bundle_contents(
+    bundle_path: &Path,
+    allowed_names: &HashSet<String>,
+) -> Result<()> {
+    let mut entries = match tokio_fs::read_dir(bundle_path).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        if allowed_names.contains(&name) {
+            continue;
+        }
+        let file_type = entry.file_type().await?;
+        if file_type.is_dir() {
+            let _ = tokio_fs::remove_dir_all(&path).await;
+        } else {
+            let _ = tokio_fs::remove_file(&path).await;
+        }
+    }
+    Ok(())
+}
+
+async fn purge_managed_share_root(
+    shared_root: &Path,
+    valid_categories: &HashSet<String>,
+    valid_bundles_by_category: &HashMap<String, HashSet<String>>,
+) -> Result<()> {
+    let mut category_entries = match tokio_fs::read_dir(shared_root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+
+    while let Some(category_entry) = category_entries.next_entry().await? {
+        let category_name = category_entry.file_name().to_string_lossy().to_string();
+        let category_path = category_entry.path();
+        let category_type = category_entry.file_type().await?;
+        if !category_type.is_dir() || !valid_categories.contains(&category_name) {
+            if category_type.is_dir() {
+                let _ = tokio_fs::remove_dir_all(&category_path).await;
+            } else {
+                let _ = tokio_fs::remove_file(&category_path).await;
+            }
+            continue;
+        }
+
+        let valid_bundles = valid_bundles_by_category
+            .get(&category_name)
+            .cloned()
+            .unwrap_or_default();
+        let mut bundle_entries = tokio_fs::read_dir(&category_path).await?;
+        while let Some(bundle_entry) = bundle_entries.next_entry().await? {
+            let bundle_name = bundle_entry.file_name().to_string_lossy().to_string();
+            let bundle_path = bundle_entry.path();
+            let bundle_type = bundle_entry.file_type().await?;
+            if !bundle_type.is_dir() || !valid_bundles.contains(&bundle_name) {
+                if bundle_type.is_dir() {
+                    let _ = tokio_fs::remove_dir_all(&bundle_path).await;
+                } else {
+                    let _ = tokio_fs::remove_file(&bundle_path).await;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_ipfs_artifact_to_path(
+    context: &Arc<RunningContext>,
+    settings: &AppSettings,
+    cid: &str,
+    content_type_hint: Option<&str>,
+    destination: &Path,
+) -> Result<()> {
+    let gateway = if settings.primary_gateway_url.trim().is_empty() {
+        BOOTSTRAP_PRIMARY_GATEWAY
+    } else {
+        settings.primary_gateway_url.trim()
+    };
+    let url = raw_file_url(gateway, cid);
+    let _ = content_type_hint;
+    fetch_http_asset_to_path(context, &url, destination, true).await
+}
+
+async fn fetch_ipfs_landing_page_to_path(
+    context: &Arc<RunningContext>,
+    settings: &AppSettings,
+    page_cid: &str,
+    existing_url: Option<&str>,
+    destination: &Path,
+) -> Result<()> {
+    let gateway = if settings.primary_gateway_url.trim().is_empty() {
+        BOOTSTRAP_PRIMARY_GATEWAY
+    } else {
+        settings.primary_gateway_url.trim()
+    };
+    let url = existing_url
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| page_url(gateway, page_cid));
+    fetch_http_asset_to_path(context, &url, destination, true).await
+}
+
+async fn fetch_http_asset_to_path(
+    context: &Arc<RunningContext>,
+    url: &str,
+    destination: &Path,
+    ipfs_like: bool,
+) -> Result<()> {
+    let parsed = reqwest::Url::parse(url)?;
+    let timeout_total = if ipfs_like {
+        Duration::from_secs(20 * 60)
+    } else {
+        Duration::from_secs(5 * 60)
+    };
+    let timeout_stall = if ipfs_like {
+        Duration::from_secs(90)
+    } else {
+        Duration::from_secs(30)
+    };
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(timeout_total)
+        .build()?;
+    let response = client
+        .get(parsed)
+        .header(USER_AGENT, "MatrixMediaShareClient/0.1")
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let temp_path = temp_download_path(&context.paths.temp_downloads_path, destination.extension().and_then(|value| value.to_str()));
+    let transfer = async {
+        if let Some(parent) = destination.parent() {
+            tokio_fs::create_dir_all(parent).await?;
+        }
+        let mut file = tokio_fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await?;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = timeout(timeout_stall, stream.next())
+            .await
+            .map_err(|_| anyhow!("Timed out while waiting for background IPFS sidecar data."))?
+        {
+            file.write_all(&chunk?).await?;
+        }
+        file.flush().await?;
+        move_file_cross_filesystem(&temp_path, destination).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(error) = transfer {
+        let _ = tokio_fs::remove_file(&temp_path).await;
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 fn collect_regular_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -1263,28 +1784,36 @@ async fn share_source_from_archive_or_library(
     let content_type = mime_guess::from_path(file_path).first_or_octet_stream();
     let category = media_classification::category(Some(&file_name), Some(content_type.essence_str()));
     let file_size = metadata.len() as i64;
-    let sha256 = sha256_file(file_path).await?;
     let settings = context.settings.read().await.clone();
+    let sha256 = managed_file_sha256(context, file_path, &settings).await?;
+    let bundle_path = managed_share_bundle_dir(&settings, &context.paths, category, &sha256);
+    tokio_fs::create_dir_all(&bundle_path).await?;
     let now = Utc::now();
 
     if let Some(existing) = context.database.find_tracked_upload_by_sha256(&sha256).await? {
         let existing_source = PathBuf::from(&existing.source_path);
         if tokio_fs::try_exists(&existing_source).await.unwrap_or(false) {
             return Ok(PreparedShareSource {
+                sha256,
+                category,
                 file_name,
                 content_type,
                 file_size,
                 source_path: existing_source,
+                bundle_path,
             });
         }
         if let Some(archive_path) = existing.archive_path.as_deref() {
             let archive_source = PathBuf::from(archive_path);
             if tokio_fs::try_exists(&archive_source).await.unwrap_or(false) {
                 return Ok(PreparedShareSource {
+                    sha256,
+                    category,
                     file_name,
                     content_type,
                     file_size,
                     source_path: archive_source,
+                    bundle_path,
                 });
             }
         }
@@ -1297,10 +1826,15 @@ async fn share_source_from_archive_or_library(
             sha256: sha256.clone(),
             source_kind,
             source_path: source_path.to_string_lossy().to_string(),
+            bundle_path: Some(bundle_path.to_string_lossy().to_string()),
             library_path: (source_kind == LocalAssetSourceKind::Library)
                 .then(|| source_path.to_string_lossy().to_string()),
             archive_path: (source_kind == LocalAssetSourceKind::Archive)
                 .then(|| source_path.to_string_lossy().to_string()),
+            file_cid: None,
+            thumbnail_cid: None,
+            page_cid: None,
+            landing_page_url: None,
             room_id: room.room_id().to_string(),
             category,
             original_filename: Some(file_name.clone()),
@@ -1311,10 +1845,13 @@ async fn share_source_from_archive_or_library(
         };
         context.database.upsert_tracked_upload(&record).await?;
         return Ok(PreparedShareSource {
+            sha256,
+            category,
             file_name,
             content_type,
             file_size,
             source_path,
+            bundle_path,
         });
     }
 
@@ -1323,8 +1860,13 @@ async fn share_source_from_archive_or_library(
             sha256: sha256.clone(),
             source_kind: LocalAssetSourceKind::Archive,
             source_path: archive_path.to_string_lossy().to_string(),
+            bundle_path: Some(bundle_path.to_string_lossy().to_string()),
             library_path: None,
             archive_path: Some(archive_path.to_string_lossy().to_string()),
+            file_cid: None,
+            thumbnail_cid: None,
+            page_cid: None,
+            landing_page_url: None,
             room_id: room.room_id().to_string(),
             category,
             original_filename: Some(file_name.clone()),
@@ -1335,37 +1877,37 @@ async fn share_source_from_archive_or_library(
         };
         context.database.upsert_tracked_upload(&record).await?;
         return Ok(PreparedShareSource {
+            sha256,
+            category,
             file_name,
             content_type,
             file_size,
             source_path: archive_path,
+            bundle_path,
         });
     }
 
-    let room_record = context.room_catalog.sync_sdk_room(room, &settings).await?;
-    let library_category_folder = library_category_folder(
-        &settings,
-        &room_record.active_folder_label,
-        category,
-        &context.paths,
-    )
-    .await?;
     let extension = media_classification::preferred_extension(
         Some(&file_name),
         Some(content_type.essence_str()),
     );
-    let stored_name = extension.map_or_else(|| sha256.clone(), |ext| format!("{sha256}.{ext}"));
-    let library_path = library_category_folder.join(stored_name);
+    let library_path = managed_share_media_path(&bundle_path, &sha256, extension.as_deref());
     if !tokio_fs::try_exists(&library_path).await.unwrap_or(false) {
         copy_file_cross_filesystem(file_path, &library_path).await?;
+        remember_file_hash(&context.database, &library_path, HASH_ROOT_SHARED, &sha256).await?;
     }
 
     let record = TrackedUploadRecord {
         sha256,
         source_kind: LocalAssetSourceKind::Library,
         source_path: library_path.to_string_lossy().to_string(),
+        bundle_path: Some(bundle_path.to_string_lossy().to_string()),
         library_path: Some(library_path.to_string_lossy().to_string()),
         archive_path: None,
+        file_cid: None,
+        thumbnail_cid: None,
+        page_cid: None,
+        landing_page_url: None,
         room_id: room.room_id().to_string(),
         category,
         original_filename: Some(file_name.clone()),
@@ -1377,10 +1919,13 @@ async fn share_source_from_archive_or_library(
     context.database.upsert_tracked_upload(&record).await?;
 
     Ok(PreparedShareSource {
+        sha256: record.sha256.clone(),
+        category: record.category,
         file_name,
         content_type,
         file_size,
         source_path: library_path,
+        bundle_path,
     })
 }
 
@@ -1471,24 +2016,6 @@ async fn configured_archive_source(file_path: &Path, settings: &AppSettings) -> 
     Ok(None)
 }
 
-async fn library_category_folder(
-    settings: &AppSettings,
-    room_folder_label: &str,
-    category: MediaCategory,
-    paths: &AppPaths,
-) -> Result<PathBuf> {
-    let root = configured_library_root(settings, paths);
-    tokio_fs::create_dir_all(&root).await?;
-    if settings.flat_folder_layout {
-        return Ok(root);
-    }
-    let category_folder = root
-        .join(room_folder_label)
-        .join(category.as_storage_key());
-    tokio_fs::create_dir_all(&category_folder).await?;
-    Ok(category_folder)
-}
-
 fn configured_library_root(settings: &AppSettings, paths: &AppPaths) -> PathBuf {
     let configured = settings.library_root_path.trim();
     if configured.is_empty() {
@@ -1498,17 +2025,74 @@ fn configured_library_root(settings: &AppSettings, paths: &AppPaths) -> PathBuf 
     }
 }
 
-fn configured_destination_root(settings: &AppSettings) -> PathBuf {
-    PathBuf::from(settings.destination_root_path.trim())
+fn managed_share_category_root(
+    settings: &AppSettings,
+    paths: &AppPaths,
+    category: MediaCategory,
+) -> PathBuf {
+    configured_library_root(settings, paths).join(category.as_storage_key())
 }
 
-fn configured_downloads_root(settings: &AppSettings, paths: &AppPaths) -> PathBuf {
-    let configured = settings.manual_download_root_path.trim();
+fn managed_share_bundle_dir(
+    settings: &AppSettings,
+    paths: &AppPaths,
+    category: MediaCategory,
+    sha256: &str,
+) -> PathBuf {
+    managed_share_category_root(settings, paths, category).join(sha256)
+}
+
+fn managed_share_media_path(
+    bundle_path: &Path,
+    sha256: &str,
+    extension: Option<&str>,
+) -> PathBuf {
+    let file_name = extension
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("{sha256}.{value}"))
+        .unwrap_or_else(|| sha256.to_owned());
+    bundle_path.join(file_name)
+}
+
+fn managed_share_thumbnail_path(bundle_path: &Path) -> PathBuf {
+    bundle_path.join("thumbnail.jpg")
+}
+
+fn managed_share_landing_page_path(bundle_path: &Path) -> PathBuf {
+    bundle_path.join("index.html")
+}
+
+fn configured_destination_root(settings: &AppSettings, paths: &AppPaths) -> PathBuf {
+    let configured = settings.destination_root_path.trim();
     if configured.is_empty() {
         paths.manual_downloads_path.clone()
     } else {
         PathBuf::from(configured)
     }
+}
+
+async fn download_job_destination_folder(
+    room_catalog: &RoomCatalog,
+    paths: &AppPaths,
+    settings: &AppSettings,
+    room_id: &str,
+    category: MediaCategory,
+) -> Result<PathBuf> {
+    if room_id == MANUAL_IPFS_ROOM_ID {
+        let downloads_root = configured_destination_root(settings, paths);
+        tokio_fs::create_dir_all(&downloads_root).await?;
+        if settings.flat_folder_layout {
+            return Ok(downloads_root);
+        }
+
+        let manual_root = downloads_root.join(MANUAL_IPFS_FOLDER_LABEL);
+        tokio_fs::create_dir_all(&manual_root).await?;
+        let category_folder = manual_root.join(category.as_storage_key());
+        tokio_fs::create_dir_all(&category_folder).await?;
+        return Ok(category_folder);
+    }
+
+    room_catalog.category_folder(room_id, category, settings).await
 }
 
 async fn configured_library_source(
@@ -1524,15 +2108,9 @@ async fn configured_download_source(
     settings: &AppSettings,
     paths: &AppPaths,
 ) -> Result<Option<PathBuf>> {
-    let roots = [
-        configured_destination_root(settings),
-        configured_downloads_root(settings, paths),
-    ];
-
-    for root in roots {
-        if let Some(path) = configured_root_source(file_path, &root).await? {
-            return Ok(Some(path));
-        }
+    let root = configured_destination_root(settings, paths);
+    if let Some(path) = configured_root_source(file_path, &root).await? {
+        return Ok(Some(path));
     }
 
     Ok(None)
@@ -1555,6 +2133,82 @@ async fn configured_root_source(file_path: &Path, root_path: &Path) -> Result<Op
     Ok(None)
 }
 
+async fn managed_file_sha256(
+    context: &Arc<RunningContext>,
+    file_path: &Path,
+    settings: &AppSettings,
+) -> Result<String> {
+    if configured_archive_source(file_path, settings).await?.is_some() {
+        return sha256_with_cache(&context.database, file_path, HASH_ROOT_ARCHIVE).await;
+    }
+    if configured_download_source(file_path, settings, &context.paths).await?.is_some() {
+        return sha256_with_cache(&context.database, file_path, HASH_ROOT_DOWNLOADS).await;
+    }
+    if configured_library_source(file_path, settings, &context.paths).await?.is_some() {
+        return sha256_with_cache(&context.database, file_path, HASH_ROOT_SHARED).await;
+    }
+    sha256_file(file_path).await
+}
+
+async fn sha256_with_cache(
+    database: &AppDatabase,
+    file_path: &Path,
+    root_kind: &str,
+) -> Result<String> {
+    let metadata = tokio_fs::metadata(file_path)
+        .await
+        .with_context(|| format!("Failed to inspect {}", file_path.display()))?;
+    let canonical_path = tokio_fs::canonicalize(file_path)
+        .await
+        .unwrap_or_else(|_| file_path.to_path_buf());
+    let canonical_string = canonical_path.to_string_lossy().to_string();
+    let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
+
+    if let Some(cached) = database.file_hash_cache_record(&canonical_string).await? {
+        if cached.root_kind == root_kind
+            && cached.file_size == metadata.len() as i64
+            && cached.modified_at == modified_at
+        {
+            return Ok(cached.sha256);
+        }
+    }
+
+    let sha256 = sha256_file(&canonical_path).await?;
+    database
+        .upsert_file_hash_cache(
+            &canonical_string,
+            root_kind,
+            &sha256,
+            metadata.len() as i64,
+            modified_at,
+        )
+        .await?;
+    Ok(sha256)
+}
+
+async fn remember_file_hash(
+    database: &AppDatabase,
+    file_path: &Path,
+    root_kind: &str,
+    sha256: &str,
+) -> Result<()> {
+    let metadata = tokio_fs::metadata(file_path)
+        .await
+        .with_context(|| format!("Failed to inspect {}", file_path.display()))?;
+    let canonical_path = tokio_fs::canonicalize(file_path)
+        .await
+        .unwrap_or_else(|_| file_path.to_path_buf());
+    database
+        .upsert_file_hash_cache(
+            &canonical_path.to_string_lossy(),
+            root_kind,
+            sha256,
+            metadata.len() as i64,
+            metadata.modified().ok().map(DateTime::<Utc>::from),
+        )
+        .await
+}
+
 async fn share_local_file(
     context: &Arc<RunningContext>,
     room_id: &str,
@@ -1567,7 +2221,8 @@ async fn share_local_file(
         .find(|room| room.room_id().as_str() == room_id)
         .ok_or_else(|| anyhow!("Room not found: {room_id}"))?;
     let prepared = share_source_from_archive_or_library(context, &room, file_path).await?;
-    let thumbnail_path = generate_preview_thumbnail(&context.paths, &prepared.source_path).await.ok();
+    let thumbnail_path = prepare_managed_share_thumbnail(&prepared).await.ok();
+    let landing_page_path = managed_share_landing_page_path(&prepared.bundle_path);
     let settings = context.settings.read().await.clone();
     let preferred_gateway = if settings.primary_gateway_url.trim().is_empty() {
         BOOTSTRAP_PRIMARY_GATEWAY
@@ -1580,10 +2235,12 @@ async fn share_local_file(
             &prepared.file_name,
             &prepared.source_path,
             thumbnail_path.as_deref(),
+            &landing_page_path,
             Some(preferred_gateway),
             &settings.preferred_gateway_urls,
         )
         .await?;
+    update_tracked_share_publication(context, &prepared, &published).await?;
     let comment_message = format!(
         "IPFS landing page: {}\nIPFS media: ipfs://{}\nCID: {}\nLanding Page CID: {}",
         published.landing_page_url, published.file_cid, published.file_cid, published.page_cid,
@@ -1680,6 +2337,28 @@ async fn share_local_file(
     Ok(())
 }
 
+async fn update_tracked_share_publication(
+    context: &Arc<RunningContext>,
+    prepared: &PreparedShareSource,
+    published: &crate::ipfs_service::PublishedShare,
+) -> Result<()> {
+    let Some(mut record) = context
+        .database
+        .find_tracked_upload_by_sha256(&prepared.sha256)
+        .await?
+    else {
+        return Ok(());
+    };
+
+    record.bundle_path = Some(prepared.bundle_path.to_string_lossy().to_string());
+    record.file_cid = Some(published.file_cid.clone());
+    record.thumbnail_cid = published.thumbnail_cid.clone();
+    record.page_cid = Some(published.page_cid.clone());
+    record.landing_page_url = Some(published.landing_page_url.clone());
+    record.updated_at = Utc::now();
+    context.database.upsert_tracked_upload(&record).await
+}
+
 async fn import_ipfs_link(context: &Arc<RunningContext>, link: &str) -> Result<()> {
     let settings = context.settings.read().await.clone();
     let imported = parse_ipfs_import_target(link, &settings)?;
@@ -1689,7 +2368,7 @@ async fn import_ipfs_link(context: &Arc<RunningContext>, link: &str) -> Result<(
     let queued = context
         .database
         .enqueue_direct_download(
-            "__manual_ipfs__",
+            MANUAL_IPFS_ROOM_ID,
             &event_id,
             crate::domain::MediaSourceKind::Ipfs,
             &imported.direct_url,
@@ -1740,6 +2419,8 @@ async fn open_discovery(
         retry_count: 0,
         next_eligible_at: None,
         last_failure_at: None,
+        received_bytes: 0,
+        total_bytes: None,
         last_error: None,
         sha256: None,
         saved_relative_path: None,
@@ -1786,6 +2467,7 @@ async fn open_discovery(
 
     let temp_path = download_media_to_temp(
         &context.client,
+        &context.database,
         &context.paths,
         &context.runtime,
         0,
@@ -2043,7 +2725,23 @@ fn ipfs_body_candidates(body: &str) -> Vec<String> {
     candidates
 }
 
+async fn prepare_managed_share_thumbnail(prepared: &PreparedShareSource) -> Result<PathBuf> {
+    let thumbnail_path = managed_share_thumbnail_path(&prepared.bundle_path);
+    generate_preview_thumbnail_to_path(&prepared.source_path, &thumbnail_path).await?;
+    Ok(thumbnail_path)
+}
+
 async fn generate_preview_thumbnail(paths: &AppPaths, file_path: &Path) -> Result<PathBuf> {
+    let name = file_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("preview");
+    let destination = paths.temp_downloads_path.join(format!("{name}.preview.jpg"));
+    generate_preview_thumbnail_to_path(file_path, &destination).await?;
+    Ok(destination)
+}
+
+async fn generate_preview_thumbnail_to_path(file_path: &Path, destination: &Path) -> Result<()> {
     let extension = file_path
         .extension()
         .and_then(|value| value.to_str())
@@ -2058,15 +2756,13 @@ async fn generate_preview_thumbnail(paths: &AppPaths, file_path: &Path) -> Resul
         .with_context(|| format!("Failed to read {}", file_path.display()))?;
     let image = load_oriented_image_from_bytes(&bytes).context("Failed to decode the image")?;
     let thumbnail = image.thumbnail(480, 480);
-    let name = file_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("preview");
-    let destination = paths.temp_downloads_path.join(format!("{name}.preview.jpg"));
+    if let Some(parent) = destination.parent() {
+        tokio_fs::create_dir_all(parent).await?;
+    }
     thumbnail
-        .save_with_format(&destination, image::ImageFormat::Jpeg)
+        .save_with_format(destination, image::ImageFormat::Jpeg)
         .with_context(|| format!("Failed to write {}", destination.display()))?;
-    Ok(destination)
+    Ok(())
 }
 
 fn load_oriented_image_from_bytes(bytes: &[u8]) -> Result<image::DynamicImage> {
@@ -2732,6 +3428,7 @@ mod tests {
             preview_worker_count: 1,
             auto_join_space_rooms: false,
             auto_download_new_media: false,
+            self_heal_enabled: false,
             desired_power_state: true,
         }
     }
@@ -4078,6 +4775,7 @@ async fn prune_expired_failed_jobs(context: &Arc<RunningContext>) -> Result<()> 
 
 async fn download_media_to_temp(
     client: &Client,
+    database: &AppDatabase,
     paths: &AppPaths,
     runtime: &RuntimeStore,
     worker_id: i32,
@@ -4086,6 +4784,7 @@ async fn download_media_to_temp(
 ) -> Result<PathBuf> {
     if let Some(direct_url) = job.direct_url.as_deref().filter(|value| !value.trim().is_empty()) {
         return download_http_url_to_temp(
+            database,
             runtime,
             &paths.temp_downloads_path,
             worker_id,
@@ -4098,6 +4797,7 @@ async fn download_media_to_temp(
     let source = decode_media_source(&job.mxc_url)?;
     if let MediaSource::Plain(uri) = &source {
         if let Some(path) = direct_remote_media_download_to_temp(
+            database,
             runtime,
             &paths.temp_downloads_path,
             worker_id,
@@ -4161,10 +4861,12 @@ async fn download_media_to_temp(
             }
         })
         .await;
+    persist_download_progress(database, job.id, size, Some(size), true).await?;
     Ok(temp_path)
 }
 
 async fn download_http_url_to_temp(
+    database: &AppDatabase,
     runtime: &RuntimeStore,
     temp_root: &Path,
     worker_id: i32,
@@ -4172,8 +4874,10 @@ async fn download_http_url_to_temp(
     url: &str,
 ) -> Result<PathBuf> {
     let parsed = reqwest::Url::parse(url)?;
+    let policy = http_download_policy(job);
     let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(policy.total_timeout)
         .build()?;
     let response = http_client
         .get(parsed.clone())
@@ -4195,40 +4899,22 @@ async fn download_http_url_to_temp(
             .and_then(|segments| segments.last())
             .and_then(|segment| std::path::Path::new(segment).extension()?.to_str().map(ToOwned::to_owned))
     });
-    let temp_path = temp_download_path(temp_root, extension.as_deref());
-    let mut file = tokio_fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .await?;
-    let mut received = 0i64;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        file.write_all(&chunk).await?;
-        received += chunk.len() as i64;
-        runtime
-            .mutate(|snapshot| {
-                if let Some(active) = snapshot
-                    .active_downloads
-                    .iter_mut()
-                    .find(|download| download.worker_id == worker_id)
-                {
-                    active.received_bytes = received;
-                    active.total_bytes = total;
-                }
-                if worker_id == 0 && snapshot.viewer.state == ViewerState::Downloading {
-                    snapshot.viewer.received_bytes = received;
-                    snapshot.viewer.total_bytes = total;
-                }
-            })
-            .await;
-    }
-    file.flush().await?;
-    Ok(temp_path)
+    stream_http_response_to_temp(
+        database,
+        runtime,
+        temp_root,
+        worker_id,
+        job,
+        response,
+        extension.as_deref(),
+        total,
+        policy.stall_timeout,
+    )
+    .await
 }
 
 async fn direct_remote_media_download_to_temp(
+    database: &AppDatabase,
     runtime: &RuntimeStore,
     temp_root: &Path,
     worker_id: i32,
@@ -4250,20 +4936,13 @@ async fn direct_remote_media_download_to_temp(
         format!("/_matrix/media/r0/download/{encoded_server}/{encoded_media_id}"),
     ];
 
+    let policy = http_download_policy(job);
     let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(policy.total_timeout)
         .build()?;
     for candidate_path in candidate_paths {
         let url = base.join(&candidate_path)?;
-        let temp_path = temp_download_path(
-            temp_root,
-            media_classification::preferred_extension(
-                job.original_filename.as_deref(),
-                job.mime_type.as_deref(),
-            )
-            .as_deref(),
-        );
-
         let mut request = http_client
             .get(url.clone())
             .header(USER_AGENT, "MatrixMediaShareClient/0.1");
@@ -4283,14 +4962,82 @@ async fn direct_remote_media_download_to_temp(
         }
 
         let total = response.content_length().map(|value| value as i64);
-        let mut received = 0i64;
+        let extension = media_classification::preferred_extension(
+            job.original_filename.as_deref(),
+            job.mime_type.as_deref(),
+        );
+        match stream_http_response_to_temp(
+            database,
+            runtime,
+            temp_root,
+            worker_id,
+            job,
+            response,
+            extension.as_deref(),
+            total,
+            policy.stall_timeout,
+        )
+        .await
+        {
+            Ok(temp_path) => return Ok(Some(temp_path)),
+            Err(_) => continue,
+        }
+    }
+
+    Ok(None)
+}
+
+struct HttpDownloadPolicy {
+    total_timeout: Duration,
+    stall_timeout: Duration,
+}
+
+fn http_download_policy(job: &DownloadJobRecord) -> HttpDownloadPolicy {
+    if job.source_kind == MediaSourceKind::Ipfs {
+        return HttpDownloadPolicy {
+            total_timeout: Duration::from_secs(20 * 60),
+            stall_timeout: Duration::from_secs(90),
+        };
+    }
+
+    HttpDownloadPolicy {
+        total_timeout: Duration::from_secs(5 * 60),
+        stall_timeout: Duration::from_secs(30),
+    }
+}
+
+async fn stream_http_response_to_temp(
+    database: &AppDatabase,
+    runtime: &RuntimeStore,
+    temp_root: &Path,
+    worker_id: i32,
+    job: &DownloadJobRecord,
+    response: reqwest::Response,
+    extension: Option<&str>,
+    total: Option<i64>,
+    stall_timeout: Duration,
+) -> Result<PathBuf> {
+    let temp_path = temp_download_path(temp_root, extension);
+    let transfer = async {
         let mut file = tokio_fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp_path)
             .await?;
+        let mut received = 0i64;
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        let mut last_persisted_received = -1i64;
+        let mut last_persisted_total = None;
+        while let Some(chunk) = timeout(stall_timeout, stream.next())
+            .await
+            .map_err(|_| {
+                if job.source_kind == MediaSourceKind::Ipfs {
+                    anyhow!("IPFS download timed out while waiting for gateway data.")
+                } else {
+                    anyhow!("Download timed out while waiting for remote data.")
+                }
+            })?
+        {
             let chunk = chunk?;
             file.write_all(&chunk).await?;
             received += chunk.len() as i64;
@@ -4310,20 +5057,79 @@ async fn direct_remote_media_download_to_temp(
                     }
                 })
                 .await;
+            persist_download_progress_if_needed(
+                database,
+                job.id,
+                received,
+                total,
+                &mut last_persisted_received,
+                &mut last_persisted_total,
+                false,
+            )
+            .await?;
         }
         file.flush().await?;
-        if tokio_fs::metadata(&temp_path)
-            .await
-            .map(|meta| meta.len())
-            .unwrap_or_default()
-            > 0
-        {
-            return Ok(Some(temp_path));
-        }
+        persist_download_progress_if_needed(
+            database,
+            job.id,
+            received,
+            total.or(Some(received)),
+            &mut last_persisted_received,
+            &mut last_persisted_total,
+            true,
+        )
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(error) = transfer {
         let _ = tokio_fs::remove_file(&temp_path).await;
+        return Err(error);
     }
 
-    Ok(None)
+    Ok(temp_path)
+}
+
+async fn persist_download_progress_if_needed(
+    database: &AppDatabase,
+    job_id: i64,
+    received_bytes: i64,
+    total_bytes: Option<i64>,
+    last_persisted_received: &mut i64,
+    last_persisted_total: &mut Option<i64>,
+    force: bool,
+) -> Result<()> {
+    let should_persist = force
+        || *last_persisted_received < 0
+        || received_bytes.saturating_sub(*last_persisted_received) >= DOWNLOAD_PROGRESS_PERSIST_BYTES
+        || total_bytes != *last_persisted_total;
+    if !should_persist {
+        return Ok(());
+    }
+
+    persist_download_progress(database, job_id, received_bytes, total_bytes, force).await?;
+    *last_persisted_received = received_bytes;
+    *last_persisted_total = total_bytes;
+    Ok(())
+}
+
+async fn persist_download_progress(
+    database: &AppDatabase,
+    job_id: i64,
+    received_bytes: i64,
+    total_bytes: Option<i64>,
+    force: bool,
+) -> Result<()> {
+    if job_id <= 0 && !force {
+        return Ok(());
+    }
+    if job_id <= 0 {
+        return Ok(());
+    }
+    database
+        .update_job_progress(job_id, received_bytes.max(0), total_bytes)
+        .await
 }
 
 async fn handle_job_failure(

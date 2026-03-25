@@ -179,6 +179,7 @@ void AppController::refresh()
 {
     refreshQueued_ = false;
     rooms_ = database_.fetchRooms();
+    sharedItems_ = database_.fetchSharedItems();
     jobs_ = database_.fetchJobs();
     waitingQueueCount_ = database_.fetchWaitingJobCount();
     emit stateChanged();
@@ -249,6 +250,11 @@ QVector<RoomRecord> AppController::joinedSpaces() const
         }
     }
     return result;
+}
+
+const QVector<SharedItemRecord> &AppController::sharedItems() const
+{
+    return sharedItems_;
 }
 
 const QVector<DownloadJobRecord> &AppController::jobs() const
@@ -606,6 +612,21 @@ void AppController::importIpfsLink(const QString &link)
         logError(QStringLiteral("ipfs"), errorMessage);
     } else {
         logInfo(QStringLiteral("ipfs"), QStringLiteral("Imported IPFS link."));
+    }
+    refresh();
+}
+
+void AppController::deleteSharedItem(const QString &sha256)
+{
+    if (sha256.trimmed().isEmpty()) {
+        return;
+    }
+    QString errorMessage;
+    if (!backend_->deleteSharedItem(sha256.trimmed(), errorMessage)) {
+        lastErrorMessage_ = errorMessage;
+        logError(QStringLiteral("shared-files"), errorMessage);
+    } else {
+        logInfo(QStringLiteral("shared-files"), QStringLiteral("Queued cleanup for shared item %1.").arg(sha256.trimmed()));
     }
     refresh();
 }

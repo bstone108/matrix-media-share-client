@@ -105,6 +105,14 @@ private:
     void trimLogWindow();
     void ensureViewerDialog();
     void loadViewerMedia(const ViewerSnapshot &viewer);
+    void openSelectedSharedItem();
+    void deleteSelectedSharedItem();
+    QString sharedItemLocalPath(const SharedItemRecord &item) const;
+    QString sharedItemThumbnailPath(const SharedItemRecord &item) const;
+    QString sharedItemOriginLabel(const SharedItemRecord &item) const;
+    QString sharedItemSignature(const QVector<SharedItemRecord> &items) const;
+    QIcon sharedItemIcon(const SharedItemRecord &item);
+    void openLocalViewerFile(const QString &filePath, const QString &displayName, const QString &mimeType, MediaCategory category);
     AppSection currentSection() const;
     QVector<RoomRecord> roomSidebarRoomsForCurrentSection() const;
     QString roomDisplayTitle(const RoomRecord &room) const;
@@ -142,6 +150,7 @@ private:
 
     QListWidget *libraryList_ = nullptr;
     QPushButton *openLibraryButton_ = nullptr;
+    QPushButton *deleteLibraryButton_ = nullptr;
 
     QLabel *queueStatsLabel_ = nullptr;
     QListWidget *activeDownloadsList_ = nullptr;
@@ -158,7 +167,6 @@ private:
     QLineEdit *destinationEdit_ = nullptr;
     QLineEdit *libraryEdit_ = nullptr;
     QLineEdit *archiveEdit_ = nullptr;
-    QLineEdit *manualDownloadsEdit_ = nullptr;
     QLineEdit *primaryGatewayEdit_ = nullptr;
     QTextEdit *preferredGatewaysEdit_ = nullptr;
     QLabel *currentVersionLabel_ = nullptr;
@@ -178,6 +186,7 @@ private:
     QCheckBox *startHiddenCheck_ = nullptr;
     QCheckBox *archiveScanEnabledCheck_ = nullptr;
     QCheckBox *archiveHighPriorityCheck_ = nullptr;
+    QCheckBox *selfHealCheck_ = nullptr;
     QCheckBox *flatFolderLayoutCheck_ = nullptr;
     QCheckBox *autoJoinSpacesCheck_ = nullptr;
     QCheckBox *autoDownloadCheck_ = nullptr;
@@ -209,6 +218,9 @@ private:
     quint64 viewerDismissedSessionId_ = 0;
     QString viewerLoadedLocalPath_;
     ViewerState viewerLoadedState_ = ViewerState::Idle;
+    ViewerSnapshot localViewerSnapshot_;
+    bool localViewerActive_ = false;
+    quint64 nextLocalViewerSessionId_ = 1;
 
     bool settingsPageInitialized_ = false;
     bool settingsDirty_ = false;
@@ -236,4 +248,6 @@ private:
     int logTotalCount_ = 0;
     bool logsLoadingPage_ = false;
     bool logsProblemsOnly_ = false;
+    QString sharedItemsSignature_;
+    QHash<QString, QIcon> sharedItemIconCache_;
 };

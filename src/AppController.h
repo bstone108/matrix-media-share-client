@@ -32,6 +32,7 @@ public:
     int discoveryCount(const QString &roomId = QString()) const;
     QVector<RoomRecord> joinedRooms() const;
     QVector<RoomRecord> joinedSpaces() const;
+    const QVector<SharedItemRecord> &sharedItems() const;
     const QVector<DownloadJobRecord> &jobs() const;
     QVector<ActivityLogEntry> fetchLogsPage(int offset, int limit, bool problemsOnly) const;
     int logCount(bool problemsOnly) const;
@@ -67,6 +68,7 @@ public slots:
     void shareLocalFile(const QString &roomId, const QString &filePath);
     void shareLocalFiles(const QString &roomId, const QStringList &filePaths);
     void importIpfsLink(const QString &link);
+    void deleteSharedItem(const QString &sha256);
     void refreshCatalog();
     void joinRoom(const QString &roomIdOrAlias);
     void leaveRoom(const QString &roomId);
@@ -99,6 +101,7 @@ private:
     QString password_;
     BotRuntimeSnapshot runtime_;
     QVector<RoomRecord> rooms_;
+    QVector<SharedItemRecord> sharedItems_;
     QVector<DownloadJobRecord> jobs_;
     int waitingQueueCount_ = 0;
     QString lastErrorMessage_;

@@ -27,6 +27,16 @@ pub struct AppDatabase {
     path: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub struct FileHashCacheRecord {
+    pub file_path: String,
+    pub root_kind: String,
+    pub sha256: String,
+    pub file_size: i64,
+    pub modified_at: Option<DateTime<Utc>>,
+    pub last_verified_at: DateTime<Utc>,
+}
+
 impl AppDatabase {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_owned();
@@ -72,7 +82,7 @@ impl AppDatabase {
             .context("Failed to load app settings")?;
 
         if let Some(settings) = row {
-            return Ok(settings);
+            return Ok(normalize_settings(settings));
         }
 
         let defaults = AppSettings {
@@ -85,7 +95,7 @@ impl AppDatabase {
             archive_root_path: String::new(),
             archive_scan_enabled: false,
             archive_scan_high_priority: false,
-            manual_download_root_path: format!("{default_destination_root_path}/Downloads"),
+            manual_download_root_path: default_destination_root_path.to_owned(),
             message_limit: 5_000,
             time_window_value: 0,
             time_window_unit: TimeWindowUnit::None,
@@ -110,15 +120,17 @@ impl AppDatabase {
             preview_worker_count: 1,
             auto_join_space_rooms: false,
             auto_download_new_media: false,
+            self_heal_enabled: false,
             desired_power_state: false,
         };
         drop(statement);
         drop(connection);
         self.save_settings(&defaults).await?;
-        Ok(defaults)
+        Ok(normalize_settings(defaults))
     }
 
     pub async fn save_settings(&self, settings: &AppSettings) -> Result<()> {
+        let settings = normalize_settings(settings.clone());
         let connection = self.inner.lock().await;
         connection.execute("DELETE FROM app_settings", [])?;
         connection.execute(
@@ -132,9 +144,9 @@ impl AppDatabase {
                 primary_gateway_url, preferred_gateway_urls,
                 autostart_enabled, minimize_to_tray, start_hidden,
                 bandwidth_limit_kib_per_sec, preview_worker_count,
-                auto_join_space_rooms, auto_download_new_media,
+                auto_join_space_rooms, auto_download_new_media, self_heal_enabled,
                 desired_power_state, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
             params![
                 settings.homeserver_url,
                 settings.username,
@@ -163,6 +175,7 @@ impl AppDatabase {
                 settings.preview_worker_count,
                 if settings.auto_join_space_rooms { 1 } else { 0 },
                 if settings.auto_download_new_media { 1 } else { 0 },
+                if settings.self_heal_enabled { 1 } else { 0 },
                 if settings.desired_power_state { 1 } else { 0 },
                 iso_now(),
             ],
@@ -636,7 +649,7 @@ impl AppDatabase {
         let connection = self.inner.lock().await;
         connection.execute(
             "UPDATE download_jobs
-             SET state = ?1, last_error = ?2, next_eligible_at = NULL, updated_at = ?3
+             SET state = ?1, last_error = ?2, next_eligible_at = NULL, received_bytes = 0, total_bytes = NULL, updated_at = ?3
              WHERE id = ?4",
             params![
                 DownloadJobState::Queued.as_storage_key(),
@@ -652,7 +665,7 @@ impl AppDatabase {
         let connection = self.inner.lock().await;
         connection.execute(
             "UPDATE download_jobs
-             SET state = ?1, retry_count = 0, next_eligible_at = NULL, last_failure_at = NULL, last_error = NULL, updated_at = ?2
+             SET state = ?1, retry_count = 0, next_eligible_at = NULL, last_failure_at = NULL, last_error = NULL, received_bytes = 0, total_bytes = NULL, updated_at = ?2
              WHERE id = ?3 AND state = ?4",
             params![
                 DownloadJobState::Queued.as_storage_key(),
@@ -668,7 +681,7 @@ impl AppDatabase {
         let connection = self.inner.lock().await;
         connection.execute(
             "UPDATE download_jobs
-             SET state = ?1, retry_count = 0, next_eligible_at = NULL, last_failure_at = NULL, last_error = NULL, updated_at = ?2
+             SET state = ?1, retry_count = 0, next_eligible_at = NULL, last_failure_at = NULL, last_error = NULL, received_bytes = 0, total_bytes = NULL, updated_at = ?2
              WHERE state = ?3",
             params![
                 DownloadJobState::Queued.as_storage_key(),
@@ -760,7 +773,7 @@ impl AppDatabase {
         let updated_at = Utc::now();
         connection.execute(
             "UPDATE download_jobs
-             SET state = ?1, last_error = NULL, next_eligible_at = NULL, updated_at = ?2
+             SET state = ?1, last_error = NULL, next_eligible_at = NULL, received_bytes = 0, total_bytes = NULL, updated_at = ?2
              WHERE id = ?3",
             params![
                 DownloadJobState::Downloading.as_storage_key(),
@@ -772,6 +785,8 @@ impl AppDatabase {
         job.state = DownloadJobState::Downloading;
         job.last_error = None;
         job.next_eligible_at = None;
+        job.received_bytes = 0;
+        job.total_bytes = None;
         job.updated_at = updated_at;
         Ok(Some(job))
     }
@@ -781,16 +796,19 @@ impl AppDatabase {
         id: i64,
         sha256: &str,
         saved_relative_path: &str,
+        final_size: i64,
     ) -> Result<()> {
         let connection = self.inner.lock().await;
         connection.execute(
             "UPDATE download_jobs
-             SET state = ?1, sha256 = ?2, saved_relative_path = ?3, updated_at = ?4
-             WHERE id = ?5",
+             SET state = ?1, sha256 = ?2, saved_relative_path = ?3, received_bytes = ?4, total_bytes = ?5, updated_at = ?6
+             WHERE id = ?7",
             params![
                 DownloadJobState::Completed.as_storage_key(),
                 sha256,
                 saved_relative_path,
+                final_size,
+                final_size,
                 iso_now(),
                 id,
             ],
@@ -803,19 +821,38 @@ impl AppDatabase {
         id: i64,
         sha256: &str,
         saved_relative_path: Option<&str>,
+        final_size: i64,
     ) -> Result<()> {
         let connection = self.inner.lock().await;
         connection.execute(
             "UPDATE download_jobs
-             SET state = ?1, sha256 = ?2, saved_relative_path = ?3, updated_at = ?4
-             WHERE id = ?5",
+             SET state = ?1, sha256 = ?2, saved_relative_path = ?3, received_bytes = ?4, total_bytes = ?5, updated_at = ?6
+             WHERE id = ?7",
             params![
                 DownloadJobState::DuplicateCompleted.as_storage_key(),
                 sha256,
                 saved_relative_path,
+                final_size,
+                final_size,
                 iso_now(),
                 id,
             ],
+        )?;
+        Ok(())
+    }
+
+    pub async fn update_job_progress(
+        &self,
+        id: i64,
+        received_bytes: i64,
+        total_bytes: Option<i64>,
+    ) -> Result<()> {
+        let connection = self.inner.lock().await;
+        connection.execute(
+            "UPDATE download_jobs
+             SET received_bytes = ?1, total_bytes = ?2, updated_at = ?3
+             WHERE id = ?4",
+            params![received_bytes, total_bytes, iso_now(), id],
         )?;
         Ok(())
     }
@@ -831,7 +868,7 @@ impl AppDatabase {
         let connection = self.inner.lock().await;
         connection.execute(
             "UPDATE download_jobs
-             SET state = ?1, retry_count = ?2, next_eligible_at = ?3, last_failure_at = ?4, last_error = ?5, updated_at = ?6
+             SET state = ?1, retry_count = ?2, next_eligible_at = ?3, last_failure_at = ?4, last_error = ?5, received_bytes = 0, total_bytes = NULL, updated_at = ?6
              WHERE id = ?7",
             params![
                 if permanently_failed {
@@ -860,7 +897,7 @@ impl AppDatabase {
         let failed_at = Utc::now();
         connection.execute(
             "UPDATE download_jobs
-             SET state = ?1, next_eligible_at = ?2, last_failure_at = ?3, last_error = ?4, updated_at = ?5
+             SET state = ?1, next_eligible_at = ?2, last_failure_at = ?3, last_error = ?4, received_bytes = 0, total_bytes = NULL, updated_at = ?5
              WHERE id = ?6",
             params![
                 DownloadJobState::UndecryptablePending.as_storage_key(),
@@ -1026,15 +1063,21 @@ impl AppDatabase {
         let connection = self.inner.lock().await;
         connection.execute(
             "INSERT INTO tracked_uploads (
-                sha256, source_kind, source_path, library_path, archive_path,
+                sha256, source_kind, source_path, bundle_path, library_path, archive_path,
+                file_cid, thumbnail_cid, page_cid, landing_page_url,
                 room_id, category, original_filename, mime_type, file_size,
                 created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(sha256) DO UPDATE SET
                 source_kind = excluded.source_kind,
                 source_path = excluded.source_path,
+                bundle_path = excluded.bundle_path,
                 library_path = excluded.library_path,
                 archive_path = excluded.archive_path,
+                file_cid = excluded.file_cid,
+                thumbnail_cid = excluded.thumbnail_cid,
+                page_cid = excluded.page_cid,
+                landing_page_url = excluded.landing_page_url,
                 room_id = excluded.room_id,
                 category = excluded.category,
                 original_filename = excluded.original_filename,
@@ -1045,8 +1088,13 @@ impl AppDatabase {
                 record.sha256,
                 record.source_kind.as_storage_key(),
                 record.source_path,
+                record.bundle_path,
                 record.library_path,
                 record.archive_path,
+                record.file_cid,
+                record.thumbnail_cid,
+                record.page_cid,
+                record.landing_page_url,
                 record.room_id,
                 record.category.as_storage_key(),
                 record.original_filename,
@@ -1073,6 +1121,137 @@ impl AppDatabase {
             )
             .optional()
             .context("Failed to load tracked upload record")
+    }
+
+    pub async fn fetch_tracked_uploads(&self) -> Result<Vec<TrackedUploadRecord>> {
+        let connection = self.inner.lock().await;
+        let mut statement = connection.prepare(
+            "SELECT *
+             FROM tracked_uploads
+             ORDER BY updated_at DESC, sha256 ASC",
+        )?;
+        let rows = statement.query_map([], Self::map_tracked_upload_record)?;
+        collect_rows(rows)
+    }
+
+    pub async fn remove_tracked_upload(&self, sha256: &str) -> Result<()> {
+        let connection = self.inner.lock().await;
+        connection.execute(
+            "DELETE FROM tracked_uploads WHERE sha256 = ?1",
+            params![sha256],
+        )?;
+        Ok(())
+    }
+
+    pub async fn remove_file_hash_cache_entry(&self, file_path: &str) -> Result<()> {
+        let connection = self.inner.lock().await;
+        connection.execute(
+            "DELETE FROM file_hash_cache WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        Ok(())
+    }
+
+    pub async fn upsert_file_hash_cache(
+        &self,
+        file_path: &str,
+        root_kind: &str,
+        sha256: &str,
+        file_size: i64,
+        modified_at: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let connection = self.inner.lock().await;
+        connection.execute(
+            "INSERT INTO file_hash_cache (
+                file_path, root_kind, sha256, file_size, modified_at, last_verified_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(file_path) DO UPDATE SET
+                root_kind = excluded.root_kind,
+                sha256 = excluded.sha256,
+                file_size = excluded.file_size,
+                modified_at = excluded.modified_at,
+                last_verified_at = excluded.last_verified_at",
+            params![
+                file_path,
+                root_kind,
+                sha256,
+                file_size,
+                modified_at.map(|value| value.to_rfc3339()),
+                iso_now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub async fn file_hash_cache_record(
+        &self,
+        file_path: &str,
+    ) -> Result<Option<FileHashCacheRecord>> {
+        let connection = self.inner.lock().await;
+        connection
+            .query_row(
+                "SELECT file_path, root_kind, sha256, file_size, modified_at, last_verified_at
+                 FROM file_hash_cache WHERE file_path = ?1",
+                params![file_path],
+                Self::map_file_hash_cache_record,
+            )
+            .optional()
+            .context("Failed to load file hash cache record")
+    }
+
+    pub async fn prune_file_hash_cache_for_root_kind(
+        &self,
+        root_kind: &str,
+        valid_paths: &HashSet<String>,
+    ) -> Result<usize> {
+        let connection = self.inner.lock().await;
+        let mut statement = connection.prepare(
+            "SELECT file_path FROM file_hash_cache WHERE root_kind = ?1",
+        )?;
+        let existing_paths = statement
+            .query_map(params![root_kind], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        let mut removed = 0usize;
+        for file_path in existing_paths {
+            if valid_paths.contains(&file_path) {
+                continue;
+            }
+            connection.execute(
+                "DELETE FROM file_hash_cache WHERE file_path = ?1",
+                params![file_path],
+            )?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    pub async fn prune_archive_files_to_paths(
+        &self,
+        valid_paths: &HashSet<String>,
+    ) -> Result<usize> {
+        let connection = self.inner.lock().await;
+        let mut statement = connection.prepare(
+            "SELECT sha256, file_path FROM archive_files",
+        )?;
+        let existing = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        let mut removed = 0usize;
+        for (sha256, file_path) in existing {
+            if valid_paths.contains(&file_path) {
+                continue;
+            }
+            connection.execute(
+                "DELETE FROM archive_files WHERE sha256 = ?1",
+                params![sha256],
+            )?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     pub async fn fetch_recent_logs(&self, limit: i64) -> Result<Vec<ActivityLogEntry>> {
@@ -1145,6 +1324,7 @@ impl AppDatabase {
                 preview_worker_count INTEGER NOT NULL DEFAULT 1,
                 auto_join_space_rooms INTEGER NOT NULL DEFAULT 0,
                 auto_download_new_media INTEGER NOT NULL DEFAULT 0,
+                self_heal_enabled INTEGER NOT NULL DEFAULT 0,
                 desired_power_state INTEGER NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -1205,6 +1385,8 @@ impl AppDatabase {
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 next_eligible_at TEXT,
                 last_failure_at TEXT,
+                received_bytes INTEGER NOT NULL DEFAULT 0,
+                total_bytes INTEGER,
                 last_error TEXT,
                 sha256 TEXT,
                 saved_relative_path TEXT,
@@ -1230,8 +1412,13 @@ impl AppDatabase {
                 sha256 TEXT PRIMARY KEY,
                 source_kind TEXT NOT NULL DEFAULT 'library',
                 source_path TEXT NOT NULL,
+                bundle_path TEXT,
                 library_path TEXT,
                 archive_path TEXT,
+                file_cid TEXT,
+                thumbnail_cid TEXT,
+                page_cid TEXT,
+                landing_page_url TEXT,
                 room_id TEXT NOT NULL,
                 category TEXT NOT NULL,
                 original_filename TEXT,
@@ -1239,6 +1426,14 @@ impl AppDatabase {
                 file_size INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS file_hash_cache (
+                file_path TEXT PRIMARY KEY,
+                root_kind TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                file_size INTEGER NOT NULL DEFAULT 0,
+                modified_at TEXT,
+                last_verified_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS space_auto_joins (
                 space_room_id TEXT NOT NULL,
@@ -1271,6 +1466,54 @@ impl AppDatabase {
             &connection,
             "discovered_attachments",
             "thumbnail_cached_path",
+            "TEXT",
+        )?;
+        Self::ensure_column(
+            &connection,
+            "download_jobs",
+            "received_bytes",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::ensure_column(
+            &connection,
+            "download_jobs",
+            "total_bytes",
+            "INTEGER",
+        )?;
+        Self::ensure_column(
+            &connection,
+            "app_settings",
+            "self_heal_enabled",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::ensure_column(
+            &connection,
+            "tracked_uploads",
+            "bundle_path",
+            "TEXT",
+        )?;
+        Self::ensure_column(
+            &connection,
+            "tracked_uploads",
+            "file_cid",
+            "TEXT",
+        )?;
+        Self::ensure_column(
+            &connection,
+            "tracked_uploads",
+            "thumbnail_cid",
+            "TEXT",
+        )?;
+        Self::ensure_column(
+            &connection,
+            "tracked_uploads",
+            "page_cid",
+            "TEXT",
+        )?;
+        Self::ensure_column(
+            &connection,
+            "tracked_uploads",
+            "landing_page_url",
             "TEXT",
         )?;
         Self::ensure_column(
@@ -1361,6 +1604,7 @@ impl AppDatabase {
             preview_worker_count: row.get("preview_worker_count")?,
             auto_join_space_rooms: row.get::<_, i64>("auto_join_space_rooms")? != 0,
             auto_download_new_media: row.get::<_, i64>("auto_download_new_media")? != 0,
+            self_heal_enabled: row.get::<_, i64>("self_heal_enabled")? != 0,
             desired_power_state: row.get::<_, i64>("desired_power_state")? != 0,
         })
     }
@@ -1382,8 +1626,13 @@ impl AppDatabase {
                 row.get::<_, String>("source_kind")?.as_str(),
             ),
             source_path: row.get("source_path")?,
+            bundle_path: row.get("bundle_path")?,
             library_path: row.get("library_path")?,
             archive_path: row.get("archive_path")?,
+            file_cid: row.get("file_cid")?,
+            thumbnail_cid: row.get("thumbnail_cid")?,
+            page_cid: row.get("page_cid")?,
+            landing_page_url: row.get("landing_page_url")?,
             room_id: row.get("room_id")?,
             category: MediaCategory::from_storage_key(row.get::<_, String>("category")?.as_str()),
             original_filename: row.get("original_filename")?,
@@ -1391,6 +1640,17 @@ impl AppDatabase {
             file_size: row.get("file_size")?,
             created_at: parse_datetime_required(row.get("created_at")?)?,
             updated_at: parse_datetime_required(row.get("updated_at")?)?,
+        })
+    }
+
+    fn map_file_hash_cache_record(row: &Row<'_>) -> rusqlite::Result<FileHashCacheRecord> {
+        Ok(FileHashCacheRecord {
+            file_path: row.get("file_path")?,
+            root_kind: row.get("root_kind")?,
+            sha256: row.get("sha256")?,
+            file_size: row.get("file_size")?,
+            modified_at: parse_datetime_optional(row.get("modified_at")?)?,
+            last_verified_at: parse_datetime_required(row.get("last_verified_at")?)?,
         })
     }
 
@@ -1458,6 +1718,8 @@ impl AppDatabase {
             retry_count: row.get("retry_count")?,
             next_eligible_at: parse_datetime_optional_row(row, "next_eligible_at")?,
             last_failure_at: parse_datetime_optional_row(row, "last_failure_at")?,
+            received_bytes: row.get("received_bytes")?,
+            total_bytes: row.get("total_bytes")?,
             last_error: row.get("last_error")?,
             sha256: row.get("sha256")?,
             saved_relative_path: row.get("saved_relative_path")?,
@@ -1532,6 +1794,17 @@ fn parse_optional_datetime(value: Option<String>) -> Result<Option<DateTime<Utc>
         )),
         None => Ok(None),
     }
+}
+
+fn normalize_settings(mut settings: AppSettings) -> AppSettings {
+    let destination = if settings.destination_root_path.trim().is_empty() {
+        settings.manual_download_root_path.trim().to_owned()
+    } else {
+        settings.destination_root_path.trim().to_owned()
+    };
+    settings.destination_root_path = destination.clone();
+    settings.manual_download_root_path = destination;
+    settings
 }
 
 fn iso_now() -> String {

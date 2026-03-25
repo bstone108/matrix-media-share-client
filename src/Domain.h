@@ -387,6 +387,7 @@ struct AppSettings {
     int previewWorkerCount = 1;
     bool autoJoinSpaceRooms = false;
     bool autoDownloadNewMedia = false;
+    bool selfHealEnabled = false;
     bool desiredPowerState = false;
 
     static AppSettings defaults(const QString &destinationRootPath)
@@ -399,7 +400,7 @@ struct AppSettings {
         settings.libraryRootPath = destinationRootPath + QStringLiteral("/Shared Files");
         settings.flatFolderLayout = false;
         settings.archiveRootPath = QStringLiteral("");
-        settings.manualDownloadRootPath = destinationRootPath + QStringLiteral("/Downloads");
+        settings.manualDownloadRootPath = destinationRootPath;
         return settings;
     }
 };
@@ -469,6 +470,25 @@ struct MediaCatalogItem {
     QDateTime updatedAt;
 };
 
+struct SharedItemRecord {
+    QString sha256;
+    MediaSourceKind sourceKind = MediaSourceKind::LocalFile;
+    QString sourcePath;
+    QString bundlePath;
+    QString libraryPath;
+    QString archivePath;
+    QString fileCid;
+    QString thumbnailCid;
+    QString pageCid;
+    QString landingPageUrl;
+    QString roomId;
+    QString originalFilename;
+    QString mimeType;
+    MediaCategory category = MediaCategory::Other;
+    qint64 fileSize = 0;
+    QDateTime updatedAt;
+};
+
 struct SpaceChildDescriptor {
     QString roomId;
     QStringList viaServers;
@@ -505,6 +525,8 @@ struct DownloadJobRecord {
     int retryCount = 0;
     QDateTime nextEligibleAt;
     QDateTime lastFailureAt;
+    qint64 receivedBytes = 0;
+    qint64 totalBytes = -1;
     QString lastError;
     QString sha256;
     QString savedRelativePath;

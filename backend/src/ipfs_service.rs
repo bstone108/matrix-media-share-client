@@ -71,6 +71,7 @@ impl IpfsService {
         title: &str,
         file_path: &Path,
         thumbnail_path: Option<&Path>,
+        landing_page_output_path: &Path,
         preferred_gateway_url: Option<&str>,
         preferred_gateway_urls: &[String],
     ) -> Result<PublishedShare> {
@@ -135,8 +136,12 @@ impl IpfsService {
             .await?;
         let landing_page_url = page_url(&primary_gateway, &page_cid);
 
-        let snapshot_path = self.paths.landing_pages_path.join(format!("{page_cid}.html"));
-        fs::write(&snapshot_path, render_landing_page(
+        if let Some(parent) = landing_page_output_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        fs::write(landing_page_output_path, render_landing_page(
             title,
             &file_cid,
             thumbnail_cid.as_deref(),
@@ -144,7 +149,7 @@ impl IpfsService {
             &alternate_gateways,
         ))
         .await
-        .with_context(|| format!("Failed to persist {}", snapshot_path.display()))?;
+        .with_context(|| format!("Failed to persist {}", landing_page_output_path.display()))?;
 
         Ok(PublishedShare {
             file_cid,
