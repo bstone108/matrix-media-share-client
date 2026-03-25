@@ -23,7 +23,7 @@ use tokio::{
 
 use crate::{
     app_paths::AppPaths,
-    protocol::{CommandEnvelope, ServerEvent},
+    protocol::{Command, CommandEnvelope, ServerEvent},
     service::{BackendService, CommandOutcome},
 };
 
@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    let _ = service.handle_command(Command::Shutdown).await;
     drop(event_tx);
     let _ = writer_task.await;
     Ok(())

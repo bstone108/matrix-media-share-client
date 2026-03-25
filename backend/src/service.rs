@@ -24,7 +24,7 @@ use matrix_sdk::{
         api::client::uiaa,
         events::room::{
             MediaSource,
-            message::{MessageType, RoomMessageEventContent},
+            message::{MessageType, RoomMessageEventContent, TextMessageEventContent},
         },
     },
 };
@@ -67,6 +67,7 @@ use crate::{
 const ROOM_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const DOWNLOAD_IDLE_DELAY: Duration = Duration::from_secs(1);
 const DOWNLOAD_ERROR_DELAY: Duration = Duration::from_secs(2);
+const SHARE_QUEUE_DELAY: Duration = Duration::from_secs(10);
 const MAX_DISCOVERY_CACHE_ENTRIES: usize = 12_000;
 
 pub enum CommandOutcome {
@@ -101,6 +102,7 @@ struct RunningContext {
     downloads: Arc<DownloadManager>,
     share_slots: Arc<Semaphore>,
     room_workers: Arc<Mutex<HashMap<String, RoomWorkerState>>>,
+    focused_room_id: Arc<RwLock<Option<String>>>,
     handled_event_ids: Arc<Mutex<HashSet<String>>>,
     verification: Arc<Mutex<VerificationContext>>,
 }
@@ -444,6 +446,7 @@ impl BackendService {
             downloads: downloads.clone(),
             share_slots: share_slots.clone(),
             room_workers: Arc::new(Mutex::new(HashMap::new())),
+            focused_room_id: Arc::new(RwLock::new(None)),
             handled_event_ids: Arc::new(Mutex::new(HashSet::new())),
             verification: Arc::new(Mutex::new(VerificationContext::default())),
         });
@@ -1034,6 +1037,8 @@ async fn queue_share_requests(
                     )
                     .await;
             }
+
+            sleep(SHARE_QUEUE_DELAY).await;
         });
     }
 
@@ -1578,14 +1583,11 @@ async fn share_local_file(
             &settings.preferred_gateway_urls,
         )
         .await?;
-    let link_message = format!(
-        "{}\nIPFS landing page: {}\nIPFS media: ipfs://{}\nCID: {}\nLanding Page CID: {}",
-        prepared.file_name,
-        published.landing_page_url,
-        published.file_cid,
-        published.file_cid,
-        published.page_cid,
+    let comment_message = format!(
+        "IPFS landing page: {}\nIPFS media: ipfs://{}\nCID: {}\nLanding Page CID: {}",
+        published.landing_page_url, published.file_cid, published.file_cid, published.page_cid,
     );
+    let attachment_comment = Some(TextMessageEventContent::plain(comment_message.clone()));
 
     let upload_limit = context.runtime.snapshot().await.upload_size_limit_bytes;
     let should_try_full_upload = upload_limit.is_none_or(|limit| prepared.file_size <= limit);
@@ -1599,13 +1601,11 @@ async fn share_local_file(
                 prepared.file_name.clone(),
                 &prepared.content_type,
                 file_bytes,
-                AttachmentConfig::new(),
+                AttachmentConfig::new().caption(attachment_comment.clone()),
             )
             .await
         {
             Ok(_) => {
-                room.send(RoomMessageEventContent::text_plain(link_message.clone()))
-                    .await?;
                 context
                     .database
                     .insert_log(
@@ -1634,18 +1634,36 @@ async fn share_local_file(
 
     if let Some(thumbnail_path) = thumbnail_path.as_deref() {
         if let Ok(thumbnail_bytes) = tokio_fs::read(thumbnail_path).await {
-            let _ = room
+            if room
                 .send_attachment(
                     format!("{}.preview.jpg", prepared.file_name),
                     &mime::IMAGE_JPEG,
                     thumbnail_bytes,
-                    AttachmentConfig::new(),
+                    AttachmentConfig::new().caption(attachment_comment.clone()),
                 )
-                .await;
+                .await
+                .is_ok()
+            {
+                context
+                    .database
+                    .insert_log(
+                        AppLogLevel::Info,
+                        "share",
+                        &format!(
+                            "Shared {} to {room_id} via IPFS landing page {}.",
+                            prepared.file_name, published.landing_page_url
+                        ),
+                    )
+                    .await?;
+                return Ok(());
+            }
         }
     }
 
-    room.send(RoomMessageEventContent::text_plain(link_message.clone()))
+    room.send(RoomMessageEventContent::text_plain(format!(
+        "{}\n{}",
+        prepared.file_name, comment_message
+    )))
         .await?;
     context
         .database
@@ -2236,6 +2254,7 @@ async fn focus_room_now(context: &Arc<RunningContext>, room_id: &str) -> Result<
     if room_id.is_empty() {
         return Ok(());
     }
+    *context.focused_room_id.write().await = Some(room_id.to_owned());
 
     let room = context
         .client
@@ -2925,6 +2944,12 @@ async fn process_events(
     } else {
         Some(context.settings.read().await.clone())
     };
+    let should_warm_thumbnails = context
+        .focused_room_id
+        .read()
+        .await
+        .as_deref()
+        == Some(room_id);
 
     for event in events {
         let ObservedTimelineEvent {
@@ -2984,7 +3009,7 @@ async fn process_events(
                 if inserted {
                     new_discovery_count += 1;
                 }
-                if should_cache_discovery_thumbnail(&discovery) {
+                if should_warm_thumbnails && should_cache_discovery_thumbnail(&discovery) {
                     thumbnail_warmups.push(discovery.clone());
                 }
             }
@@ -4058,20 +4083,18 @@ async fn download_media_to_temp(
 
     let source = decode_media_source(&job.mxc_url)?;
     if let MediaSource::Plain(uri) = &source {
-        if is_remote_media(uri.as_str(), &homeserver_url) {
-            if let Some(path) = direct_remote_media_download_to_temp(
-                runtime,
-                &paths.temp_downloads_path,
-                worker_id,
-                job,
-                uri.as_str(),
-                &homeserver_url,
-                client.access_token(),
-            )
-            .await?
-            {
-                return Ok(path);
-            }
+        if let Some(path) = direct_remote_media_download_to_temp(
+            runtime,
+            &paths.temp_downloads_path,
+            worker_id,
+            job,
+            uri.as_str(),
+            &homeserver_url,
+            client.access_token(),
+        )
+        .await?
+        {
+            return Ok(path);
         }
     }
 
@@ -4203,19 +4226,6 @@ async fn direct_remote_media_download_to_temp(
     let Some((server_name, media_id)) = parse_mxc_url(mxc_url) else {
         return Ok(None);
     };
-
-    let remote_host = server_name
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let homeserver_host = reqwest::Url::parse(homeserver_url)
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-        .unwrap_or_default();
-    if remote_host == homeserver_host {
-        return Ok(None);
-    }
 
     let base = reqwest::Url::parse(homeserver_url)?;
     let encoded_server = urlencoding::encode(&server_name);

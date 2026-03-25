@@ -137,6 +137,14 @@ AppController::AppController(QObject *parent)
         updateRefreshTimer();
         scheduleRefresh();
     });
+    connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, this, [this]() {
+        shutdownBackendForExit();
+    });
+}
+
+AppController::~AppController()
+{
+    shutdownBackendForExit();
 }
 
 void AppController::initialize()
@@ -174,6 +182,21 @@ void AppController::refresh()
     jobs_ = database_.fetchJobs();
     waitingQueueCount_ = database_.fetchWaitingJobCount();
     emit stateChanged();
+}
+
+void AppController::shutdownBackendForExit()
+{
+    if (backend_ == nullptr) {
+        return;
+    }
+
+    if (refreshTimer_ != nullptr) {
+        refreshTimer_->stop();
+    }
+
+    backend_.reset();
+    runtime_ = BotRuntimeSnapshot {};
+    runtime_.connectionState = ConnectionState::Stopped;
 }
 
 const AppSettings &AppController::settings() const

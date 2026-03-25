@@ -68,6 +68,7 @@ constexpr int kBrowserBufferedPages = 2;
 constexpr int kBrowserMaxWindowPages = 5;
 constexpr int kBrowserThumbnailCacheLimit = 160;
 constexpr int kBrowserBackgroundThumbnailBatchSize = 10;
+constexpr int kBrowserThumbnailConcurrentRequests = 6;
 constexpr int kLogsPageSize = 200;
 constexpr int kLogsBufferedPages = 2;
 constexpr int kLogsMaxWindowPages = 5;
@@ -1767,6 +1768,7 @@ void MainWindow::resetBrowserPageState()
     browserTotalDiscoveryCount_ = 0;
     browserLoadingPage_ = false;
     browserBackgroundThumbnailPrefetchScheduled_ = false;
+    clearBrowserThumbnailRequests();
     if (discoveriesList_ == nullptr) {
         return;
     }
@@ -1973,14 +1975,17 @@ void MainWindow::requestVisibleBrowserThumbnails()
         return;
     }
 
+    const QSet<QString> visibleKeys = currentVisibleBrowserThumbnailKeys();
     const QRect viewportRect = discoveriesList_->viewport()->rect();
     for (int index = 0; index < browserLoadedDiscoveries_.size() && index < discoveriesList_->count(); ++index) {
         QListWidgetItem *item = discoveriesList_->item(index);
         if (item == nullptr || !discoveriesList_->visualItemRect(item).intersects(viewportRect)) {
             continue;
         }
-        requestBrowserThumbnail(browserLoadedDiscoveries_.at(index));
+        enqueueBrowserThumbnailRequest(browserLoadedDiscoveries_.at(index), true);
     }
+    reprioritizeBrowserThumbnailRequests(visibleKeys);
+    pumpBrowserThumbnailRequests();
 }
 
 void MainWindow::scheduleBackgroundBrowserThumbnailPrefetch()
@@ -1995,32 +2000,53 @@ void MainWindow::scheduleBackgroundBrowserThumbnailPrefetch()
         if (discoveriesList_ == nullptr) {
             return;
         }
-
-        const QRect viewportRect = discoveriesList_->viewport()->rect();
-        int requested = 0;
-        bool morePending = false;
-        for (int index = 0; index < browserLoadedDiscoveries_.size() && index < discoveriesList_->count(); ++index) {
-            const AttachmentDiscovery &discovery = browserLoadedDiscoveries_.at(index);
-            QListWidgetItem *item = discoveriesList_->item(index);
-            if (item == nullptr || discoveriesList_->visualItemRect(item).intersects(viewportRect)) {
-                continue;
-            }
-
-            const QString cacheKey = browserThumbnailKey(discovery);
-            if (browserThumbnailIconCache_.contains(cacheKey) || browserThumbnailRequestsInFlight_.contains(cacheKey)) {
-                continue;
-            }
-
-            if (requested >= kBrowserBackgroundThumbnailBatchSize) {
-                morePending = true;
-                break;
-            }
-
-            requestBrowserThumbnail(discovery);
-            ++requested;
+        if (!browserThumbnailForegroundOrder_.isEmpty() || !browserThumbnailForegroundRequestsInFlight_.isEmpty()) {
+            scheduleBackgroundBrowserThumbnailPrefetch();
+            return;
         }
 
-        if (morePending) {
+        const QRect viewportRect = discoveriesList_->viewport()->rect();
+        int firstVisibleIndex = -1;
+        int lastVisibleIndex = -1;
+        for (int index = 0; index < browserLoadedDiscoveries_.size() && index < discoveriesList_->count(); ++index) {
+            QListWidgetItem *item = discoveriesList_->item(index);
+            if (item == nullptr || !discoveriesList_->visualItemRect(item).intersects(viewportRect)) {
+                continue;
+            }
+            if (firstVisibleIndex < 0) {
+                firstVisibleIndex = index;
+            }
+            lastVisibleIndex = index;
+        }
+
+        if (firstVisibleIndex < 0 || lastVisibleIndex < 0) {
+            return;
+        }
+
+        int queued = 0;
+        const int maxDistance = qMax(firstVisibleIndex, browserLoadedDiscoveries_.size() - lastVisibleIndex - 1);
+        for (int distance = 1; distance <= maxDistance && queued < kBrowserBackgroundThumbnailBatchSize; ++distance) {
+            const int afterIndex = lastVisibleIndex + distance;
+            if (afterIndex >= 0 && afterIndex < browserLoadedDiscoveries_.size()) {
+                enqueueBrowserThumbnailRequest(browserLoadedDiscoveries_.at(afterIndex), false);
+                ++queued;
+                if (queued >= kBrowserBackgroundThumbnailBatchSize) {
+                    break;
+                }
+            }
+
+            const int beforeIndex = firstVisibleIndex - distance;
+            if (beforeIndex >= 0 && beforeIndex < browserLoadedDiscoveries_.size()) {
+                enqueueBrowserThumbnailRequest(browserLoadedDiscoveries_.at(beforeIndex), false);
+                ++queued;
+            }
+        }
+
+        pumpBrowserThumbnailRequests();
+
+        if (!browserThumbnailForegroundOrder_.isEmpty()
+            || !browserThumbnailForegroundRequestsInFlight_.isEmpty()
+            || !browserThumbnailBackgroundOrder_.isEmpty()) {
             scheduleBackgroundBrowserThumbnailPrefetch();
         }
     });
@@ -2083,7 +2109,138 @@ QIcon MainWindow::placeholderDiscoveryIcon(const AttachmentDiscovery &discovery)
     return QIcon(tile);
 }
 
-void MainWindow::requestBrowserThumbnail(const AttachmentDiscovery &discovery)
+QSet<QString> MainWindow::currentVisibleBrowserThumbnailKeys() const
+{
+    QSet<QString> visibleKeys;
+    if (discoveriesList_ == nullptr) {
+        return visibleKeys;
+    }
+
+    const QRect viewportRect = discoveriesList_->viewport()->rect();
+    for (int index = 0; index < browserLoadedDiscoveries_.size() && index < discoveriesList_->count(); ++index) {
+        QListWidgetItem *item = discoveriesList_->item(index);
+        if (item == nullptr || !discoveriesList_->visualItemRect(item).intersects(viewportRect)) {
+            continue;
+        }
+        visibleKeys.insert(browserThumbnailKey(browserLoadedDiscoveries_.at(index)));
+    }
+
+    return visibleKeys;
+}
+
+void MainWindow::clearBrowserThumbnailRequests()
+{
+    browserThumbnailForegroundPending_.clear();
+    browserThumbnailForegroundOrder_.clear();
+    browserThumbnailBackgroundPending_.clear();
+    browserThumbnailBackgroundOrder_.clear();
+    browserThumbnailRequestsInFlight_.clear();
+    browserThumbnailForegroundRequestsInFlight_.clear();
+
+    const auto replies = browserThumbnailReplies_;
+    browserThumbnailReplies_.clear();
+    for (auto it = replies.cbegin(); it != replies.cend(); ++it) {
+        if (it.value() != nullptr) {
+            it.value()->abort();
+            it.value()->deleteLater();
+        }
+    }
+}
+
+void MainWindow::enqueueBrowserThumbnailRequest(const AttachmentDiscovery &discovery, const bool highPriority)
+{
+    const QString cacheKey = browserThumbnailKey(discovery);
+    if (cacheKey.startsWith(QStringLiteral("placeholder:")) || browserThumbnailIconCache_.contains(cacheKey)) {
+        return;
+    }
+
+    const bool inFlight = browserThumbnailRequestsInFlight_.contains(cacheKey);
+    const bool foregroundInFlight = browserThumbnailForegroundRequestsInFlight_.contains(cacheKey);
+
+    if (highPriority) {
+        browserThumbnailBackgroundPending_.remove(cacheKey);
+        browserThumbnailBackgroundOrder_.removeAll(cacheKey);
+
+        if (!browserThumbnailForegroundPending_.contains(cacheKey)) {
+            browserThumbnailForegroundPending_.insert(cacheKey, discovery);
+        }
+        browserThumbnailForegroundOrder_.removeAll(cacheKey);
+        browserThumbnailForegroundOrder_.prepend(cacheKey);
+
+        if (inFlight && !foregroundInFlight) {
+            if (QNetworkReply *reply = browserThumbnailReplies_.value(cacheKey, nullptr)) {
+                reply->abort();
+            }
+        }
+        return;
+    }
+
+    if (inFlight || browserThumbnailForegroundPending_.contains(cacheKey)) {
+        return;
+    }
+
+    if (browserThumbnailBackgroundPending_.contains(cacheKey)) {
+        browserThumbnailBackgroundOrder_.removeAll(cacheKey);
+        browserThumbnailBackgroundOrder_.append(cacheKey);
+        return;
+    }
+
+    browserThumbnailBackgroundPending_.insert(cacheKey, discovery);
+    browserThumbnailBackgroundOrder_.append(cacheKey);
+}
+
+void MainWindow::reprioritizeBrowserThumbnailRequests(const QSet<QString> &visibleKeys)
+{
+    Q_UNUSED(visibleKeys);
+    if (browserThumbnailForegroundOrder_.isEmpty() || browserThumbnailReplies_.isEmpty()) {
+        return;
+    }
+
+    for (auto it = browserThumbnailReplies_.cbegin(); it != browserThumbnailReplies_.cend(); ++it) {
+        if (browserThumbnailForegroundRequestsInFlight_.contains(it.key()) || it.value() == nullptr) {
+            continue;
+        }
+        it.value()->abort();
+    }
+}
+
+void MainWindow::pumpBrowserThumbnailRequests()
+{
+    while (browserThumbnailReplies_.size() < kBrowserThumbnailConcurrentRequests) {
+        if (!browserThumbnailForegroundOrder_.isEmpty()) {
+            const QString cacheKey = browserThumbnailForegroundOrder_.takeFirst();
+            const auto it = browserThumbnailForegroundPending_.find(cacheKey);
+            if (it == browserThumbnailForegroundPending_.end()) {
+                continue;
+            }
+
+            const AttachmentDiscovery discovery = it.value();
+            browserThumbnailForegroundPending_.erase(it);
+            requestBrowserThumbnail(discovery, true);
+            continue;
+        }
+
+        if (!browserThumbnailForegroundRequestsInFlight_.isEmpty()) {
+            return;
+        }
+
+        if (browserThumbnailBackgroundOrder_.isEmpty()) {
+            return;
+        }
+
+        const QString cacheKey = browserThumbnailBackgroundOrder_.takeFirst();
+        const auto it = browserThumbnailBackgroundPending_.find(cacheKey);
+        if (it == browserThumbnailBackgroundPending_.end()) {
+            continue;
+        }
+
+        const AttachmentDiscovery discovery = it.value();
+        browserThumbnailBackgroundPending_.erase(it);
+        requestBrowserThumbnail(discovery, false);
+    }
+}
+
+void MainWindow::requestBrowserThumbnail(const AttachmentDiscovery &discovery, const bool foreground)
 {
     if (thumbnailNetworkManager_ == nullptr) {
         return;
@@ -2104,14 +2261,21 @@ void MainWindow::requestBrowserThumbnail(const AttachmentDiscovery &discovery)
     QNetworkRequest request {QUrl(url)};
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
     browserThumbnailRequestsInFlight_.insert(cacheKey);
+    if (foreground) {
+        browserThumbnailForegroundRequestsInFlight_.insert(cacheKey);
+    }
     QNetworkReply *reply = thumbnailNetworkManager_->get(request);
+    browserThumbnailReplies_.insert(cacheKey, reply);
     connect(reply, &QNetworkReply::finished, this, [this, reply, cacheKey, discovery]() {
         browserThumbnailRequestsInFlight_.remove(cacheKey);
+        browserThumbnailForegroundRequestsInFlight_.remove(cacheKey);
+        browserThumbnailReplies_.remove(cacheKey);
 
         if (reply == nullptr || reply->error() != QNetworkReply::NoError) {
             if (reply != nullptr) {
                 reply->deleteLater();
             }
+            pumpBrowserThumbnailRequests();
             return;
         }
 
@@ -2120,8 +2284,14 @@ void MainWindow::requestBrowserThumbnail(const AttachmentDiscovery &discovery)
 
         QPixmap preview;
         if (!preview.loadFromData(bytes)) {
+            pumpBrowserThumbnailRequests();
             return;
         }
+
+        browserThumbnailForegroundPending_.remove(cacheKey);
+        browserThumbnailForegroundOrder_.removeAll(cacheKey);
+        browserThumbnailBackgroundPending_.remove(cacheKey);
+        browserThumbnailBackgroundOrder_.removeAll(cacheKey);
 
         const QString title = discovery.originalFilename.isEmpty() ? discovery.eventId : discovery.originalFilename;
         const QString subtitle = QStringLiteral("%1 | %2")
@@ -2136,6 +2306,7 @@ void MainWindow::requestBrowserThumbnail(const AttachmentDiscovery &discovery)
         const QIcon icon(tile);
         cacheBrowserThumbnailIcon(cacheKey, icon);
         updateBrowserThumbnailItems(cacheKey, icon);
+        pumpBrowserThumbnailRequests();
     });
 }
 

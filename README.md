@@ -2,12 +2,14 @@
 
 Matrix Media Share Client is a desktop Matrix media browser, sharer, and downloader for Linux, Windows, and macOS.
 
+For a plain-English walkthrough of the app, see [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
+
 It is seeded from Matrix Media Archiver, but this app is now oriented around:
 
 - browsing room media instead of blindly archiving everything
 - sharing files through Matrix plus IPFS
 - publishing IPFS landing pages with alternate public gateway links
-- keeping a local library and a visible transfer queue
+- keeping managed shared files plus a visible transfer queue
 - managing a bundled, app-owned Kubo node from inside the client
 
 ## Current Implementation

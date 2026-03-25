@@ -92,7 +92,7 @@ jobs:
       - name: Install Qt
         run: |
           QT_BASE_DIR="${RUNNER_TEMP}/qt"
-          python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" linux desktop "${QT_VERSION}" linux_gcc_64
+          python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" linux desktop "${QT_VERSION}" linux_gcc_64 --modules qtmultimedia
           QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/gcc_64"
           echo "QT_ROOT_DIR=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
@@ -173,7 +173,7 @@ jobs:
       - name: Install Qt
         run: |
           QT_BASE_DIR="${RUNNER_TEMP}/qt"
-          python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" linux_arm64 desktop "${QT_VERSION}" linux_gcc_arm64
+          python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" linux_arm64 desktop "${QT_VERSION}" linux_gcc_arm64 --modules qtmultimedia
           QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/gcc_arm64"
           echo "QT_ROOT_DIR=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
@@ -235,7 +235,7 @@ jobs:
       - name: Install Qt
         run: |
           $qtBaseDir = Join-Path $env:RUNNER_TEMP "qt"
-          python -m aqt install-qt --outputdir $qtBaseDir windows desktop $env:QT_VERSION win64_msvc2022_64
+          python -m aqt install-qt --outputdir $qtBaseDir windows desktop $env:QT_VERSION win64_msvc2022_64 --modules qtmultimedia
           $qtRootDir = Join-Path $qtBaseDir "$env:QT_VERSION\\msvc2022_64"
           "QT_ROOT_DIR=$qtRootDir" >> $env:GITHUB_ENV
           "CMAKE_PREFIX_PATH=$qtRootDir" >> $env:GITHUB_ENV
@@ -297,8 +297,8 @@ jobs:
       - name: Install Qt
         run: |
           $qtBaseDir = Join-Path $env:RUNNER_TEMP "qt"
-          python -m aqt install-qt --outputdir $qtBaseDir windows desktop $env:QT_VERSION win64_msvc2022_64
-          python -m aqt install-qt --outputdir $qtBaseDir windows_arm64 desktop $env:QT_VERSION win64_msvc2022_arm64
+          python -m aqt install-qt --outputdir $qtBaseDir windows desktop $env:QT_VERSION win64_msvc2022_64 --modules qtmultimedia
+          python -m aqt install-qt --outputdir $qtBaseDir windows_arm64 desktop $env:QT_VERSION win64_msvc2022_arm64 --modules qtmultimedia
           $qtHostRootDir = Join-Path $qtBaseDir "$env:QT_VERSION\\msvc2022_64"
           $qtRootDir = Join-Path $qtBaseDir "$env:QT_VERSION\\msvc2022_arm64"
           "QT_HOST_ROOT_DIR=$qtHostRootDir" >> $env:GITHUB_ENV
@@ -360,7 +360,7 @@ jobs:
       - name: Install Qt
         run: |
           QT_BASE_DIR="${RUNNER_TEMP}/qt"
-          python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" mac desktop "${QT_VERSION}" clang_64
+          python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" mac desktop "${QT_VERSION}" clang_64 --modules qtmultimedia
           QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/macos"
           echo "QT_ROOT_DIR=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
@@ -417,7 +417,7 @@ jobs:
       - name: Install Qt
         run: |
           QT_BASE_DIR="${RUNNER_TEMP}/qt"
-          python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" mac desktop "${QT_VERSION}" clang_64
+          python3 -m aqt install-qt --outputdir "${QT_BASE_DIR}" mac desktop "${QT_VERSION}" clang_64 --modules qtmultimedia
           QT_ROOT_DIR="${QT_BASE_DIR}/${QT_VERSION}/macos"
           echo "QT_ROOT_DIR=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"

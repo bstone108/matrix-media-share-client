@@ -76,6 +76,7 @@ impl KuboManager {
         self.init_repo_if_needed(&binary_path).await?;
         let mut command = Command::new(&binary_path);
         command
+            .kill_on_drop(true)
             .env("IPFS_PATH", &self.paths.kubo_repo_path)
             .arg("daemon")
             .arg("--migrate=true")
