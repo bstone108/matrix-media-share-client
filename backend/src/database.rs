@@ -471,8 +471,8 @@ impl AppDatabase {
             .is_some();
         connection.execute(
             "INSERT OR IGNORE INTO discovered_attachments (
-                room_id, event_id, origin_ts, source_kind, direct_url, mxc_url, thumbnail_source_url, thumbnail_cached_path, original_filename, mime_type, category
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                room_id, event_id, origin_ts, source_kind, direct_url, mxc_url, fallback_source_url, thumbnail_source_url, thumbnail_cached_path, original_filename, mime_type, category
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 discovery.room_id,
                 discovery.event_id,
@@ -480,6 +480,7 @@ impl AppDatabase {
                 discovery.source_kind.as_storage_key(),
                 discovery.direct_url,
                 discovery.mxc_url,
+                discovery.fallback_source_url,
                 discovery.thumbnail_source_url,
                 discovery.thumbnail_cached_path,
                 discovery.original_filename,
@@ -492,11 +493,12 @@ impl AppDatabase {
              SET source_kind = ?3,
                  direct_url = COALESCE(?4, direct_url),
                  mxc_url = ?5,
-                 thumbnail_source_url = COALESCE(?6, thumbnail_source_url),
-                 thumbnail_cached_path = COALESCE(?7, thumbnail_cached_path),
-                 original_filename = COALESCE(?8, original_filename),
-                 mime_type = COALESCE(?9, mime_type),
-                 category = ?10
+                 fallback_source_url = COALESCE(?6, fallback_source_url),
+                 thumbnail_source_url = COALESCE(?7, thumbnail_source_url),
+                 thumbnail_cached_path = COALESCE(?8, thumbnail_cached_path),
+                 original_filename = COALESCE(?9, original_filename),
+                 mime_type = COALESCE(?10, mime_type),
+                 category = ?11
              WHERE room_id = ?1 AND event_id = ?2",
             params![
                 discovery.room_id,
@@ -504,6 +506,7 @@ impl AppDatabase {
                 discovery.source_kind.as_storage_key(),
                 discovery.direct_url,
                 discovery.mxc_url,
+                discovery.fallback_source_url,
                 discovery.thumbnail_source_url,
                 discovery.thumbnail_cached_path,
                 discovery.original_filename,
@@ -523,13 +526,14 @@ impl AppDatabase {
         let now = iso_now();
         connection.execute(
             "INSERT OR IGNORE INTO download_jobs (
-                room_id, event_id, mxc_url, source_kind, direct_url, original_filename, mime_type, category,
+                room_id, event_id, mxc_url, fallback_source_url, source_kind, direct_url, original_filename, mime_type, category,
                 state, retry_count, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12)",
             params![
                 discovery.room_id,
                 discovery.event_id,
                 discovery.mxc_url,
+                discovery.fallback_source_url,
                 discovery.source_kind.as_storage_key(),
                 discovery.direct_url,
                 discovery.original_filename,
@@ -557,13 +561,14 @@ impl AppDatabase {
         let now = iso_now();
         connection.execute(
             "INSERT OR IGNORE INTO download_jobs (
-                room_id, event_id, mxc_url, source_kind, direct_url, original_filename, mime_type, category,
+                room_id, event_id, mxc_url, fallback_source_url, source_kind, direct_url, original_filename, mime_type, category,
                 state, retry_count, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12)",
             params![
                 room_id,
                 event_id,
                 direct_url,
+                Option::<String>::None,
                 source_kind.as_storage_key(),
                 direct_url,
                 original_filename,
@@ -585,7 +590,7 @@ impl AppDatabase {
         let connection = self.inner.lock().await;
         connection
             .query_row(
-                "SELECT room_id, event_id, origin_ts, source_kind, direct_url, mxc_url, thumbnail_source_url, thumbnail_cached_path, original_filename, mime_type, category
+                "SELECT room_id, event_id, origin_ts, source_kind, direct_url, mxc_url, fallback_source_url, thumbnail_source_url, thumbnail_cached_path, original_filename, mime_type, category
                  FROM discovered_attachments
                  WHERE room_id = ?1 AND event_id = ?2",
                 params![room_id, event_id],
@@ -607,6 +612,22 @@ impl AppDatabase {
              SET thumbnail_cached_path = ?3
              WHERE room_id = ?1 AND event_id = ?2",
             params![room_id, event_id, thumbnail_cached_path],
+        )?;
+        Ok(())
+    }
+
+    pub async fn set_discovery_thumbnail_source_url(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        thumbnail_source_url: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.inner.lock().await;
+        connection.execute(
+            "UPDATE discovered_attachments
+             SET thumbnail_source_url = ?3
+             WHERE room_id = ?1 AND event_id = ?2",
+            params![room_id, event_id, thumbnail_source_url],
         )?;
         Ok(())
     }
@@ -1363,6 +1384,7 @@ impl AppDatabase {
                 source_kind TEXT NOT NULL DEFAULT 'matrix',
                 direct_url TEXT,
                 mxc_url TEXT NOT NULL,
+                fallback_source_url TEXT,
                 thumbnail_source_url TEXT,
                 thumbnail_cached_path TEXT,
                 original_filename TEXT,
@@ -1376,6 +1398,7 @@ impl AppDatabase {
                 room_id TEXT NOT NULL,
                 event_id TEXT NOT NULL,
                 mxc_url TEXT NOT NULL,
+                fallback_source_url TEXT,
                 source_kind TEXT NOT NULL DEFAULT 'matrix',
                 direct_url TEXT,
                 original_filename TEXT,
@@ -1459,6 +1482,12 @@ impl AppDatabase {
         Self::ensure_column(
             &connection,
             "discovered_attachments",
+            "fallback_source_url",
+            "TEXT",
+        )?;
+        Self::ensure_column(
+            &connection,
+            "discovered_attachments",
             "thumbnail_source_url",
             "TEXT",
         )?;
@@ -1466,6 +1495,12 @@ impl AppDatabase {
             &connection,
             "discovered_attachments",
             "thumbnail_cached_path",
+            "TEXT",
+        )?;
+        Self::ensure_column(
+            &connection,
+            "download_jobs",
+            "fallback_source_url",
             "TEXT",
         )?;
         Self::ensure_column(
@@ -1692,6 +1727,7 @@ impl AppDatabase {
             ),
             direct_url: row.get("direct_url")?,
             mxc_url: row.get("mxc_url")?,
+            fallback_source_url: row.get("fallback_source_url")?,
             thumbnail_source_url: row.get("thumbnail_source_url")?,
             thumbnail_cached_path: row.get("thumbnail_cached_path")?,
             original_filename: row.get("original_filename")?,
@@ -1707,6 +1743,7 @@ impl AppDatabase {
             room_id: row.get("room_id")?,
             event_id: row.get("event_id")?,
             mxc_url: row.get("mxc_url")?,
+            fallback_source_url: row.get("fallback_source_url")?,
             source_kind: crate::domain::MediaSourceKind::from_storage_key(
                 &row.get::<_, String>("source_kind")?,
             ),
@@ -1924,6 +1961,7 @@ mod tests {
             source_kind: crate::domain::MediaSourceKind::Matrix,
             direct_url: None,
             mxc_url: format!("mxc://example.org/{event_id}"),
+            fallback_source_url: None,
             thumbnail_source_url: None,
             thumbnail_cached_path: None,
             original_filename: Some(format!("{event_id}.bin")),

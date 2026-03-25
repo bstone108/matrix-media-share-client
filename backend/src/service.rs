@@ -2242,8 +2242,8 @@ async fn share_local_file(
         .await?;
     update_tracked_share_publication(context, &prepared, &published).await?;
     let comment_message = format!(
-        "IPFS landing page: {}\nIPFS media: ipfs://{}\nCID: {}\nLanding Page CID: {}",
-        published.landing_page_url, published.file_cid, published.file_cid, published.page_cid,
+        "Download link: {}\nIPFS media: ipfs://{}",
+        published.landing_page_url, published.file_cid,
     );
     let attachment_comment = Some(TextMessageEventContent::plain(comment_message.clone()));
 
@@ -2410,6 +2410,7 @@ async fn open_discovery(
         room_id: discovery.room_id.clone(),
         event_id: discovery.event_id.clone(),
         mxc_url: discovery.mxc_url.clone(),
+        fallback_source_url: discovery.fallback_source_url.clone(),
         source_kind: discovery.source_kind,
         direct_url: discovery.direct_url.clone(),
         original_filename: discovery.original_filename.clone(),
@@ -2524,15 +2525,40 @@ async fn open_discovery(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
 struct ImportedIpfsTarget {
     direct_url: String,
     file_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct IpfsMessageHints {
+    media_target: Option<ImportedIpfsTarget>,
+    landing_page_url: Option<String>,
+    file_name_hint: Option<String>,
 }
 
 fn parse_ipfs_import_target(link: &str, settings: &AppSettings) -> Result<ImportedIpfsTarget> {
     let trimmed = link.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("Paste an IPFS link or CID first."));
+    }
+
+    if let Some(stripped) = trimmed.strip_prefix("ipfs://") {
+        let without_slashes = stripped.trim_start_matches('/');
+        let mut parts = without_slashes.splitn(2, '/');
+        let cid = parts
+            .next()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("Invalid IPFS URI."))?
+            .to_owned();
+        let remainder = parts.next().map(ToOwned::to_owned);
+        return Ok(ImportedIpfsTarget {
+            direct_url: gateway_raw_url(settings, &cid, remainder.as_deref())?,
+            file_name: remainder
+                .and_then(|value| std::path::Path::new(&value).file_name()?.to_str().map(ToOwned::to_owned))
+                .or_else(|| Some(cid)),
+        });
     }
 
     if let Ok(url) = reqwest::Url::parse(trimmed) {
@@ -2557,23 +2583,6 @@ fn parse_ipfs_import_target(link: &str, settings: &AppSettings) -> Result<Import
         });
     }
 
-    if let Some(stripped) = trimmed.strip_prefix("ipfs://") {
-        let without_slashes = stripped.trim_start_matches('/');
-        let mut parts = without_slashes.splitn(2, '/');
-        let cid = parts
-            .next()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("Invalid IPFS URI."))?
-            .to_owned();
-        let remainder = parts.next().map(ToOwned::to_owned);
-        return Ok(ImportedIpfsTarget {
-            direct_url: gateway_raw_url(settings, &cid, remainder.as_deref())?,
-            file_name: remainder
-                .and_then(|value| std::path::Path::new(&value).file_name()?.to_str().map(ToOwned::to_owned))
-                .or_else(|| Some(cid)),
-        });
-    }
-
     if looks_like_ipfs_cid(trimmed) {
         return Ok(ImportedIpfsTarget {
             direct_url: gateway_raw_url(settings, trimmed, None)?,
@@ -2591,29 +2600,84 @@ fn ipfs_discovery_from_body(
     body: &str,
     settings: &AppSettings,
 ) -> Result<Option<AttachmentDiscovery>> {
+    let hints = ipfs_message_hints(body, settings)?;
+    let Some(media_target) = hints.media_target else {
+        return Ok(None);
+    };
+
+    let file_name = hints.file_name_hint.clone().or(media_target.file_name);
+    let category = media_classification::category(file_name.as_deref(), None);
+    let direct_url = media_target.direct_url;
+
+    Ok(Some(AttachmentDiscovery {
+        room_id: room_id.to_owned(),
+        event_id: event_id.to_owned(),
+        origin_server_timestamp: timestamp,
+        source_kind: MediaSourceKind::Ipfs,
+        direct_url: Some(direct_url.clone()),
+        mxc_url: hints.landing_page_url.unwrap_or_else(|| direct_url.clone()),
+        fallback_source_url: None,
+        thumbnail_source_url: file_name
+            .as_deref()
+            .and_then(|name| (media_classification::category(Some(name), None) == MediaCategory::Images).then(|| direct_url.clone())),
+        thumbnail_cached_path: None,
+        original_filename: file_name,
+        mime_type: None,
+        category,
+    }))
+}
+
+fn preferred_message_discovery(
+    matrix_discovery: Option<AttachmentDiscovery>,
+    ipfs_discovery: Option<AttachmentDiscovery>,
+) -> Option<AttachmentDiscovery> {
+    match (matrix_discovery, ipfs_discovery) {
+        (Some(matrix), Some(mut ipfs)) => {
+            ipfs.fallback_source_url = Some(matrix.mxc_url.clone());
+            if ipfs.original_filename.is_none() {
+                ipfs.original_filename = matrix.original_filename;
+            }
+            if ipfs.mime_type.is_none() {
+                ipfs.mime_type = matrix.mime_type;
+            }
+            if ipfs.category == MediaCategory::Other {
+                ipfs.category = matrix.category;
+            }
+            if ipfs.thumbnail_source_url.is_none() {
+                ipfs.thumbnail_source_url = matrix.thumbnail_source_url;
+            }
+            if ipfs.thumbnail_cached_path.is_none() {
+                ipfs.thumbnail_cached_path = matrix.thumbnail_cached_path;
+            }
+            Some(ipfs)
+        }
+        (None, Some(ipfs)) => Some(ipfs),
+        (Some(matrix), None) => Some(matrix),
+        (None, None) => None,
+    }
+}
+
+fn ipfs_message_hints(body: &str, settings: &AppSettings) -> Result<IpfsMessageHints> {
     let file_name_hint = ipfs_message_file_name_hint(body);
     let landing_page_url = ipfs_landing_page_hint(body);
 
+    if let Some(media_target) = ipfs_media_hint(body, settings)? {
+        return Ok(IpfsMessageHints {
+            media_target: Some(media_target),
+            landing_page_url,
+            file_name_hint,
+        });
+    }
+
     if let Some(cid) = ipfs_cid_hint(body) {
-        let direct_url = gateway_raw_url(settings, &cid, None)?;
-        return Ok(Some(AttachmentDiscovery {
-            room_id: room_id.to_owned(),
-            event_id: event_id.to_owned(),
-            origin_server_timestamp: timestamp,
-            source_kind: MediaSourceKind::Ipfs,
-            direct_url: Some(direct_url.clone()),
-            mxc_url: landing_page_url.unwrap_or_else(|| direct_url.clone()),
-            thumbnail_source_url: file_name_hint
-                .as_deref()
-                .and_then(|file_name| {
-                    (media_classification::category(Some(file_name), None) == MediaCategory::Images)
-                        .then(|| direct_url.clone())
-                }),
-            thumbnail_cached_path: None,
-            original_filename: file_name_hint.clone(),
-            mime_type: None,
-            category: media_classification::category(file_name_hint.as_deref(), None),
-        }));
+        return Ok(IpfsMessageHints {
+            media_target: Some(ImportedIpfsTarget {
+                direct_url: gateway_raw_url(settings, &cid, None)?,
+                file_name: Some(cid),
+            }),
+            landing_page_url,
+            file_name_hint,
+        });
     }
 
     for token in ipfs_body_candidates(body) {
@@ -2623,27 +2687,35 @@ fn ipfs_discovery_from_body(
         let Ok(imported) = parse_ipfs_import_target(&token, settings) else {
             continue;
         };
-        let file_name = imported.file_name.or_else(|| file_name_hint.clone());
-        return Ok(Some(AttachmentDiscovery {
-            room_id: room_id.to_owned(),
-            event_id: event_id.to_owned(),
-            origin_server_timestamp: timestamp,
-            source_kind: MediaSourceKind::Ipfs,
-            direct_url: Some(imported.direct_url.clone()),
-            mxc_url: landing_page_url.unwrap_or_else(|| imported.direct_url.clone()),
-            thumbnail_source_url: file_name
-                .as_deref()
-                .and_then(|name| {
-                    (media_classification::category(Some(name), None) == MediaCategory::Images)
-                        .then(|| imported.direct_url.clone())
-                }),
-            thumbnail_cached_path: None,
-            original_filename: file_name.clone(),
-            mime_type: None,
-            category: media_classification::category(file_name.as_deref(), None),
-        }));
+        return Ok(IpfsMessageHints {
+            media_target: Some(imported),
+            landing_page_url,
+            file_name_hint,
+        });
     }
 
+    Ok(IpfsMessageHints {
+        media_target: None,
+        landing_page_url,
+        file_name_hint,
+    })
+}
+
+fn ipfs_media_hint(body: &str, settings: &AppSettings) -> Result<Option<ImportedIpfsTarget>> {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if !trimmed.to_ascii_lowercase().starts_with("ipfs media:") {
+            continue;
+        }
+        let Some((_, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let candidate = value.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        return parse_ipfs_import_target(candidate, settings).map(Some);
+    }
     Ok(None)
 }
 
@@ -2658,6 +2730,7 @@ fn ipfs_message_file_name_hint(body: &str) -> Option<String> {
                 && !lower.starts_with("media cid:")
                 && !lower.starts_with("page cid:")
                 && !lower.starts_with("landing page cid:")
+                && !lower.starts_with("download link:")
                 && !lower.starts_with("ipfs landing page:")
                 && !lower.starts_with("ipfs media:")
         })
@@ -2667,7 +2740,10 @@ fn ipfs_message_file_name_hint(body: &str) -> Option<String> {
 fn ipfs_landing_page_hint(body: &str) -> Option<String> {
     body.lines().find_map(|line| {
         let trimmed = line.trim();
-        if !trimmed.to_ascii_lowercase().starts_with("ipfs landing page:") {
+        let lower = trimmed.to_ascii_lowercase();
+        if !lower.starts_with("ipfs landing page:")
+            && !lower.starts_with("download link:")
+        {
             return None;
         }
         let (_, value) = trimmed.split_once(':')?;
@@ -3528,6 +3604,84 @@ mod tests {
         );
         assert_eq!(response.rooms[1].room_id, None);
     }
+
+    #[test]
+    fn ipfs_discovery_prefers_explicit_media_link_over_landing_page() {
+        let settings = sample_settings("meow");
+        let body = "\
+Example.webm
+Download link: https://dweb.link/ipfs/bafklandingpage
+IPFS media: ipfs://bafybeicba7jmibru2lzxrm7wpy7ydkxgh2xmgko2cq5qwveytsz3p4wgnm";
+
+        let discovery = ipfs_discovery_from_body(
+            "!room:example.org",
+            "$event",
+            Utc::now(),
+            body,
+            &settings,
+        )
+        .expect("discovery parse should succeed")
+        .expect("discovery should be detected");
+
+        assert_eq!(
+            discovery.direct_url.as_deref(),
+            Some("https://dweb.link/ipfs/bafybeicba7jmibru2lzxrm7wpy7ydkxgh2xmgko2cq5qwveytsz3p4wgnm?download=1")
+        );
+        assert_eq!(discovery.mxc_url, "https://dweb.link/ipfs/bafklandingpage");
+        assert_eq!(discovery.original_filename.as_deref(), Some("Example.webm"));
+    }
+
+    #[test]
+    fn preferred_message_discovery_prefers_ipfs_media_over_matrix_copy() {
+        let matrix = AttachmentDiscovery {
+            room_id: "!room:example.org".to_owned(),
+            event_id: "$event".to_owned(),
+            origin_server_timestamp: Utc::now(),
+            source_kind: MediaSourceKind::Matrix,
+            direct_url: None,
+            mxc_url: "mxc://example.org/media".to_owned(),
+            fallback_source_url: None,
+            thumbnail_source_url: Some("mxc://example.org/thumb".to_owned()),
+            thumbnail_cached_path: None,
+            original_filename: Some("MatrixName.webm".to_owned()),
+            mime_type: Some("video/webm".to_owned()),
+            category: MediaCategory::Videos,
+        };
+        let ipfs = AttachmentDiscovery {
+            room_id: "!room:example.org".to_owned(),
+            event_id: "$event".to_owned(),
+            origin_server_timestamp: Utc::now(),
+            source_kind: MediaSourceKind::Ipfs,
+            direct_url: Some("https://dweb.link/ipfs/bafyraw?download=1".to_owned()),
+            mxc_url: "https://dweb.link/ipfs/bafkpage".to_owned(),
+            fallback_source_url: None,
+            thumbnail_source_url: None,
+            thumbnail_cached_path: None,
+            original_filename: None,
+            mime_type: None,
+            category: MediaCategory::Other,
+        };
+
+        let merged = preferred_message_discovery(Some(matrix), Some(ipfs))
+            .expect("discovery should be selected");
+
+        assert_eq!(merged.source_kind, MediaSourceKind::Ipfs);
+        assert_eq!(
+            merged.direct_url.as_deref(),
+            Some("https://dweb.link/ipfs/bafyraw?download=1")
+        );
+        assert_eq!(merged.original_filename.as_deref(), Some("MatrixName.webm"));
+        assert_eq!(merged.mime_type.as_deref(), Some("video/webm"));
+        assert_eq!(merged.category, MediaCategory::Videos);
+        assert_eq!(
+            merged.thumbnail_source_url.as_deref(),
+            Some("mxc://example.org/thumb")
+        );
+        assert_eq!(
+            merged.fallback_source_url.as_deref(),
+            Some("mxc://example.org/media")
+        );
+    }
 }
 
 fn should_cache_discovery_thumbnail(discovery: &AttachmentDiscovery) -> bool {
@@ -3543,6 +3697,26 @@ fn should_cache_discovery_thumbnail(discovery: &AttachmentDiscovery) -> bool {
         .thumbnail_source_url
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn should_fetch_ipfs_landing_page_thumbnail(discovery: &AttachmentDiscovery) -> bool {
+    if discovery.source_kind != MediaSourceKind::Ipfs {
+        return false;
+    }
+    if discovery
+        .thumbnail_source_url
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return false;
+    }
+    let landing_page_url = discovery.mxc_url.trim();
+    let Some(direct_url) = discovery.direct_url.as_deref() else {
+        return false;
+    };
+    !landing_page_url.is_empty()
+        && (landing_page_url.starts_with("http://") || landing_page_url.starts_with("https://"))
+        && landing_page_url != direct_url
 }
 
 async fn cache_discovery_thumbnail(
@@ -3601,6 +3775,47 @@ async fn cache_discovery_thumbnail(
     Ok(Some(cached_path))
 }
 
+async fn enrich_ipfs_discovery_thumbnail_from_landing_page(
+    context: &Arc<RunningContext>,
+    discovery: &AttachmentDiscovery,
+) -> Result<()> {
+    if !should_fetch_ipfs_landing_page_thumbnail(discovery) {
+        return Ok(());
+    }
+
+    let landing_page_url = discovery.mxc_url.clone();
+    let html = fetch_http_text(&landing_page_url, true).await?;
+    let Some(thumbnail_url) = extract_landing_page_thumbnail_url(&landing_page_url, &html)? else {
+        return Ok(());
+    };
+
+    context
+        .database
+        .set_discovery_thumbnail_source_url(
+            &discovery.room_id,
+            &discovery.event_id,
+            Some(&thumbnail_url),
+        )
+        .await?;
+
+    let mut updated = discovery.clone();
+    updated.thumbnail_source_url = Some(thumbnail_url.clone());
+    let _ = cache_discovery_thumbnail(context, &updated).await;
+
+    context
+        .database
+        .insert_log(
+            AppLogLevel::Info,
+            "thumbnails",
+            &format!(
+                "Resolved landing-page thumbnail for {} in {} from {}",
+                discovery.event_id, discovery.room_id, landing_page_url
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn load_discovery_thumbnail_bytes(client: &Client, source: &str) -> Result<Vec<u8>> {
     if source.starts_with("http://") || source.starts_with("https://") {
         let response = reqwest::Client::builder()
@@ -3627,6 +3842,56 @@ async fn load_discovery_thumbnail_bytes(client: &Client, source: &str) -> Result
     client.media().get_media_content(&request, true).await.map_err(Into::into)
 }
 
+async fn fetch_http_text(url: &str, ipfs_like: bool) -> Result<String> {
+    let parsed = reqwest::Url::parse(url)?;
+    let timeout_total = if ipfs_like {
+        Duration::from_secs(20 * 60)
+    } else {
+        Duration::from_secs(5 * 60)
+    };
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(timeout_total)
+        .build()?;
+    let response = client
+        .get(parsed)
+        .header(USER_AGENT, "MatrixMediaShareClient/0.1")
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(response.text().await?)
+}
+
+fn extract_landing_page_thumbnail_url(base_url: &str, html: &str) -> Result<Option<String>> {
+    let base = reqwest::Url::parse(base_url)?;
+    let lower_html = html.to_ascii_lowercase();
+    let Some(img_index) = lower_html.find("<img") else {
+        return Ok(None);
+    };
+    let html_after_img = &html[img_index..];
+    let lower_after_img = &lower_html[img_index..];
+    let Some(src_index) = lower_after_img.find("src=") else {
+        return Ok(None);
+    };
+    let value = &html_after_img[src_index + 4..];
+    let mut chars = value.chars();
+    let Some(quote) = chars.next() else {
+        return Ok(None);
+    };
+    if quote != '"' && quote != '\'' {
+        return Ok(None);
+    }
+    let remainder = &value[quote.len_utf8()..];
+    let Some(end_index) = remainder.find(quote) else {
+        return Ok(None);
+    };
+    let src = remainder[..end_index].trim();
+    if src.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(base.join(src)?.to_string()))
+}
+
 fn thumbnail_cache_file_path(paths: &AppPaths, room_id: &str, event_id: &str) -> PathBuf {
     let digest = Sha256::digest(format!("{room_id}:{event_id}").as_bytes());
     paths.thumbnail_cache_path.join(format!("{digest:x}.jpg"))
@@ -3642,6 +3907,7 @@ async fn process_events(
     let mut event_count = 0;
     let mut new_discovery_count = 0usize;
     let mut thumbnail_warmups = Vec::new();
+    let mut landing_page_thumbnail_warmups = Vec::new();
     let mut oldest: Option<(String, DateTime<Utc>)> = None;
     let mut newest: Option<(String, DateTime<Utc>)> = None;
     let is_space_room = context
@@ -3691,23 +3957,22 @@ async fn process_events(
         }
 
         if !is_space_room {
-            let discovery = discovery.or_else(|| {
-                command_body.as_deref().and_then(|body| {
-                    settings
-                        .as_ref()
-                        .and_then(|settings| {
-                            ipfs_discovery_from_body(
-                                room_id,
-                                &event_id,
-                                timestamp,
-                                body,
-                                settings,
-                            )
-                            .ok()
-                            .flatten()
-                        })
-                })
+            let ipfs_discovery = command_body.as_deref().and_then(|body| {
+                settings
+                    .as_ref()
+                    .and_then(|settings| {
+                        ipfs_discovery_from_body(
+                            room_id,
+                            &event_id,
+                            timestamp,
+                            body,
+                            settings,
+                        )
+                        .ok()
+                        .flatten()
+                    })
             });
+            let discovery = preferred_message_discovery(discovery, ipfs_discovery);
 
             if let Some(discovery) = discovery {
                 let auto_download = settings
@@ -3722,6 +3987,9 @@ async fn process_events(
                 }
                 if should_warm_thumbnails && should_cache_discovery_thumbnail(&discovery) {
                     thumbnail_warmups.push(discovery.clone());
+                }
+                if should_warm_thumbnails && should_fetch_ipfs_landing_page_thumbnail(&discovery) {
+                    landing_page_thumbnail_warmups.push(discovery.clone());
                 }
             }
         }
@@ -3789,6 +4057,24 @@ async fn process_events(
                         "thumbnails",
                         &format!(
                             "Failed to cache thumbnail for {} in {}: {error:#}",
+                            discovery.event_id, discovery.room_id
+                        ),
+                    )
+                    .await;
+            }
+        });
+    }
+    for discovery in landing_page_thumbnail_warmups {
+        let context = context.clone();
+        tokio::spawn(async move {
+            if let Err(error) = enrich_ipfs_discovery_thumbnail_from_landing_page(&context, &discovery).await {
+                let _ = context
+                    .database
+                    .insert_log(
+                        AppLogLevel::Warning,
+                        "thumbnails",
+                        &format!(
+                            "Failed to resolve landing-page thumbnail for {} in {}: {error:#}",
                             discovery.event_id, discovery.room_id
                         ),
                     )
@@ -4783,7 +5069,7 @@ async fn download_media_to_temp(
     homeserver_url: String,
 ) -> Result<PathBuf> {
     if let Some(direct_url) = job.direct_url.as_deref().filter(|value| !value.trim().is_empty()) {
-        return download_http_url_to_temp(
+        match download_http_url_to_temp(
             database,
             runtime,
             &paths.temp_downloads_path,
@@ -4791,10 +5077,81 @@ async fn download_media_to_temp(
             job,
             direct_url,
         )
-        .await;
+        .await
+        {
+            Ok(temp_path) => return Ok(temp_path),
+            Err(error) if should_fallback_to_matrix_attachment(job, &error) => {
+                let fallback_source_url = job
+                    .fallback_source_url
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow!("Missing Matrix fallback source for IPFS media."))?;
+                database
+                    .insert_log(
+                        AppLogLevel::Warning,
+                        "downloads",
+                        &format!(
+                            "IPFS media returned 404 for {}. Falling back to the Matrix attachment.",
+                            job.original_filename
+                                .clone()
+                                .unwrap_or_else(|| job.event_id.clone())
+                        ),
+                    )
+                    .await?;
+                return download_matrix_source_to_temp(
+                    client,
+                    database,
+                    paths,
+                    runtime,
+                    worker_id,
+                    job,
+                    fallback_source_url,
+                    homeserver_url,
+                )
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
     }
 
-    let source = decode_media_source(&job.mxc_url)?;
+    download_matrix_source_to_temp(
+        client,
+        database,
+        paths,
+        runtime,
+        worker_id,
+        job,
+        &job.mxc_url,
+        homeserver_url,
+    )
+    .await
+}
+
+fn should_fallback_to_matrix_attachment(job: &DownloadJobRecord, error: &anyhow::Error) -> bool {
+    job.source_kind == MediaSourceKind::Ipfs
+        && job
+            .fallback_source_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && error_is_http_not_found(error)
+}
+
+fn error_is_http_not_found(error: &anyhow::Error) -> bool {
+    let lowered = error.to_string().to_ascii_lowercase();
+    lowered.contains("status 404") || lowered.contains("404 not found")
+}
+
+async fn download_matrix_source_to_temp(
+    client: &Client,
+    database: &AppDatabase,
+    paths: &AppPaths,
+    runtime: &RuntimeStore,
+    worker_id: i32,
+    job: &DownloadJobRecord,
+    source_url: &str,
+    homeserver_url: String,
+) -> Result<PathBuf> {
+    let source = decode_media_source(source_url)?;
     if let MediaSource::Plain(uri) = &source {
         if let Some(path) = direct_remote_media_download_to_temp(
             database,
@@ -5302,6 +5659,7 @@ fn timeline_discovery(
                 source_kind: MediaSourceKind::Matrix,
                 direct_url: None,
                 mxc_url: encoded_source.clone(),
+                fallback_source_url: None,
                 thumbnail_source_url: Some(encoded_source),
                 thumbnail_cached_path: None,
                 original_filename: Some(content.body.clone()),
@@ -5320,6 +5678,7 @@ fn timeline_discovery(
             source_kind: MediaSourceKind::Matrix,
             direct_url: None,
             mxc_url: encode_media_source(&content.source)?,
+            fallback_source_url: None,
             thumbnail_source_url: Some(encode_media_source(&content.source)?),
             thumbnail_cached_path: None,
             original_filename: content
@@ -5336,6 +5695,7 @@ fn timeline_discovery(
             source_kind: MediaSourceKind::Matrix,
             direct_url: None,
             mxc_url: encode_media_source(&content.source)?,
+            fallback_source_url: None,
             thumbnail_source_url: content
                 .info
                 .as_ref()
@@ -5357,6 +5717,7 @@ fn timeline_discovery(
             source_kind: MediaSourceKind::Matrix,
             direct_url: None,
             mxc_url: encode_media_source(&content.source)?,
+            fallback_source_url: None,
             thumbnail_source_url: None,
             thumbnail_cached_path: None,
             original_filename: content
@@ -5373,6 +5734,7 @@ fn timeline_discovery(
             source_kind: MediaSourceKind::Matrix,
             direct_url: None,
             mxc_url: encode_media_source(&content.source)?,
+            fallback_source_url: None,
             thumbnail_source_url: content
                 .info
                 .as_ref()

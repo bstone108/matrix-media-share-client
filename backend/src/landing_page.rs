@@ -24,11 +24,7 @@ pub fn render_landing_page(
         .enumerate()
         .map(|(index, (label, gateway_url, supports_html))| {
             let note = if *supports_html { "" } else { " <span>(file only)</span>" };
-            let href = if *supports_html {
-                "#".to_owned()
-            } else {
-                raw_file_url(gateway_url, file_cid)
-            };
+            let href = raw_file_url(gateway_url, file_cid);
             format!(
                 "<li><a id=\"gateway-link-{index}\" data-gateway=\"{}\" data-supports-html=\"{}\" href=\"{}\">{} via {}</a>{}</li>",
                 escape_html(gateway_url),
@@ -103,7 +99,7 @@ pub fn render_landing_page(
     <h1>{title}</h1>
     <p class=\"meta\">Shared with Matrix Media Share Client over IPFS.</p>
     {thumbnail}
-    <p><a class=\"button\" href=\"{primary_download}\">Download</a></p>
+    <p><a class=\"button\" href=\"{primary_download}\">Download link</a></p>
     <h2>Other gateways</h2>
     <ul>{alternate_links}</ul>
     <div class=\"warning\">If a gateway is slow or unavailable, try another one. Gateways labeled <strong>file only</strong> are fallback download links rather than preferred HTML landing-page hosts.</div>
@@ -158,6 +154,7 @@ mod tests {
         assert!(html.contains("https://dweb.link/ipfs/bafyfile"));
         assert!(html.contains("window.location.pathname"));
         assert!(html.contains("data-gateway=\"https://ipfs.io\""));
+        assert!(html.contains("href=\"https://ipfs.io/ipfs/bafyfile\""));
         assert!(html.contains("file only"));
     }
 }
