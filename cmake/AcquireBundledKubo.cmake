@@ -32,13 +32,18 @@ else()
         message(FATAL_ERROR "Go is required to build the bundled Kubo binary from source.")
     endif()
 
+    set(_kubo_gopath "${KUBO_OUTPUT_DIR}/go-work")
+    set(_kubo_install_candidate
+        "${_kubo_gopath}/bin/${KUBO_GOOS}_${KUBO_GOARCH}/${KUBO_OUTPUT_NAME}"
+    )
+
     execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env
             GO111MODULE=on
             CGO_ENABLED=0
             GOOS=${KUBO_GOOS}
             GOARCH=${KUBO_GOARCH}
-            GOBIN=${KUBO_OUTPUT_DIR}
+            GOPATH=${_kubo_gopath}
             "${GO_EXECUTABLE}" install github.com/ipfs/kubo/cmd/ipfs@${KUBO_VERSION}
         RESULT_VARIABLE kubo_result
         OUTPUT_VARIABLE kubo_stdout
@@ -51,6 +56,32 @@ else()
             "stderr:\n${kubo_stderr}"
         )
     endif()
+
+    if(NOT EXISTS "${_kubo_install_candidate}")
+        set(_kubo_install_candidate "${_kubo_gopath}/bin/${KUBO_OUTPUT_NAME}")
+    endif()
+
+    if(NOT EXISTS "${_kubo_install_candidate}")
+        file(GLOB_RECURSE _kubo_built_candidates
+            LIST_DIRECTORIES FALSE
+            "${_kubo_gopath}/bin/${KUBO_OUTPUT_NAME}"
+            "${_kubo_gopath}/bin/*/${KUBO_OUTPUT_NAME}"
+        )
+        list(LENGTH _kubo_built_candidates _kubo_candidate_count)
+        if(_kubo_candidate_count GREATER 0)
+            list(GET _kubo_built_candidates 0 _kubo_install_candidate)
+        endif()
+    endif()
+
+    if(NOT EXISTS "${_kubo_install_candidate}")
+        message(FATAL_ERROR
+            "Bundled Kubo build succeeded but the output binary was not found.\n"
+            "expected:\n${_kubo_gopath}/bin/${KUBO_OUTPUT_NAME}\n"
+            "or:\n${_kubo_gopath}/bin/${KUBO_GOOS}_${KUBO_GOARCH}/${KUBO_OUTPUT_NAME}"
+        )
+    endif()
+
+    file(COPY_FILE "${_kubo_install_candidate}" "${KUBO_OUTPUT_BINARY}" ONLY_IF_DIFFERENT)
 endif()
 
 if(NOT EXISTS "${KUBO_OUTPUT_BINARY}")

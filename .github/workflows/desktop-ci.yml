@@ -79,6 +79,8 @@ jobs:
             curl \
             desktop-file-utils \
             libgl1-mesa-dev \
+            libgstreamer-plugins-base1.0-0 \
+            libgstreamer1.0-0 \
             libpulse-dev \
             libpulse0 \
             libxcb-cursor0 \
@@ -167,6 +169,8 @@ jobs:
             curl \
             desktop-file-utils \
             libgl1-mesa-dev \
+            libgstreamer-plugins-base1.0-0 \
+            libgstreamer1.0-0 \
             libpulse-dev \
             libpulse0 \
             libxcb-cursor0 \
