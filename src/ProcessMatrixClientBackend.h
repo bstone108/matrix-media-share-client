@@ -30,6 +30,7 @@ public:
     bool shareLocalFiles(const QString &roomId, const QStringList &filePaths, QString &errorMessage) override;
     bool importIpfsLink(const QString &link, QString &errorMessage) override;
     bool openDiscovery(const QString &roomId, const QString &eventId, QString &errorMessage) override;
+    bool focusRoom(const QString &roomId, QString &errorMessage) override;
     bool refreshCatalog(QString &errorMessage) override;
 
     bool joinRoom(const QString &roomIdOrAlias, QString &errorMessage) override;
@@ -47,6 +48,7 @@ private:
     };
 
     QString backendExecutablePath() const;
+    QString bundledKuboBinaryPath() const;
     QString stderrSummary() const;
     bool ensureProcess(QString &errorMessage);
     bool launchProcess(QString &errorMessage);

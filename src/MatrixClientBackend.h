@@ -27,6 +27,7 @@ public:
     virtual bool shareLocalFiles(const QString &roomId, const QStringList &filePaths, QString &errorMessage) = 0;
     virtual bool importIpfsLink(const QString &link, QString &errorMessage) = 0;
     virtual bool openDiscovery(const QString &roomId, const QString &eventId, QString &errorMessage) = 0;
+    virtual bool focusRoom(const QString &roomId, QString &errorMessage) = 0;
     virtual bool refreshCatalog(QString &errorMessage) = 0;
 
     virtual bool joinRoom(const QString &roomIdOrAlias, QString &errorMessage) = 0;

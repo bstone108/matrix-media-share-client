@@ -14,13 +14,18 @@ public:
 
     AppSettings loadSettings(const QString &defaultDestinationRootPath);
     bool saveSettings(const AppSettings &settings);
+    QString lastErrorText() const;
     UpdateCheckState loadUpdateCheckState() const;
     bool saveUpdateCheckState(const UpdateCheckState &state);
 
     QVector<RoomRecord> fetchRooms() const;
     QVector<AttachmentDiscovery> fetchDiscoveries() const;
+    QVector<AttachmentDiscovery> fetchDiscoveriesPage(const QString &roomId, int offset, int limit) const;
+    int fetchDiscoveryCount(const QString &roomId = QString()) const;
     QVector<DownloadJobRecord> fetchJobs() const;
     QVector<ActivityLogEntry> fetchRecentLogs(int limit = 500) const;
+    QVector<ActivityLogEntry> fetchLogsPage(int offset, int limit, bool problemsOnly) const;
+    int fetchLogCount(bool problemsOnly) const;
     QStringList aliasHistory(const QString &roomId) const;
     int fetchWaitingJobCount() const;
     bool queueDiscoveryDownload(const QString &roomId, const QString &eventId);
@@ -38,4 +43,5 @@ private:
     bool execute(const QString &sql) const;
 
     QSqlDatabase database_;
+    QString lastErrorText_;
 };

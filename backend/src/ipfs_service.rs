@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{collections::HashSet, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::multipart::{Form, Part};
@@ -72,6 +72,7 @@ impl IpfsService {
         file_path: &Path,
         thumbnail_path: Option<&Path>,
         preferred_gateway_url: Option<&str>,
+        preferred_gateway_urls: &[String],
     ) -> Result<PublishedShare> {
         let status = self.refresh_status(None).await?;
         if !matches!(status.state, crate::domain::IpfsRuntimeState::Running) {
@@ -103,15 +104,23 @@ impl IpfsService {
             _ => None,
         };
 
-        let primary_gateway = preferred_gateway_url
-            .map(ToOwned::to_owned)
-            .or(status.primary_gateway_url.clone())
-            .unwrap_or_else(|| "https://dweb.link".to_owned());
-
-        let alternate_gateways = default_gateways()
-            .into_iter()
-            .filter(|gateway| gateway.enabled_by_default)
-            .map(|gateway| (gateway.region_label, gateway.gateway_url, gateway.supports_html))
+        let share_gateways = configured_share_gateways(
+            preferred_gateway_url,
+            status.primary_gateway_url.as_deref(),
+            preferred_gateway_urls,
+        );
+        let primary_gateway = select_share_primary_gateway(
+            preferred_gateway_url,
+            status.primary_gateway_url.as_deref(),
+            &share_gateways,
+        );
+        let alternate_gateways = share_gateways
+            .iter()
+            .map(|gateway| (
+                gateway.region_label.as_str(),
+                gateway.gateway_url.as_str(),
+                gateway.supports_html,
+            ))
             .collect::<Vec<_>>();
 
         let html = render_landing_page(
@@ -196,4 +205,104 @@ impl IpfsService {
             .context("Failed to decode the bundled Kubo add response")?;
         Ok(payload.hash)
     }
+}
+
+#[derive(Clone, Debug)]
+struct ShareGatewayDescriptor {
+    region_label: String,
+    gateway_url: String,
+    supports_html: bool,
+}
+
+fn configured_share_gateways(
+    preferred_gateway_url: Option<&str>,
+    status_primary_gateway_url: Option<&str>,
+    preferred_gateway_urls: &[String],
+) -> Vec<ShareGatewayDescriptor> {
+    let defaults = default_gateways();
+    let mut urls = Vec::new();
+    if let Some(url) = preferred_gateway_url {
+        urls.push(url.to_owned());
+    }
+    if let Some(url) = status_primary_gateway_url {
+        urls.push(url.to_owned());
+    }
+    if preferred_gateway_urls.is_empty() {
+        urls.extend(
+            defaults
+                .iter()
+                .filter(|gateway| gateway.enabled_by_default)
+                .map(|gateway| gateway.gateway_url.to_owned()),
+        );
+    } else {
+        urls.extend(preferred_gateway_urls.iter().cloned());
+    }
+
+    let mut seen = HashSet::new();
+    let mut gateways = Vec::new();
+    for raw_url in urls {
+        let normalized = normalize_gateway_url(&raw_url);
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+
+        if let Some(descriptor) = defaults
+            .iter()
+            .find(|gateway| normalize_gateway_url(gateway.gateway_url) == normalized)
+        {
+            gateways.push(ShareGatewayDescriptor {
+                region_label: descriptor.region_label.to_owned(),
+                gateway_url: normalized,
+                supports_html: descriptor.supports_html,
+            });
+        } else {
+            gateways.push(ShareGatewayDescriptor {
+                region_label: "Custom Gateway".to_owned(),
+                gateway_url: normalized,
+                supports_html: true,
+            });
+        }
+    }
+
+    gateways
+}
+
+fn select_share_primary_gateway(
+    preferred_gateway_url: Option<&str>,
+    status_primary_gateway_url: Option<&str>,
+    gateways: &[ShareGatewayDescriptor],
+) -> String {
+    let preferred = preferred_gateway_url
+        .map(normalize_gateway_url)
+        .filter(|value| !value.is_empty());
+    if let Some(url) = preferred.as_deref() {
+        if gateways
+            .iter()
+            .any(|gateway| gateway.supports_html && gateway.gateway_url == url)
+        {
+            return url.to_owned();
+        }
+    }
+
+    let status_primary = status_primary_gateway_url
+        .map(normalize_gateway_url)
+        .filter(|value| !value.is_empty());
+    if let Some(url) = status_primary.as_deref() {
+        if gateways
+            .iter()
+            .any(|gateway| gateway.supports_html && gateway.gateway_url == url)
+        {
+            return url.to_owned();
+        }
+    }
+
+    gateways
+        .iter()
+        .find(|gateway| gateway.supports_html)
+        .map(|gateway| gateway.gateway_url.clone())
+        .unwrap_or_else(|| "https://dweb.link".to_owned())
+}
+
+fn normalize_gateway_url(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_owned()
 }

@@ -148,19 +148,6 @@ impl KuboManager {
             candidates.push(PathBuf::from(path));
         }
 
-        #[cfg(target_os = "windows")]
-        {
-            candidates.push(self.paths.kubo_path.join("kubo.exe"));
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            candidates.push(self.paths.kubo_path.join("kubo"));
-        }
-
-        if let Some(path) = which_on_path("kubo") {
-            candidates.push(path);
-        }
-
         let resolved = candidates.into_iter().find(|candidate| candidate.is_file());
         *self.resolved_binary.lock().await = resolved.clone();
         Ok(resolved)
@@ -181,13 +168,4 @@ impl KuboManager {
             .context("Failed to decode the local Kubo ID response")?;
         Ok(payload.id)
     }
-}
-
-fn which_on_path(binary_name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|value| {
-        std::env::split_paths(&value).find_map(|directory| {
-            let candidate = directory.join(binary_name);
-            candidate.is_file().then_some(candidate)
-        })
-    })
 }

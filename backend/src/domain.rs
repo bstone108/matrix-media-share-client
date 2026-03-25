@@ -92,6 +92,7 @@ impl MediaSourceKind {
 #[serde(rename_all = "camelCase")]
 pub enum LocalAssetSourceKind {
     Library,
+    Downloads,
     Archive,
 }
 
@@ -99,6 +100,7 @@ impl LocalAssetSourceKind {
     pub fn as_storage_key(self) -> &'static str {
         match self {
             Self::Library => "library",
+            Self::Downloads => "downloads",
             Self::Archive => "archive",
         }
     }
@@ -106,6 +108,7 @@ impl LocalAssetSourceKind {
     pub fn from_storage_key(value: &str) -> Self {
         match value {
             "archive" => Self::Archive,
+            "downloads" => Self::Downloads,
             _ => Self::Library,
         }
     }
@@ -235,6 +238,15 @@ pub enum VerificationStatus {
     Unverified,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ViewerState {
+    Idle,
+    Downloading,
+    Ready,
+    Error,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -243,6 +255,7 @@ pub struct AppSettings {
     pub owner_user_id: String,
     pub destination_root_path: String,
     pub library_root_path: String,
+    pub flat_folder_layout: bool,
     pub archive_root_path: String,
     pub archive_scan_enabled: bool,
     pub archive_scan_high_priority: bool,
@@ -357,6 +370,8 @@ pub struct AttachmentDiscovery {
     pub source_kind: MediaSourceKind,
     pub direct_url: Option<String>,
     pub mxc_url: String,
+    pub thumbnail_source_url: Option<String>,
+    pub thumbnail_cached_path: Option<String>,
     pub original_filename: Option<String>,
     pub mime_type: Option<String>,
     pub category: MediaCategory,
@@ -485,6 +500,7 @@ pub struct ActiveDownloadSnapshot {
     pub worker_id: i32,
     pub job_id: i64,
     pub room_id: String,
+    pub event_id: String,
     pub filename: String,
     pub received_bytes: i64,
     pub total_bytes: Option<i64>,
@@ -502,6 +518,16 @@ pub struct VerificationEmoji {
 pub struct VerificationSnapshot {
     pub state: VerificationStatus,
     pub device_id: Option<String>,
+    pub message: String,
+    pub request_flow_id: Option<String>,
+    pub request_state: Option<String>,
+    pub has_active_request: bool,
+    pub request_ready: bool,
+    pub request_can_accept: bool,
+    pub has_active_sas: bool,
+    pub sas_can_accept: bool,
+    pub can_bootstrap_cross_signing: bool,
+    pub other_device_count: u32,
     pub emojis: Vec<VerificationEmoji>,
     pub decimals: Vec<u16>,
 }
@@ -511,8 +537,52 @@ impl Default for VerificationSnapshot {
         Self {
             state: VerificationStatus::Unknown,
             device_id: None,
+            message: String::new(),
+            request_flow_id: None,
+            request_state: None,
+            has_active_request: false,
+            request_ready: false,
+            request_can_accept: false,
+            has_active_sas: false,
+            sas_can_accept: false,
+            can_bootstrap_cross_signing: false,
+            other_device_count: 0,
             emojis: Vec::new(),
             decimals: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewerSnapshot {
+    pub session_id: u64,
+    pub state: ViewerState,
+    pub room_id: Option<String>,
+    pub event_id: Option<String>,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub category: Option<MediaCategory>,
+    pub local_path: Option<String>,
+    pub received_bytes: i64,
+    pub total_bytes: Option<i64>,
+    pub error: Option<String>,
+}
+
+impl Default for ViewerSnapshot {
+    fn default() -> Self {
+        Self {
+            session_id: 0,
+            state: ViewerState::Idle,
+            room_id: None,
+            event_id: None,
+            file_name: None,
+            mime_type: None,
+            category: None,
+            local_path: None,
+            received_bytes: 0,
+            total_bytes: None,
+            error: None,
         }
     }
 }
@@ -527,6 +597,7 @@ pub struct BotRuntimeSnapshot {
     pub upload_size_limit_bytes: Option<i64>,
     pub upload_size_limit_detected_at: Option<DateTime<Utc>>,
     pub ipfs: IpfsStatusSnapshot,
+    pub viewer: ViewerSnapshot,
     pub verification: VerificationSnapshot,
     pub worker_states: Vec<RoomWorkerSnapshot>,
     pub active_downloads: Vec<ActiveDownloadSnapshot>,
@@ -542,6 +613,7 @@ impl Default for BotRuntimeSnapshot {
             upload_size_limit_bytes: None,
             upload_size_limit_detected_at: None,
             ipfs: IpfsStatusSnapshot::default(),
+            viewer: ViewerSnapshot::default(),
             verification: VerificationSnapshot::default(),
             worker_states: Vec::new(),
             active_downloads: Vec::new(),

@@ -18,6 +18,9 @@ option(MATRIX_MEDIA_ARCHIVER_BUILD_TESTS "Build and register Qt test targets" ON
 set(MATRIX_MEDIA_ARCHIVER_BACKEND_RUST_TARGET "" CACHE STRING
     "Optional Rust target triple for cross-compiling the backend sidecar"
 )
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_SOURCE "" CACHE FILEPATH
+    "Path to the Kubo/IPFS binary to bundle inside the app package"
+)
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
@@ -36,7 +39,7 @@ if(WIN32 AND MINGW)
     find_package(
         Qt6 ${MATRIX_MEDIA_ARCHIVER_MIN_QT_VERSION}
         REQUIRED
-        COMPONENTS Core Gui Widgets Network Test
+        COMPONENTS Core Gui Widgets Network Multimedia MultimediaWidgets Test
         OPTIONAL_COMPONENTS Sql
     )
 
@@ -74,10 +77,11 @@ if(WIN32 AND MINGW)
         )
     endif()
 else()
-    find_package(Qt6 ${MATRIX_MEDIA_ARCHIVER_MIN_QT_VERSION} REQUIRED COMPONENTS Core Gui Widgets Network Sql Test)
+    find_package(Qt6 ${MATRIX_MEDIA_ARCHIVER_MIN_QT_VERSION} REQUIRED COMPONENTS Core Gui Widgets Network Sql Multimedia MultimediaWidgets Test)
 endif()
 
 find_program(CARGO_EXECUTABLE NAMES cargo HINTS /opt/homebrew/opt/rustup/bin)
+find_program(GO_EXECUTABLE NAMES go)
 
 if(NOT CARGO_EXECUTABLE)
     message(FATAL_ERROR "cargo is required to build the Rust Matrix backend")
@@ -163,6 +167,104 @@ endif()
 set(MATRIX_MEDIA_ARCHIVER_BACKEND_BINARY
     ${MATRIX_MEDIA_ARCHIVER_BACKEND_BINARY_DIR}/${MATRIX_MEDIA_ARCHIVER_BACKEND_BINARY_NAME}
 )
+
+if(NOT MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_SOURCE)
+    if(APPLE)
+        set(_matrix_media_share_client_default_kubo
+            "/Applications/IPFS Desktop.app/Contents/Resources/app.asar.unpacked/node_modules/kubo/kubo/ipfs"
+        )
+        if(EXISTS "${_matrix_media_share_client_default_kubo}")
+            set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_SOURCE
+                "${_matrix_media_share_client_default_kubo}"
+                CACHE FILEPATH "Path to the Kubo/IPFS binary to bundle inside the app package" FORCE
+            )
+        endif()
+        unset(_matrix_media_share_client_default_kubo)
+    endif()
+endif()
+
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_VERSION "v0.38.2" CACHE STRING
+    "Pinned Kubo version to bundle when building from source"
+)
+
+if(NOT MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_SOURCE AND NOT GO_EXECUTABLE)
+    message(FATAL_ERROR
+        "A bundled Kubo binary is required at build time. "
+        "Provide MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_SOURCE or install Go so the build can compile "
+        "github.com/ipfs/kubo/cmd/ipfs@${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_VERSION}."
+    )
+endif()
+
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_NAME ipfs)
+if(WIN32)
+    set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_NAME ipfs.exe)
+endif()
+
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_DIR
+    ${CMAKE_CURRENT_BINARY_DIR}/bundled-kubo
+)
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_BINARY
+    ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_DIR}/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_NAME}
+)
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_STAMP
+    ${CMAKE_CURRENT_BINARY_DIR}/matrix_media_share_client_bundled_kubo.stamp
+)
+
+if(CMAKE_GENERATOR_PLATFORM)
+    set(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH "${CMAKE_GENERATOR_PLATFORM}")
+elseif(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    list(GET CMAKE_OSX_ARCHITECTURES 0 MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH)
+elseif(CMAKE_SYSTEM_PROCESSOR)
+    set(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+else()
+    set(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH "${CMAKE_HOST_SYSTEM_PROCESSOR}")
+endif()
+string(TOLOWER "${MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH}" MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_LOWER)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_GOOS darwin)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_GOOS linux)
+elseif(WIN32)
+    set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_GOOS windows)
+else()
+    message(FATAL_ERROR "Unsupported platform for bundled Kubo acquisition: ${CMAKE_SYSTEM_NAME}")
+endif()
+
+if(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_LOWER STREQUAL "x86_64"
+    OR MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_LOWER STREQUAL "amd64"
+    OR MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_LOWER STREQUAL "x64")
+    set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_GOARCH amd64)
+elseif(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_LOWER STREQUAL "arm64"
+    OR MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_LOWER STREQUAL "aarch64")
+    set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_GOARCH arm64)
+else()
+    message(FATAL_ERROR
+        "Unsupported architecture for bundled Kubo acquisition: ${MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH}"
+    )
+endif()
+
+add_custom_command(
+    OUTPUT ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_STAMP}
+    COMMAND ${CMAKE_COMMAND}
+        "-DGO_EXECUTABLE=${GO_EXECUTABLE}"
+        "-DKUBO_SOURCE=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_SOURCE}"
+        "-DKUBO_OUTPUT_DIR=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_DIR}"
+        "-DKUBO_OUTPUT_BINARY=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_BINARY}"
+        "-DKUBO_OUTPUT_NAME=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_NAME}"
+        "-DKUBO_VERSION=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_VERSION}"
+        "-DKUBO_GOOS=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_GOOS}"
+        "-DKUBO_GOARCH=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_GOARCH}"
+        "-DKUBO_STAMP=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_STAMP}"
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/AcquireBundledKubo.cmake
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/AcquireBundledKubo.cmake
+    COMMENT "Bundling Kubo/IPFS binary into Matrix Media Share Client"
+    VERBATIM
+)
+
+add_custom_target(MatrixMediaShareClientQtBundledKubo ALL
+    DEPENDS ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_STAMP}
+)
 set(MATRIX_MEDIA_ARCHIVER_BACKEND_STAMP
     ${CMAKE_CURRENT_BINARY_DIR}/matrix_media_archiver_backend.stamp
 )
@@ -234,6 +336,7 @@ qt_add_executable(MatrixMediaShareClientQt
 
 target_include_directories(MatrixMediaShareClientQt PRIVATE src)
 add_dependencies(MatrixMediaShareClientQt MatrixMediaShareClientQtBackend)
+add_dependencies(MatrixMediaShareClientQt MatrixMediaShareClientQtBundledKubo)
 
 target_link_libraries(MatrixMediaShareClientQt
     PRIVATE
@@ -242,6 +345,8 @@ target_link_libraries(MatrixMediaShareClientQt
         Qt6::Widgets
         Qt6::Network
         Qt6::Sql
+        Qt6::Multimedia
+        Qt6::MultimediaWidgets
 )
 
 target_compile_definitions(MatrixMediaShareClientQt
@@ -261,6 +366,26 @@ add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
     COMMENT "Copying Rust Matrix backend next to MatrixMediaShareClientQt"
 )
 
+if(APPLE)
+    add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/kubo
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_BINARY}
+            $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/kubo/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_NAME}
+        COMMENT "Copying bundled Kubo into MatrixMediaShareClientQt.app"
+    )
+else()
+    add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/kubo
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_BINARY}
+            $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/kubo/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_NAME}
+        COMMENT "Copying bundled Kubo next to MatrixMediaShareClientQt"
+    )
+endif()
+
 install(TARGETS MatrixMediaShareClientQt
     BUNDLE DESTINATION .
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -269,6 +394,9 @@ install(TARGETS MatrixMediaShareClientQt
 if(NOT APPLE)
     install(PROGRAMS ${MATRIX_MEDIA_ARCHIVER_BACKEND_BINARY}
         DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    install(PROGRAMS ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_BINARY}
+        DESTINATION ${CMAKE_INSTALL_BINDIR}/kubo
     )
 endif()
 

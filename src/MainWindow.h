@@ -2,26 +2,40 @@
 
 #include "Domain.h"
 
+#include <QHash>
+#include <QIcon>
 #include <QMainWindow>
+#include <QSet>
 
 class AppController;
+class QCloseEvent;
 class QDragEnterEvent;
 class QDragMoveEvent;
 class QDropEvent;
+class QEvent;
 class QMoveEvent;
+class QNetworkAccessManager;
 class QResizeEvent;
 class QShowEvent;
 class QCheckBox;
 class QComboBox;
+class QDialog;
+class QAudioOutput;
 class QLabel;
 class QLineEdit;
 class QListWidget;
+class QListWidgetItem;
+class QMediaPlayer;
+class QProgressBar;
 class QPushButton;
+class QScrollBar;
+class QScrollArea;
 class QSizePolicy;
 class QSpinBox;
 class QStackedWidget;
 class QTableWidget;
 class QTextEdit;
+class QVideoWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -31,6 +45,8 @@ public:
     explicit MainWindow(AppController *controller, QWidget *parent = nullptr);
 
 private:
+    void closeEvent(QCloseEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
     void showEvent(QShowEvent *event) override;
     void moveEvent(QMoveEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
@@ -40,28 +56,65 @@ private:
 
     void constrainToAvailableGeometry();
     void refreshView();
-    void populateSectionSidebar();
+    void populateSectionNavigation();
+    void populateRoomSidebar();
     void populateRoomsPage();
     void populateBrowserPage();
     void populateLibraryPage();
     void populateTransfersPage();
+    void populateLogsPage();
     void populateSettingsPage();
     void populateVerificationPage();
+    void refreshViewerDialog();
 
     QWidget *buildRoomsPage();
     QWidget *buildBrowserPage();
     QWidget *buildLibraryPage();
     QWidget *buildTransfersPage();
+    QWidget *buildLogsPage();
     QWidget *buildSettingsPage();
     QWidget *buildVerificationPage();
 
     AppSettings gatherSettingsFromUi() const;
+    bool saveSettingsFromUi(bool interactive);
+    void markSettingsDirty();
+    void applyDiscoveryPresentation(QListWidgetItem *item, const AttachmentDiscovery &discovery);
+    const ActiveDownloadSnapshot *activeDownloadForDiscovery(const AttachmentDiscovery &discovery) const;
+    const DownloadJobRecord *jobForDiscovery(const AttachmentDiscovery &discovery) const;
+    void resetBrowserPageState();
+    void loadMoreBrowserDiscoveries(bool reset = false);
+    void maybeLoadMoreBrowserDiscoveries();
+    void requestVisibleBrowserThumbnails();
+    void scheduleBackgroundBrowserThumbnailPrefetch();
+    void trimBrowserDiscoveryWindow();
+    QString browserThumbnailKey(const AttachmentDiscovery &discovery) const;
+    QString browserThumbnailUrl(const AttachmentDiscovery &discovery) const;
+    QIcon placeholderDiscoveryIcon(const AttachmentDiscovery &discovery) const;
+    void requestBrowserThumbnail(const AttachmentDiscovery &discovery);
+    void updateBrowserThumbnailItems(const QString &cacheKey, const QIcon &icon);
+    void cacheBrowserThumbnailIcon(const QString &cacheKey, const QIcon &icon);
+    void resetLogsPageState();
+    void loadMoreLogs(bool reset = false);
+    void maybeLoadMoreLogs();
+    void trimLogWindow();
+    void ensureViewerDialog();
+    void loadViewerMedia(const ViewerSnapshot &viewer);
+    AppSection currentSection() const;
+    QVector<RoomRecord> roomSidebarRoomsForCurrentSection() const;
     QString roomDisplayTitle(const RoomRecord &room) const;
+    QString selectedRoomId() const;
+    QString selectedBrowserRoomId() const;
+    bool isUploadableBrowserRoom(const QString &roomId) const;
+    bool currentSectionUsesRoomSidebar() const;
+    void updateRoomSidebarVisibility();
 
     AppController *controller_ = nullptr;
 
-    QListWidget *sectionList_ = nullptr;
+    QComboBox *sectionCombo_ = nullptr;
+    QWidget *roomSidebarContainer_ = nullptr;
+    QLabel *roomSidebarTitleLabel_ = nullptr;
     QStackedWidget *stack_ = nullptr;
+    QNetworkAccessManager *thumbnailNetworkManager_ = nullptr;
 
     QListWidget *roomsList_ = nullptr;
     QLineEdit *joinRoomEdit_ = nullptr;
@@ -73,9 +126,11 @@ private:
     QLabel *ipfsStatusLabel_ = nullptr;
     QLabel *uploadLimitLabel_ = nullptr;
     QLabel *updateBannerLabel_ = nullptr;
+    QLabel *browserSelectedRoomLabel_ = nullptr;
     QLabel *browserDropHintLabel_ = nullptr;
-    QComboBox *shareRoomCombo_ = nullptr;
+    QWidget *browserPage_ = nullptr;
     QListWidget *discoveriesList_ = nullptr;
+    QPushButton *shareFilesButton_ = nullptr;
     QPushButton *openDiscoveryButton_ = nullptr;
     QPushButton *downloadDiscoveryButton_ = nullptr;
 
@@ -86,6 +141,10 @@ private:
     QListWidget *activeDownloadsList_ = nullptr;
     QTableWidget *waitingJobsTable_ = nullptr;
     QTableWidget *failedJobsTable_ = nullptr;
+
+    QLabel *logsSummaryLabel_ = nullptr;
+    QCheckBox *logProblemsOnlyCheck_ = nullptr;
+    QTableWidget *logsTable_ = nullptr;
 
     QLineEdit *homeserverEdit_ = nullptr;
     QLineEdit *usernameEdit_ = nullptr;
@@ -100,6 +159,8 @@ private:
     QLabel *updateStatusLabel_ = nullptr;
     QLabel *latestReleaseLabel_ = nullptr;
     QLabel *lastCheckedLabel_ = nullptr;
+    QLabel *settingsDatabasePathLabel_ = nullptr;
+    QLabel *secretStorePathLabel_ = nullptr;
     QSpinBox *messageLimitSpin_ = nullptr;
     QSpinBox *retryCooldownSpin_ = nullptr;
     QSpinBox *retryLimitSpin_ = nullptr;
@@ -111,6 +172,7 @@ private:
     QCheckBox *startHiddenCheck_ = nullptr;
     QCheckBox *archiveScanEnabledCheck_ = nullptr;
     QCheckBox *archiveHighPriorityCheck_ = nullptr;
+    QCheckBox *flatFolderLayoutCheck_ = nullptr;
     QCheckBox *autoJoinSpacesCheck_ = nullptr;
     QCheckBox *autoDownloadCheck_ = nullptr;
     QPushButton *checkUpdatesButton_ = nullptr;
@@ -118,9 +180,48 @@ private:
 
     QLabel *verificationStatusLabel_ = nullptr;
     QLabel *verificationDeviceIdLabel_ = nullptr;
+    QLabel *verificationMessageLabel_ = nullptr;
     QListWidget *verificationEmojiList_ = nullptr;
     QLabel *verificationDecimalsLabel_ = nullptr;
+    QPushButton *requestVerificationButton_ = nullptr;
+    QPushButton *startVerificationButton_ = nullptr;
+    QPushButton *approveVerificationButton_ = nullptr;
+    QPushButton *declineVerificationButton_ = nullptr;
+
+    QDialog *viewerDialog_ = nullptr;
+    QLabel *viewerTitleLabel_ = nullptr;
+    QLabel *viewerStatusLabel_ = nullptr;
+    QProgressBar *viewerProgressBar_ = nullptr;
+    QStackedWidget *viewerContentStack_ = nullptr;
+    QScrollArea *viewerImageScrollArea_ = nullptr;
+    QLabel *viewerImageLabel_ = nullptr;
+    QVideoWidget *viewerVideoWidget_ = nullptr;
+    QLabel *viewerFallbackLabel_ = nullptr;
+    QMediaPlayer *viewerMediaPlayer_ = nullptr;
+    QAudioOutput *viewerAudioOutput_ = nullptr;
+    quint64 viewerLoadedSessionId_ = 0;
+    quint64 viewerDismissedSessionId_ = 0;
+    QString viewerLoadedLocalPath_;
+    ViewerState viewerLoadedState_ = ViewerState::Idle;
 
     bool settingsPageInitialized_ = false;
+    bool settingsDirty_ = false;
+    bool populatingSettingsUi_ = false;
     bool constrainingWindowGeometry_ = false;
+    QString browserSelectedRoomId_;
+    QString roomsPageSelectedRoomId_;
+    QString browserLoadedRoomId_;
+    int browserLoadedOffset_ = 0;
+    QVector<AttachmentDiscovery> browserLoadedDiscoveries_;
+    int browserTotalDiscoveryCount_ = 0;
+    bool browserLoadingPage_ = false;
+    bool browserBackgroundThumbnailPrefetchScheduled_ = false;
+    QHash<QString, QIcon> browserThumbnailIconCache_;
+    QStringList browserThumbnailCacheOrder_;
+    QSet<QString> browserThumbnailRequestsInFlight_;
+    QVector<ActivityLogEntry> loadedLogEntries_;
+    int logsLoadedOffset_ = 0;
+    int logTotalCount_ = 0;
+    bool logsLoadingPage_ = false;
+    bool logsProblemsOnly_ = false;
 };

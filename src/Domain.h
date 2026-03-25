@@ -7,10 +7,11 @@
 #include <QVector>
 
 enum class AppSection {
-    Rooms,
     Browser,
+    Rooms,
     Library,
     Transfers,
+    Logs,
     Settings,
     Verification,
 };
@@ -18,10 +19,11 @@ enum class AppSection {
 inline QList<AppSection> allSections()
 {
     return {
-        AppSection::Rooms,
         AppSection::Browser,
+        AppSection::Rooms,
         AppSection::Library,
         AppSection::Transfers,
+        AppSection::Logs,
         AppSection::Settings,
         AppSection::Verification,
     };
@@ -30,20 +32,33 @@ inline QList<AppSection> allSections()
 inline QString sectionTitle(const AppSection section)
 {
     switch (section) {
-    case AppSection::Rooms:
-        return QStringLiteral("Rooms");
     case AppSection::Browser:
         return QStringLiteral("Browser");
+    case AppSection::Rooms:
+        return QStringLiteral("Rooms");
     case AppSection::Library:
         return QStringLiteral("Shared Files");
     case AppSection::Transfers:
         return QStringLiteral("Transfers");
+    case AppSection::Logs:
+        return QStringLiteral("Logs");
     case AppSection::Settings:
         return QStringLiteral("Settings");
     case AppSection::Verification:
         return QStringLiteral("Verification");
     }
     return QStringLiteral("Unknown");
+}
+
+inline int sectionIndex(const AppSection targetSection)
+{
+    const QList<AppSection> sections = allSections();
+    for (int index = 0; index < sections.size(); ++index) {
+        if (sections.at(index) == targetSection) {
+            return index;
+        }
+    }
+    return -1;
 }
 
 enum class AccountMode {
@@ -315,12 +330,35 @@ inline QString verificationStatusTitle(const VerificationStatus status)
     return QStringLiteral("unknown");
 }
 
+enum class ViewerState {
+    Idle,
+    Downloading,
+    Ready,
+    Error,
+};
+
+inline QString viewerStateTitle(const ViewerState state)
+{
+    switch (state) {
+    case ViewerState::Idle:
+        return QStringLiteral("idle");
+    case ViewerState::Downloading:
+        return QStringLiteral("downloading");
+    case ViewerState::Ready:
+        return QStringLiteral("ready");
+    case ViewerState::Error:
+        return QStringLiteral("error");
+    }
+    return QStringLiteral("idle");
+}
+
 struct AppSettings {
     QString homeserverUrl;
     QString username;
     QString ownerUserId;
     QString destinationRootPath;
     QString libraryRootPath;
+    bool flatFolderLayout = false;
     QString archiveRootPath;
     bool archiveScanEnabled = false;
     bool archiveScanHighPriority = false;
@@ -355,9 +393,12 @@ struct AppSettings {
     {
         AppSettings settings;
         settings.homeserverUrl = QStringLiteral("https://matrix.org");
+        settings.username = QStringLiteral("");
+        settings.ownerUserId = QStringLiteral("");
         settings.destinationRootPath = destinationRootPath;
         settings.libraryRootPath = destinationRootPath + QStringLiteral("/Shared Files");
-        settings.archiveRootPath.clear();
+        settings.flatFolderLayout = false;
+        settings.archiveRootPath = QStringLiteral("");
         settings.manualDownloadRootPath = destinationRootPath + QStringLiteral("/Downloads");
         return settings;
     }
@@ -380,6 +421,7 @@ struct RoomRecord {
     QString activeFolderLabel;
     bool isSpace = false;
     QString membership;
+    int discoveredMediaCount = 0;
     QDateTime updatedAt;
 };
 
@@ -402,6 +444,8 @@ struct AttachmentDiscovery {
     MediaSourceKind sourceKind = MediaSourceKind::Matrix;
     QString directUrl;
     QString mxcUrl;
+    QString thumbnailSourceUrl;
+    QString thumbnailCachedPath;
     QString originalFilename;
     QString mimeType;
     MediaCategory category = MediaCategory::Other;
@@ -487,6 +531,7 @@ struct ActiveDownloadSnapshot {
     int workerId = 0;
     qint64 jobId = 0;
     QString roomId;
+    QString eventId;
     QString filename;
     qint64 receivedBytes = 0;
     qint64 totalBytes = -1;
@@ -500,8 +545,32 @@ struct VerificationEmoji {
 struct VerificationSnapshot {
     VerificationStatus state = VerificationStatus::Unknown;
     QString deviceId;
+    QString message;
+    QString requestFlowId;
+    QString requestState;
+    bool hasActiveRequest = false;
+    bool requestReady = false;
+    bool requestCanAccept = false;
+    bool hasActiveSas = false;
+    bool sasCanAccept = false;
+    bool canBootstrapCrossSigning = false;
+    int otherDeviceCount = 0;
     QVector<VerificationEmoji> emojis;
     QVector<quint16> decimals;
+};
+
+struct ViewerSnapshot {
+    quint64 sessionId = 0;
+    ViewerState state = ViewerState::Idle;
+    QString roomId;
+    QString eventId;
+    QString fileName;
+    QString mimeType;
+    MediaCategory category = MediaCategory::Other;
+    QString localPath;
+    qint64 receivedBytes = 0;
+    qint64 totalBytes = -1;
+    QString error;
 };
 
 struct BotRuntimeSnapshot {
@@ -519,6 +588,7 @@ struct BotRuntimeSnapshot {
         QString primaryGatewayUrl;
         QString lastError;
     } ipfs;
+    ViewerSnapshot viewer;
     VerificationSnapshot verification;
     QVector<RoomWorkerSnapshot> workerStates;
     QVector<ActiveDownloadSnapshot> activeDownloads;

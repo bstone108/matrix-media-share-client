@@ -27,12 +27,13 @@ public:
     const QString &password() const;
     const BotRuntimeSnapshot &runtime() const;
     const QVector<RoomRecord> &rooms() const;
-    const QVector<AttachmentDiscovery> &discoveries() const;
+    QVector<AttachmentDiscovery> fetchDiscoveriesPage(const QString &roomId, int offset, int limit) const;
+    int discoveryCount(const QString &roomId = QString()) const;
     QVector<RoomRecord> joinedRooms() const;
     QVector<RoomRecord> joinedSpaces() const;
     const QVector<DownloadJobRecord> &jobs() const;
-    const QVector<ActivityLogEntry> &logs() const;
-    QVector<ActivityLogEntry> visibleLogs() const;
+    QVector<ActivityLogEntry> fetchLogsPage(int offset, int limit, bool problemsOnly) const;
+    int logCount(bool problemsOnly) const;
     int waitingQueueCount() const;
     QStringList aliasHistory(const QString &roomId) const;
 
@@ -45,10 +46,15 @@ public:
     QString updateStatusText() const;
     QString latestReleaseSummaryText() const;
     QString latestReleasePageUrl() const;
+    QString settingsDatabasePath() const;
+    QString secretStorePath() const;
+    void recordInfo(const QString &subsystem, const QString &message);
+    void recordWarning(const QString &subsystem, const QString &message);
+    void recordError(const QString &subsystem, const QString &message);
 
 public slots:
     void togglePower(bool enabled);
-    void saveSettings(const AppSettings &settings, const QString &password);
+    bool saveSettings(const AppSettings &settings, const QString &password);
     void resetHistoryScans();
     void retryFailedJob(qint64 jobId);
     void retryAllFailedJobs();
@@ -56,6 +62,7 @@ public slots:
     void clearAllFailedJobs();
     void queueDiscoveryDownload(const QString &roomId, const QString &eventId);
     void openDiscovery(const QString &roomId, const QString &eventId);
+    void focusRoom(const QString &roomId);
     void shareLocalFile(const QString &roomId, const QString &filePath);
     void shareLocalFiles(const QString &roomId, const QStringList &filePaths);
     void importIpfsLink(const QString &link);
@@ -90,9 +97,7 @@ private:
     QString password_;
     BotRuntimeSnapshot runtime_;
     QVector<RoomRecord> rooms_;
-    QVector<AttachmentDiscovery> discoveries_;
     QVector<DownloadJobRecord> jobs_;
-    QVector<ActivityLogEntry> logs_;
     int waitingQueueCount_ = 0;
     QString lastErrorMessage_;
     bool refreshQueued_ = false;

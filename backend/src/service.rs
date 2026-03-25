@@ -16,11 +16,12 @@ use matrix_sdk::{
     Client, Room,
     encryption::{
         VerificationState,
-        verification::{SasVerification, VerificationRequest},
+        verification::{SasVerification, VerificationRequest, VerificationRequestState},
     },
     media::{MediaFormat, MediaRequestParameters},
     ruma::{
         OwnedMxcUri, OwnedServerName, RoomAliasId, RoomOrAliasId, ServerName, UserId,
+        api::client::uiaa,
         events::room::{
             MediaSource,
             message::{MessageType, RoomMessageEventContent},
@@ -51,7 +52,8 @@ use crate::{
         ActiveDownloadSnapshot, AppLogLevel, AppSettings, AttachmentDiscovery, BotRuntimeSnapshot,
         ConnectionState, DownloadJobRecord, FailedJobRetentionUnit, LocalAssetSourceKind,
         MediaCategory, MediaSourceKind, RoomCheckpoint, RoomHierarchySnapshot, RoomHistoryMode,
-        RoomWorkerSnapshot, SpaceChildDescriptor, StoredSession, TrackedUploadRecord,
+        RoomWorkerSnapshot, SpaceChildDescriptor, StoredSession, TrackedUploadRecord, ViewerSnapshot,
+        ViewerState,
         VerificationEmoji, VerificationSnapshot, VerificationStatus,
     },
     gateway_registry::BOOTSTRAP_PRIMARY_GATEWAY,
@@ -65,6 +67,7 @@ use crate::{
 const ROOM_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const DOWNLOAD_IDLE_DELAY: Duration = Duration::from_secs(1);
 const DOWNLOAD_ERROR_DELAY: Duration = Duration::from_secs(2);
+const MAX_DISCOVERY_CACHE_ENTRIES: usize = 12_000;
 
 pub enum CommandOutcome {
     Continue,
@@ -134,6 +137,7 @@ impl RoomWorkerState {
 #[derive(Default)]
 struct VerificationContext {
     request: Option<VerificationRequest>,
+    request_task: Option<JoinHandle<()>>,
     sas: Option<SasVerification>,
     sas_task: Option<JoinHandle<()>>,
 }
@@ -246,7 +250,46 @@ impl BackendService {
             }
             Command::OpenDiscovery { room_id, event_id } => {
                 let running = self.running_context()?;
-                open_discovery(&running, &room_id, &event_id).await?;
+                tokio::spawn(async move {
+                    if let Err(error) = open_discovery(&running, &room_id, &event_id).await {
+                        let _ = running
+                            .runtime
+                            .mutate(|runtime| {
+                                runtime
+                                    .active_downloads
+                                    .retain(|download| download.worker_id != 0);
+                                runtime.viewer.state = ViewerState::Error;
+                                runtime.viewer.room_id = Some(room_id.clone());
+                                runtime.viewer.event_id = Some(event_id.clone());
+                                runtime.viewer.error = Some(error.to_string());
+                            })
+                            .await;
+                        let _ = running
+                            .database
+                            .insert_log(
+                                AppLogLevel::Error,
+                                "viewer",
+                                &format!("Failed to open browser item {event_id} from {room_id}: {error:#}"),
+                            )
+                            .await;
+                    }
+                });
+                Ok(CommandOutcome::Continue)
+            }
+            Command::FocusRoom { room_id } => {
+                let running = self.running_context()?;
+                tokio::spawn(async move {
+                    if let Err(error) = focus_room_now(&running, &room_id).await {
+                        let _ = running
+                            .database
+                            .insert_log(
+                                AppLogLevel::Warning,
+                                "rooms",
+                                &format!("Failed to prioritize room {room_id}: {error:#}"),
+                            )
+                            .await;
+                    }
+                });
                 Ok(CommandOutcome::Continue)
             }
             Command::OpenMedia { media_item_id } => {
@@ -363,7 +406,7 @@ impl BackendService {
             .await;
 
         let client = connect_client(&self.paths, &self.secret_store, &settings, &password).await?;
-        persist_current_session(&self.secret_store, &client).await?;
+        persist_current_session(&self.secret_store, &settings.homeserver_url, &client).await?;
 
         let current_user_id = runtime_user_id_from_settings(&settings)
             .ok_or_else(|| anyhow!("Connected Matrix client has no configured user id"))?;
@@ -453,6 +496,9 @@ impl BackendService {
 
         {
             let mut verification = context.verification.lock().await;
+            if let Some(task) = verification.request_task.take() {
+                task.abort();
+            }
             if let Some(task) = verification.sas_task.take() {
                 task.abort();
             }
@@ -579,6 +625,7 @@ impl DownloadManager {
         self.runtime
             .mutate(|runtime| {
                 runtime.active_downloads.clear();
+                runtime.viewer = ViewerSnapshot::default();
             })
             .await;
     }
@@ -636,6 +683,7 @@ impl DownloadManager {
                 worker_id,
                 job_id: job.id,
                 room_id: job.room_id.clone(),
+                event_id: job.event_id.clone(),
                 filename: file_name.clone(),
                 received_bytes: 0,
                 total_bytes: None,
@@ -778,9 +826,9 @@ impl DownloadManager {
     }
 }
 
-async fn build_client(paths: &AppPaths, settings: &AppSettings) -> Result<Client> {
+async fn build_client(paths: &AppPaths, homeserver_url: &str) -> Result<Client> {
     let builder = Client::builder()
-        .server_name_or_homeserver_url(settings.homeserver_url.clone())
+        .server_name_or_homeserver_url(homeserver_url.to_owned())
         .sqlite_store_with_cache_path(&paths.matrix_data_path, &paths.matrix_cache_path, None)
         .user_agent("MatrixMediaShareClient/0.1")
         .sliding_sync_version_builder(matrix_sdk::sliding_sync::VersionBuilder::DiscoverNative);
@@ -795,22 +843,39 @@ async fn connect_client(
     password: &str,
 ) -> Result<Client> {
     if let Some(stored_session) = secret_store.load_session()? {
-        if stored_session.homeserver_url == settings.homeserver_url
-            && stored_session_matches_settings_login(&stored_session, settings)
-        {
-            let client = build_client(paths, settings).await?;
+        if stored_session_matches_settings_login(&stored_session, settings) {
+            let restore_homeserver_url = if stored_session.homeserver_url.trim().is_empty() {
+                settings.homeserver_url.as_str()
+            } else {
+                stored_session.homeserver_url.as_str()
+            };
+            let client = build_client(paths, restore_homeserver_url).await?;
+            let previous_device_id = stored_session.device_id.clone();
             if let Ok(matrix_session) = stored_session.try_into_matrix_session() {
                 if client.restore_session(matrix_session).await.is_ok() {
                     return Ok(client);
                 }
             }
+
+            if !previous_device_id.trim().is_empty() {
+                let login_result = client
+                    .matrix_auth()
+                    .login_username(&settings.username, password)
+                    .device_id(&previous_device_id)
+                    .initial_device_display_name("Matrix Media Share Client")
+                    .await;
+                if login_result.is_ok() {
+                    return Ok(client);
+                }
+            }
+
             drop(client);
         }
         secret_store.clear_session()?;
     }
 
     reset_matrix_store(paths).await?;
-    let client = build_client(paths, settings).await?;
+    let client = build_client(paths, &settings.homeserver_url).await?;
     client
         .matrix_auth()
         .login_username(&settings.username, password)
@@ -819,11 +884,18 @@ async fn connect_client(
     Ok(client)
 }
 
-async fn persist_current_session(secret_store: &SecretStore, client: &Client) -> Result<()> {
+fn normalized_homeserver_url(homeserver_url: &str) -> String {
+    homeserver_url.trim().trim_end_matches('/').to_owned()
+}
+
+async fn persist_current_session(secret_store: &SecretStore, _homeserver_url: &str, client: &Client) -> Result<()> {
     let Some(session) = client.session() else {
         return Ok(());
     };
-    let stored = StoredSession::from_auth_session(session, client.homeserver().to_string());
+    let stored = StoredSession::from_auth_session(
+        session,
+        normalized_homeserver_url(client.homeserver().as_str()),
+    );
     secret_store.save_session(&stored)?;
     Ok(())
 }
@@ -923,6 +995,15 @@ async fn queue_share_requests(
     let room_id = room_id.trim().to_owned();
     if room_id.is_empty() {
         return Err(anyhow!("Pick a room before sharing files."));
+    }
+    let selected_room = context
+        .client
+        .joined_rooms()
+        .into_iter()
+        .find(|room| room.room_id().as_str() == room_id)
+        .ok_or_else(|| anyhow!("Pick a joined room before sharing files."))?;
+    if selected_room.is_space() {
+        return Err(anyhow!("Pick a room, not a space, before sharing files."));
     }
 
     let mut queued_count = 0;
@@ -1203,6 +1284,34 @@ async fn share_source_from_archive_or_library(
         }
     }
 
+    if let Some((source_kind, source_path)) =
+        resolve_managed_share_source(context, &sha256, file_path, &settings).await?
+    {
+        let record = TrackedUploadRecord {
+            sha256: sha256.clone(),
+            source_kind,
+            source_path: source_path.to_string_lossy().to_string(),
+            library_path: (source_kind == LocalAssetSourceKind::Library)
+                .then(|| source_path.to_string_lossy().to_string()),
+            archive_path: (source_kind == LocalAssetSourceKind::Archive)
+                .then(|| source_path.to_string_lossy().to_string()),
+            room_id: room.room_id().to_string(),
+            category,
+            original_filename: Some(file_name.clone()),
+            mime_type: Some(content_type.essence_str().to_owned()),
+            file_size,
+            created_at: now,
+            updated_at: now,
+        };
+        context.database.upsert_tracked_upload(&record).await?;
+        return Ok(PreparedShareSource {
+            file_name,
+            content_type,
+            file_size,
+            source_path,
+        });
+    }
+
     if let Some(archive_path) = resolve_archive_source_path(context, &sha256, file_path, &settings).await? {
         let record = TrackedUploadRecord {
             sha256: sha256.clone(),
@@ -1269,6 +1378,43 @@ async fn share_source_from_archive_or_library(
     })
 }
 
+async fn resolve_managed_share_source(
+    context: &Arc<RunningContext>,
+    sha256: &str,
+    file_path: &Path,
+    settings: &AppSettings,
+) -> Result<Option<(LocalAssetSourceKind, PathBuf)>> {
+    if let Some(archive_path) = configured_archive_source(file_path, settings).await? {
+        let metadata = tokio_fs::metadata(&archive_path).await?;
+        let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
+        let archive_path_string = archive_path.to_string_lossy().to_string();
+        context
+            .database
+            .upsert_archive_file(
+                sha256,
+                &archive_path_string,
+                metadata.len() as i64,
+                modified_at,
+            )
+            .await?;
+        return Ok(Some((LocalAssetSourceKind::Archive, archive_path)));
+    }
+
+    if let Some(download_path) =
+        configured_download_source(file_path, settings, &context.paths).await?
+    {
+        return Ok(Some((LocalAssetSourceKind::Downloads, download_path)));
+    }
+
+    if let Some(library_path) =
+        configured_library_source(file_path, settings, &context.paths).await?
+    {
+        return Ok(Some((LocalAssetSourceKind::Library, library_path)));
+    }
+
+    Ok(None)
+}
+
 async fn resolve_archive_source_path(
     context: &Arc<RunningContext>,
     sha256: &str,
@@ -1326,6 +1472,10 @@ async fn library_category_folder(
     paths: &AppPaths,
 ) -> Result<PathBuf> {
     let root = configured_library_root(settings, paths);
+    tokio_fs::create_dir_all(&root).await?;
+    if settings.flat_folder_layout {
+        return Ok(root);
+    }
     let category_folder = root
         .join(room_folder_label)
         .join(category.as_storage_key());
@@ -1342,6 +1492,10 @@ fn configured_library_root(settings: &AppSettings, paths: &AppPaths) -> PathBuf 
     }
 }
 
+fn configured_destination_root(settings: &AppSettings) -> PathBuf {
+    PathBuf::from(settings.destination_root_path.trim())
+}
+
 fn configured_downloads_root(settings: &AppSettings, paths: &AppPaths) -> PathBuf {
     let configured = settings.manual_download_root_path.trim();
     if configured.is_empty() {
@@ -1349,6 +1503,50 @@ fn configured_downloads_root(settings: &AppSettings, paths: &AppPaths) -> PathBu
     } else {
         PathBuf::from(configured)
     }
+}
+
+async fn configured_library_source(
+    file_path: &Path,
+    settings: &AppSettings,
+    paths: &AppPaths,
+) -> Result<Option<PathBuf>> {
+    configured_root_source(file_path, &configured_library_root(settings, paths)).await
+}
+
+async fn configured_download_source(
+    file_path: &Path,
+    settings: &AppSettings,
+    paths: &AppPaths,
+) -> Result<Option<PathBuf>> {
+    let roots = [
+        configured_destination_root(settings),
+        configured_downloads_root(settings, paths),
+    ];
+
+    for root in roots {
+        if let Some(path) = configured_root_source(file_path, &root).await? {
+            return Ok(Some(path));
+        }
+    }
+
+    Ok(None)
+}
+
+async fn configured_root_source(file_path: &Path, root_path: &Path) -> Result<Option<PathBuf>> {
+    if root_path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+
+    let file_canonical = tokio_fs::canonicalize(file_path)
+        .await
+        .unwrap_or_else(|_| file_path.to_path_buf());
+    let root_canonical = tokio_fs::canonicalize(root_path)
+        .await
+        .unwrap_or_else(|_| root_path.to_path_buf());
+    if file_canonical.starts_with(&root_canonical) {
+        return Ok(Some(file_canonical));
+    }
+    Ok(None)
 }
 
 async fn share_local_file(
@@ -1377,11 +1575,16 @@ async fn share_local_file(
             &prepared.source_path,
             thumbnail_path.as_deref(),
             Some(preferred_gateway),
+            &settings.preferred_gateway_urls,
         )
         .await?;
     let link_message = format!(
-        "{}\nIPFS landing page: {}\nCID: {}",
-        prepared.file_name, published.landing_page_url, published.file_cid
+        "{}\nIPFS landing page: {}\nIPFS media: ipfs://{}\nCID: {}\nLanding Page CID: {}",
+        prepared.file_name,
+        published.landing_page_url,
+        published.file_cid,
+        published.file_cid,
+        published.page_cid,
     );
 
     let upload_limit = context.runtime.snapshot().await.upload_size_limit_bytes;
@@ -1524,10 +1727,28 @@ async fn open_discovery(
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
+    let next_session_id = context.runtime.snapshot().await.viewer.session_id.saturating_add(1);
+    let file_name = discovery
+        .original_filename
+        .clone()
+        .unwrap_or_else(|| discovery.event_id.clone());
 
     context
         .runtime
         .mutate(|runtime| {
+            runtime.viewer = ViewerSnapshot {
+                session_id: next_session_id.max(1),
+                state: ViewerState::Downloading,
+                room_id: Some(discovery.room_id.clone()),
+                event_id: Some(discovery.event_id.clone()),
+                file_name: Some(file_name.clone()),
+                mime_type: discovery.mime_type.clone(),
+                category: Some(discovery.category),
+                local_path: None,
+                received_bytes: 0,
+                total_bytes: None,
+                error: None,
+            };
             runtime
                 .active_downloads
                 .retain(|download| download.worker_id != 0);
@@ -1535,10 +1756,8 @@ async fn open_discovery(
                 worker_id: 0,
                 job_id: 0,
                 room_id: discovery.room_id.clone(),
-                filename: discovery
-                    .original_filename
-                    .clone()
-                    .unwrap_or_else(|| discovery.event_id.clone()),
+                event_id: discovery.event_id.clone(),
+                filename: file_name.clone(),
                 received_bytes: 0,
                 total_bytes: None,
             });
@@ -1565,14 +1784,40 @@ async fn open_discovery(
         })
         .await;
 
-    let temp_path = temp_path?;
-    open_path_in_default_app(&temp_path).await?;
+    let temp_path = match temp_path {
+        Ok(temp_path) => temp_path,
+        Err(error) => {
+            context
+                .runtime
+                .mutate(|runtime| {
+                    runtime.viewer.state = ViewerState::Error;
+                    runtime.viewer.local_path = None;
+                    runtime.viewer.error = Some(error.to_string());
+                })
+                .await;
+            return Err(error);
+        }
+    };
+    let final_size = tokio_fs::metadata(&temp_path)
+        .await
+        .map(|metadata| metadata.len() as i64)
+        .unwrap_or_default();
+    context
+        .runtime
+        .mutate(|runtime| {
+            runtime.viewer.state = ViewerState::Ready;
+            runtime.viewer.local_path = Some(temp_path.to_string_lossy().to_string());
+            runtime.viewer.received_bytes = final_size;
+            runtime.viewer.total_bytes = Some(final_size);
+            runtime.viewer.error = None;
+        })
+        .await;
     context
         .database
         .insert_log(
             AppLogLevel::Info,
-            "browser",
-            &format!("Opened browser item {} from room {}.", event_id, room_id),
+            "viewer",
+            &format!("Prepared browser item {} from room {} for the built-in viewer.", event_id, room_id),
         )
         .await?;
     Ok(())
@@ -1646,6 +1891,7 @@ fn ipfs_discovery_from_body(
     settings: &AppSettings,
 ) -> Result<Option<AttachmentDiscovery>> {
     let file_name_hint = ipfs_message_file_name_hint(body);
+    let landing_page_url = ipfs_landing_page_hint(body);
 
     if let Some(cid) = ipfs_cid_hint(body) {
         let direct_url = gateway_raw_url(settings, &cid, None)?;
@@ -1655,7 +1901,14 @@ fn ipfs_discovery_from_body(
             origin_server_timestamp: timestamp,
             source_kind: MediaSourceKind::Ipfs,
             direct_url: Some(direct_url.clone()),
-            mxc_url: direct_url,
+            mxc_url: landing_page_url.unwrap_or_else(|| direct_url.clone()),
+            thumbnail_source_url: file_name_hint
+                .as_deref()
+                .and_then(|file_name| {
+                    (media_classification::category(Some(file_name), None) == MediaCategory::Images)
+                        .then(|| direct_url.clone())
+                }),
+            thumbnail_cached_path: None,
             original_filename: file_name_hint.clone(),
             mime_type: None,
             category: media_classification::category(file_name_hint.as_deref(), None),
@@ -1676,7 +1929,14 @@ fn ipfs_discovery_from_body(
             origin_server_timestamp: timestamp,
             source_kind: MediaSourceKind::Ipfs,
             direct_url: Some(imported.direct_url.clone()),
-            mxc_url: imported.direct_url,
+            mxc_url: landing_page_url.unwrap_or_else(|| imported.direct_url.clone()),
+            thumbnail_source_url: file_name
+                .as_deref()
+                .and_then(|name| {
+                    (media_classification::category(Some(name), None) == MediaCategory::Images)
+                        .then(|| imported.direct_url.clone())
+                }),
+            thumbnail_cached_path: None,
             original_filename: file_name.clone(),
             mime_type: None,
             category: media_classification::category(file_name.as_deref(), None),
@@ -1690,18 +1950,40 @@ fn ipfs_message_file_name_hint(body: &str) -> Option<String> {
     body.lines()
         .map(str::trim)
         .find(|line| {
+            let lower = line.to_ascii_lowercase();
             !line.is_empty()
                 && !line.contains("://")
-                && !line.to_ascii_lowercase().starts_with("cid:")
-                && !line.to_ascii_lowercase().starts_with("ipfs landing page:")
+                && !lower.starts_with("cid:")
+                && !lower.starts_with("media cid:")
+                && !lower.starts_with("page cid:")
+                && !lower.starts_with("landing page cid:")
+                && !lower.starts_with("ipfs landing page:")
+                && !lower.starts_with("ipfs media:")
         })
         .map(ToOwned::to_owned)
+}
+
+fn ipfs_landing_page_hint(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if !trimmed.to_ascii_lowercase().starts_with("ipfs landing page:") {
+            return None;
+        }
+        let (_, value) = trimmed.split_once(':')?;
+        let url = value.trim();
+        reqwest::Url::parse(url).ok().map(|parsed| parsed.to_string())
+    })
 }
 
 fn ipfs_cid_hint(body: &str) -> Option<String> {
     for line in body.lines() {
         let trimmed = line.trim();
-        if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("cid:") {
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("page cid:") || lower.starts_with("landing page cid:") {
+            continue;
+        }
+
+        if lower.starts_with("cid:") || lower.starts_with("media cid:") {
             let rest = trimmed
                 .split_once(':')
                 .map(|(_, value)| value.trim())
@@ -1826,7 +2108,13 @@ async fn watch_session_changes(context: Arc<RunningContext>) {
     loop {
         match receiver.recv().await {
             Ok(matrix_sdk::SessionChange::TokensRefreshed) => {
-                let _ = persist_current_session(&context.secret_store, &context.client).await;
+                let settings = context.settings.read().await.clone();
+                let _ = persist_current_session(
+                    &context.secret_store,
+                    &settings.homeserver_url,
+                    &context.client,
+                )
+                .await;
             }
             Ok(matrix_sdk::SessionChange::UnknownToken { soft_logout }) => {
                 let _ = context
@@ -1863,6 +2151,7 @@ async fn periodic_room_refresh(context: Arc<RunningContext>) {
         ) {
             let _ = refresh_joined_rooms(context.clone()).await;
             let _ = prune_expired_failed_jobs(&context).await;
+            let _ = refresh_verification_snapshot(&context).await;
         }
         sleep(ROOM_REFRESH_INTERVAL).await;
     }
@@ -1885,6 +2174,12 @@ async fn refresh_joined_rooms(context: Arc<RunningContext>) -> Result<()> {
         }
     }
 
+    let invited_ids = context
+        .client
+        .invited_rooms()
+        .into_iter()
+        .map(|room| room.room_id().to_string())
+        .collect::<HashSet<_>>();
     let joined_rooms = context.client.joined_rooms();
     let joined_ids = joined_rooms
         .iter()
@@ -1894,6 +2189,28 @@ async fn refresh_joined_rooms(context: Arc<RunningContext>) -> Result<()> {
     for room in joined_rooms {
         let record = context.room_catalog.sync_sdk_room(&room, &settings).await?;
         ensure_room_worker(context.clone(), room, record.is_space).await?;
+    }
+
+    for room in context.database.fetch_rooms().await? {
+        if joined_ids.contains(&room.room_id) {
+            continue;
+        }
+        let membership = if invited_ids.contains(&room.room_id) {
+            "invited"
+        } else {
+            "left"
+        };
+        context
+            .database
+            .upsert_room(
+                &room.room_id,
+                room.current_display_name.as_deref(),
+                room.current_canonical_alias.as_deref(),
+                &room.active_folder_label,
+                room.is_space,
+                membership,
+            )
+            .await?;
     }
 
     let stale_room_ids = {
@@ -1911,6 +2228,56 @@ async fn refresh_joined_rooms(context: Arc<RunningContext>) -> Result<()> {
     }
 
     publish_worker_states(&context).await;
+    Ok(())
+}
+
+async fn focus_room_now(context: &Arc<RunningContext>, room_id: &str) -> Result<()> {
+    let room_id = room_id.trim();
+    if room_id.is_empty() {
+        return Ok(());
+    }
+
+    let room = context
+        .client
+        .joined_rooms()
+        .into_iter()
+        .find(|room| room.room_id().as_str() == room_id)
+        .ok_or_else(|| anyhow!("Room is not currently joined: {room_id}"))?;
+    let settings = context.settings.read().await.clone();
+    let room_record = context.room_catalog.sync_sdk_room(&room, &settings).await?;
+    ensure_room_worker(context.clone(), room.clone(), room_record.is_space).await?;
+
+    if room_record.is_space {
+        return Ok(());
+    }
+
+    let timeline = room.timeline().await?;
+    let (initial_items, mut stream) = timeline.subscribe().await;
+    let initial_events = collect_events_from_vector(&initial_items, room_id)?;
+    process_events(context, room_id, TimelineSource::Live, initial_events, None).await?;
+    drain_timeline_stream(context, room_id, &mut stream, TimelineSource::Live, None).await?;
+
+    let checkpoint = context.database.load_checkpoint(room_id).await?;
+    if !checkpoint.initial_backfill_complete {
+        let _ = timeline.paginate_backwards(50).await?;
+        drain_timeline_stream(
+            context,
+            room_id,
+            &mut stream,
+            TimelineSource::InitialBackfill,
+            checkpoint.oldest_backfilled_timestamp,
+        )
+        .await?;
+    }
+
+    context
+        .database
+        .insert_log(
+            AppLogLevel::Info,
+            "rooms",
+            &format!("Prioritized foreground refresh for {room_id}."),
+        )
+        .await?;
     Ok(())
 }
 
@@ -2151,6 +2518,11 @@ async fn run_initial_backfill(context: &Arc<RunningContext>, room: &Room) -> Res
     let timeline = room.timeline().await?;
     let (_initial_items, mut stream) = timeline.subscribe().await;
     let mut checkpoint;
+    let mut resume_cutoff = context
+        .database
+        .load_checkpoint(&room_id)
+        .await?
+        .oldest_backfilled_timestamp;
 
     loop {
         drain_timeline_stream(
@@ -2158,7 +2530,7 @@ async fn run_initial_backfill(context: &Arc<RunningContext>, room: &Room) -> Res
             &room_id,
             &mut stream,
             TimelineSource::InitialBackfill,
-            None,
+            resume_cutoff,
         )
         .await?;
 
@@ -2168,11 +2540,12 @@ async fn run_initial_backfill(context: &Arc<RunningContext>, room: &Room) -> Res
             &room_id,
             &mut stream,
             TimelineSource::InitialBackfill,
-            None,
+            resume_cutoff,
         )
         .await?;
 
         checkpoint = context.database.load_checkpoint(&room_id).await?;
+        resume_cutoff = checkpoint.oldest_backfilled_timestamp;
         set_history_state(
             context,
             &room_id,
@@ -2304,6 +2677,7 @@ mod tests {
             owner_user_id: String::new(),
             destination_root_path: String::new(),
             library_root_path: String::new(),
+            flat_folder_layout: false,
             archive_root_path: String::new(),
             archive_scan_enabled: false,
             archive_scan_high_priority: false,
@@ -2426,6 +2800,108 @@ mod tests {
     }
 }
 
+fn should_cache_discovery_thumbnail(discovery: &AttachmentDiscovery) -> bool {
+    if discovery
+        .thumbnail_cached_path
+        .as_deref()
+        .is_some_and(|path| Path::new(path).exists())
+    {
+        return false;
+    }
+
+    discovery
+        .thumbnail_source_url
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+async fn cache_discovery_thumbnail(
+    context: &Arc<RunningContext>,
+    discovery: &AttachmentDiscovery,
+) -> Result<Option<String>> {
+    if let Some(existing_path) = discovery.thumbnail_cached_path.as_deref() {
+        if tokio_fs::try_exists(existing_path).await.unwrap_or(false) {
+            return Ok(Some(existing_path.to_owned()));
+        }
+    }
+
+    let Some(source) = discovery
+        .thumbnail_source_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let thumbnail_bytes = load_discovery_thumbnail_bytes(&context.client, source).await?;
+    let image = image::load_from_memory(&thumbnail_bytes)
+        .with_context(|| format!("Thumbnail bytes were not a valid image for {}", discovery.event_id))?;
+    let thumbnail = image.thumbnail(384, 384);
+
+    tokio_fs::create_dir_all(&context.paths.thumbnail_cache_path).await?;
+    let cache_path = thumbnail_cache_file_path(&context.paths, &discovery.room_id, &discovery.event_id);
+    let cache_path_for_write = cache_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        thumbnail
+            .save_with_format(&cache_path_for_write, image::ImageFormat::Jpeg)
+            .with_context(|| format!("Failed to save {}", cache_path_for_write.display()))
+    })
+    .await??;
+
+    let cached_path = cache_path.to_string_lossy().to_string();
+    context
+        .database
+        .set_discovery_thumbnail_cached_path(
+            &discovery.room_id,
+            &discovery.event_id,
+            Some(&cached_path),
+        )
+        .await?;
+    context
+        .database
+        .insert_log(
+            AppLogLevel::Info,
+            "thumbnails",
+            &format!(
+                "Cached thumbnail for {} in {} at {}",
+                discovery.event_id, discovery.room_id, cached_path
+            ),
+        )
+        .await?;
+    Ok(Some(cached_path))
+}
+
+async fn load_discovery_thumbnail_bytes(client: &Client, source: &str) -> Result<Vec<u8>> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?
+            .get(source)
+            .header(USER_AGENT, "MatrixMediaShareClient/0.1")
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Thumbnail download failed with status {} from {}",
+                response.status(),
+                source
+            ));
+        }
+        return Ok(response.bytes().await?.to_vec());
+    }
+
+    let request = MediaRequestParameters {
+        source: decode_media_source(source)?,
+        format: MediaFormat::File,
+    };
+    client.media().get_media_content(&request, true).await.map_err(Into::into)
+}
+
+fn thumbnail_cache_file_path(paths: &AppPaths, room_id: &str, event_id: &str) -> PathBuf {
+    let digest = Sha256::digest(format!("{room_id}:{event_id}").as_bytes());
+    paths.thumbnail_cache_path.join(format!("{digest:x}.jpg"))
+}
+
 async fn process_events(
     context: &Arc<RunningContext>,
     room_id: &str,
@@ -2434,6 +2910,8 @@ async fn process_events(
     cutoff: Option<DateTime<Utc>>,
 ) -> Result<()> {
     let mut event_count = 0;
+    let mut new_discovery_count = 0usize;
+    let mut thumbnail_warmups = Vec::new();
     let mut oldest: Option<(String, DateTime<Utc>)> = None;
     let mut newest: Option<(String, DateTime<Utc>)> = None;
     let is_space_room = context
@@ -2457,10 +2935,15 @@ async fn process_events(
             discovery,
         } = event;
 
-        if cutoff.is_some_and(|cutoff| timestamp <= cutoff)
-            && source == TimelineSource::ReconnectCatchUp
-        {
-            continue;
+        if let Some(cutoff) = cutoff {
+            let should_skip = match source {
+                TimelineSource::ReconnectCatchUp => timestamp <= cutoff,
+                TimelineSource::InitialBackfill => timestamp >= cutoff,
+                TimelineSource::Live => false,
+            };
+            if should_skip {
+                continue;
+            }
         }
 
         event_count += 1;
@@ -2494,10 +2977,16 @@ async fn process_events(
                 let auto_download = settings
                     .as_ref()
                     .is_some_and(|settings| settings.auto_download_new_media);
-                context
+                let inserted = context
                     .database
                     .enqueue_discovery(&discovery, auto_download)
                     .await?;
+                if inserted {
+                    new_discovery_count += 1;
+                }
+                if should_cache_discovery_thumbnail(&discovery) {
+                    thumbnail_warmups.push(discovery.clone());
+                }
             }
         }
 
@@ -2542,6 +3031,35 @@ async fn process_events(
     }
 
     context.database.save_checkpoint(&checkpoint).await?;
+
+    if new_discovery_count > 0 {
+        let removed_thumbnail_paths = context
+            .database
+            .prune_discovery_cache(MAX_DISCOVERY_CACHE_ENTRIES)
+            .await?;
+        for removed_path in removed_thumbnail_paths {
+            let _ = tokio_fs::remove_file(&removed_path).await;
+        }
+    }
+
+    for discovery in thumbnail_warmups {
+        let context = context.clone();
+        tokio::spawn(async move {
+            if let Err(error) = cache_discovery_thumbnail(&context, &discovery).await {
+                let _ = context
+                    .database
+                    .insert_log(
+                        AppLogLevel::Warning,
+                        "thumbnails",
+                        &format!(
+                            "Failed to cache thumbnail for {} in {}: {error:#}",
+                            discovery.event_id, discovery.room_id
+                        ),
+                    )
+                    .await;
+            }
+        });
+    }
     Ok(())
 }
 
@@ -2648,71 +3166,218 @@ async fn send_owner_reply(context: &Arc<RunningContext>, prefix: &str, detail: &
     Ok(())
 }
 
-async fn request_verification(context: &Arc<RunningContext>) -> Result<()> {
-    let device = context
-        .client
-        .encryption()
-        .get_own_device()
-        .await?
-        .ok_or_else(|| anyhow!("Unable to find the current device for verification"))?;
-    let request = device.request_verification().await?;
-
-    let mut verification = context.verification.lock().await;
-    if let Some(task) = verification.sas_task.take() {
-        task.abort();
+fn verification_request_state_label(state: &VerificationRequestState) -> &'static str {
+    match state {
+        VerificationRequestState::Created { .. } => "created",
+        VerificationRequestState::Requested { .. } => "requested",
+        VerificationRequestState::Ready { .. } => "ready",
+        VerificationRequestState::Transitioned { .. } => "inProgress",
+        VerificationRequestState::Done => "done",
+        VerificationRequestState::Cancelled(_) => "cancelled",
     }
-    verification.request = Some(request);
-    verification.sas = None;
-    drop(verification);
-
-    refresh_verification_snapshot(context).await?;
-    Ok(())
 }
 
-async fn start_sas_verification(context: &Arc<RunningContext>) -> Result<()> {
-    let request = context
-        .verification
-        .lock()
-        .await
-        .request
-        .clone()
-        .ok_or_else(|| anyhow!("No verification request is active."))?;
+async fn bootstrap_cross_signing_if_needed(context: &Arc<RunningContext>) -> Result<bool> {
+    let Some(user_id) = context.client.user_id() else {
+        return Ok(false);
+    };
 
-    let sas = request
-        .start_sas()
+    if context
+        .client
+        .encryption()
+        .get_user_identity(user_id)
         .await?
-        .ok_or_else(|| anyhow!("Verification request is not ready for SAS yet."))?;
+        .is_some()
+    {
+        return Ok(false);
+    }
 
+    let settings = context.settings.read().await.clone();
+    let password = context.secret_store.load_password().unwrap_or_default();
+    if password.trim().is_empty() {
+        return Err(anyhow!("A saved password is required to set up Matrix verification for this device."));
+    }
+
+    match context.client.encryption().bootstrap_cross_signing_if_needed(None).await {
+        Ok(()) => {}
+        Err(error) => {
+            if let Some(response) = error.as_uiaa_response() {
+                let login_id =
+                    runtime_user_id_from_settings(&settings).unwrap_or_else(|| settings.username.trim().to_owned());
+                let mut auth = uiaa::Password::new(
+                    uiaa::UserIdentifier::UserIdOrLocalpart(login_id),
+                    password,
+                );
+                auth.session = response.session.clone();
+                context
+                    .client
+                    .encryption()
+                    .bootstrap_cross_signing(Some(uiaa::AuthData::Password(auth)))
+                    .await?;
+            } else {
+                return Err(error.into());
+            }
+        }
+    }
+
+    context
+        .database
+        .insert_log(
+            AppLogLevel::Info,
+            "verification",
+            "Set up cross-signing for this client account.",
+        )
+        .await?;
+    Ok(true)
+}
+
+async fn request_verification(context: &Arc<RunningContext>) -> Result<()> {
+    let _ = bootstrap_cross_signing_if_needed(context).await?;
+
+    let own_user_id = context
+        .client
+        .user_id()
+        .ok_or_else(|| anyhow!("Unable to determine the current Matrix user for verification"))?;
+    let own_identity = context
+        .client
+        .encryption()
+        .get_user_identity(own_user_id)
+        .await?
+        .ok_or_else(|| anyhow!("Cross-signing has not finished initializing yet. Give the client a moment and try again."))?;
+
+    let current_device_id = context.client.device_id().map(ToString::to_string);
+    let other_device_count = context
+        .client
+        .encryption()
+        .get_user_devices(own_user_id)
+        .await?
+        .devices()
+        .filter(|device| Some(device.device_id().as_str()) != current_device_id.as_deref())
+        .count();
+
+    if other_device_count == 0 {
+        return Err(anyhow!(
+            "No other logged-in devices were found for this account. Add another device if you want to run SAS verification."
+        ));
+    }
+
+    let request = own_identity.request_verification().await?;
     let watcher_context = context.clone();
-    let watcher_sas = sas.clone();
-    let watcher = tokio::spawn(async move {
-        let mut changes = watcher_sas.changes();
+    let watcher_request = request.clone();
+    let request_watcher = tokio::spawn(async move {
+        let mut changes = watcher_request.changes();
         while changes.next().await.is_some() {
             let _ = refresh_verification_snapshot(&watcher_context).await;
         }
     });
 
     let mut verification = context.verification.lock().await;
+    if let Some(task) = verification.request_task.take() {
+        task.abort();
+    }
     if let Some(task) = verification.sas_task.take() {
         task.abort();
     }
-    verification.sas = Some(sas);
-    verification.sas_task = Some(watcher);
+    verification.request = Some(request);
+    verification.request_task = Some(request_watcher);
+    verification.sas = None;
     drop(verification);
 
+    context
+        .database
+        .insert_log(
+            AppLogLevel::Info,
+            "verification",
+            "Requested verification from another signed-in device.",
+        )
+        .await?;
     refresh_verification_snapshot(context).await?;
     Ok(())
 }
 
+async fn start_sas_verification(context: &Arc<RunningContext>) -> Result<()> {
+    let (request, sas) = {
+        let verification = context.verification.lock().await;
+        (verification.request.clone(), verification.sas.clone())
+    };
+
+    if let Some(sas) = sas {
+        if !sas.can_be_presented() && !sas.is_done() && !sas.is_cancelled() {
+            sas.accept().await?;
+            context
+                .database
+                .insert_log(AppLogLevel::Info, "verification", "Accepted the SAS verification flow.")
+                .await?;
+            refresh_verification_snapshot(context).await?;
+            return Ok(());
+        }
+
+        return Err(anyhow!("SAS verification is already active."));
+    }
+
+    let request = request.ok_or_else(|| anyhow!("No verification request is active."))?;
+    match request.state() {
+        VerificationRequestState::Requested { .. } => {
+            request.accept().await?;
+            context
+                .database
+                .insert_log(AppLogLevel::Info, "verification", "Accepted the verification request.")
+                .await?;
+            refresh_verification_snapshot(context).await?;
+            Ok(())
+        }
+        VerificationRequestState::Transitioned { verification } => {
+            let sas = verification
+                .sas()
+                .ok_or_else(|| anyhow!("The verification transitioned into an unsupported flow."))?;
+            if !sas.can_be_presented() && !sas.is_done() && !sas.is_cancelled() {
+                sas.accept().await?;
+                context
+                    .database
+                    .insert_log(AppLogLevel::Info, "verification", "Accepted the SAS verification flow.")
+                    .await?;
+            }
+            refresh_verification_snapshot(context).await?;
+            Ok(())
+        }
+        _ => {
+            let sas = request
+                .start_sas()
+                .await?
+                .ok_or_else(|| anyhow!("Verification request is not ready for SAS yet."))?;
+            attach_sas_tracking(context, sas).await;
+            context
+                .database
+                .insert_log(AppLogLevel::Info, "verification", "Started SAS verification.")
+                .await?;
+            refresh_verification_snapshot(context).await?;
+            Ok(())
+        }
+    }
+}
+
 async fn approve_verification(context: &Arc<RunningContext>) -> Result<()> {
-    let sas = context
-        .verification
-        .lock()
-        .await
-        .sas
-        .clone()
-        .ok_or_else(|| anyhow!("No SAS verification is active."))?;
+    let (sas, request) = {
+        let verification = context.verification.lock().await;
+        (verification.sas.clone(), verification.request.clone())
+    };
+    let sas = if let Some(sas) = sas {
+        sas
+    } else if let Some(request) = request {
+        match request.state() {
+            VerificationRequestState::Transitioned { verification } => verification
+                .sas()
+                .ok_or_else(|| anyhow!("The verification transitioned into an unsupported flow."))?,
+            _ => return Err(anyhow!("No SAS verification is active.")),
+        }
+    } else {
+        return Err(anyhow!("No SAS verification is active."));
+    };
     sas.confirm().await?;
+    context
+        .database
+        .insert_log(AppLogLevel::Info, "verification", "Approved the SAS verification.")
+        .await?;
     refresh_verification_snapshot(context).await?;
     Ok(())
 }
@@ -2726,26 +3391,86 @@ async fn decline_verification(context: &Arc<RunningContext>) -> Result<()> {
     if let Some(sas) = sas {
         sas.mismatch().await?;
     } else if let Some(request) = request {
-        request.cancel().await?;
+        match request.state() {
+            VerificationRequestState::Transitioned { verification } => {
+                if let Some(sas) = verification.sas() {
+                    sas.mismatch().await?;
+                } else {
+                    request.cancel().await?;
+                }
+            }
+            _ => request.cancel().await?,
+        }
     } else {
         return Err(anyhow!("No verification flow is active."));
     }
 
+    context
+        .database
+        .insert_log(AppLogLevel::Info, "verification", "Rejected the active verification flow.")
+        .await?;
     refresh_verification_snapshot(context).await?;
     Ok(())
 }
 
 async fn refresh_verification_snapshot(context: &Arc<RunningContext>) -> Result<()> {
-    let state = context.client.encryption().verification_state().get();
+    let encryption = context.client.encryption();
+    let state = encryption.verification_state().get();
     let status = match state {
         VerificationState::Unknown => VerificationStatus::Unknown,
         VerificationState::Verified => VerificationStatus::Verified,
         VerificationState::Unverified => VerificationStatus::Unverified,
     };
 
-    let (emojis, decimals) = {
+    let device_id = context.client.device_id().map(ToString::to_string);
+    let own_user_id = context.client.user_id().map(|user_id| user_id.to_owned());
+    let can_bootstrap_cross_signing = if let Some(user_id) = own_user_id.as_deref() {
+        encryption.get_user_identity(user_id).await?.is_none()
+    } else {
+        false
+    };
+    let other_device_count = if let Some(user_id) = own_user_id.as_deref() {
+        encryption
+            .get_user_devices(user_id)
+            .await?
+            .devices()
+            .filter(|device| Some(device.device_id().as_str()) != device_id.as_deref())
+            .count() as u32
+    } else {
+        0
+    };
+    let own_device_verified = encryption
+        .get_own_device()
+        .await?
+        .map(|device| device.is_verified())
+        .unwrap_or(false);
+
+    let (request_flow_id, request_state, has_active_request, request_ready, request_can_accept, has_active_sas, sas_can_accept, emojis, decimals) = {
         let verification = context.verification.lock().await;
-        if let Some(sas) = &verification.sas {
+        let request_state_value = verification.request.as_ref().map(|request| request.state());
+        let request_flow_id = verification.request.as_ref().map(|request| request.flow_id().to_owned());
+        let request_state = request_state_value
+            .as_ref()
+            .map(|state| verification_request_state_label(state).to_owned());
+        let has_active_request = verification
+            .request
+            .as_ref()
+            .map(|request| !request.is_done() && !request.is_cancelled())
+            .unwrap_or(false);
+        let request_ready = verification
+            .request
+            .as_ref()
+            .map(|request| request.is_ready())
+            .unwrap_or(false);
+        let request_can_accept = matches!(request_state_value, Some(VerificationRequestState::Requested { .. }));
+        let derived_sas = request_state_value.and_then(|state| match state {
+            VerificationRequestState::Transitioned { verification } => verification.sas(),
+            _ => None,
+        });
+        let active_sas = verification.sas.clone().or(derived_sas);
+
+        if let Some(sas) = active_sas {
+            let sas_can_accept = matches!(sas.state(), matrix_sdk::encryption::verification::SasState::Started { .. });
             let emojis = sas
                 .emoji()
                 .map(|values| {
@@ -2762,19 +3487,70 @@ async fn refresh_verification_snapshot(context: &Arc<RunningContext>) -> Result<
                 .decimals()
                 .map(|values| vec![values.0, values.1, values.2])
                 .unwrap_or_default();
-            (emojis, decimals)
+            (
+                request_flow_id,
+                request_state,
+                has_active_request,
+                request_ready,
+                request_can_accept,
+                !sas.is_done() && !sas.is_cancelled(),
+                sas_can_accept,
+                emojis,
+                decimals,
+            )
         } else {
-            (Vec::new(), Vec::new())
+            (
+                request_flow_id,
+                request_state,
+                has_active_request,
+                request_ready,
+                request_can_accept,
+                false,
+                false,
+                Vec::new(),
+                Vec::new(),
+            )
         }
     };
 
-    let device_id = context.client.device_id().map(ToString::to_string);
+    let message = if has_active_sas && sas_can_accept {
+        "Your other device started SAS. Accept it here to reveal the verification codes.".to_owned()
+    } else if has_active_sas {
+        "Compare the emoji or decimal codes with your other device, then approve only if they match exactly.".to_owned()
+    } else if has_active_request && request_can_accept {
+        "Another device requested verification. Accept the request here to continue.".to_owned()
+    } else if has_active_request && request_ready {
+        "The verification request is ready. Start SAS on this device to compare codes.".to_owned()
+    } else if has_active_request {
+        "Waiting for your other device to accept the verification request.".to_owned()
+    } else if can_bootstrap_cross_signing {
+        "Verification has not been set up for this account yet. Use Set Up Verification on this page.".to_owned()
+    } else if matches!(status, VerificationStatus::Verified) {
+        "This device is verified.".to_owned()
+    } else if own_device_verified {
+        "This device is trusted locally. Waiting for Matrix sync to confirm the account verification state.".to_owned()
+    } else if other_device_count == 0 {
+        "No other logged-in devices were found for this account. Add another device if you want to run SAS verification.".to_owned()
+    } else {
+        format!("This device is not verified yet. {other_device_count} other device(s) are available for verification.")
+    };
+
     context
         .runtime
         .mutate(|runtime| {
             runtime.verification = VerificationSnapshot {
                 state: status,
                 device_id: device_id.clone(),
+                message: message.clone(),
+                request_flow_id: request_flow_id.clone(),
+                request_state: request_state.clone(),
+                has_active_request,
+                request_ready,
+                request_can_accept,
+                has_active_sas,
+                sas_can_accept,
+                can_bootstrap_cross_signing,
+                other_device_count,
                 emojis: emojis.clone(),
                 decimals: decimals.clone(),
             };
@@ -2782,6 +3558,25 @@ async fn refresh_verification_snapshot(context: &Arc<RunningContext>) -> Result<
         .await;
     Ok(())
 }
+
+async fn attach_sas_tracking(context: &Arc<RunningContext>, sas: SasVerification) {
+    let watcher_context = context.clone();
+    let watcher_sas = sas.clone();
+    let watcher = tokio::spawn(async move {
+        let mut changes = watcher_sas.changes();
+        while changes.next().await.is_some() {
+            let _ = refresh_verification_snapshot(&watcher_context).await;
+        }
+    });
+
+    let mut verification = context.verification.lock().await;
+    if let Some(task) = verification.sas_task.take() {
+        task.abort();
+    }
+    verification.sas = Some(sas);
+    verification.sas_task = Some(watcher);
+}
+
 
 async fn accept_owner_invite_if_allowed(
     context: &Arc<RunningContext>,
@@ -3323,6 +4118,10 @@ async fn download_media_to_temp(
                 active.received_bytes = size;
                 active.total_bytes = Some(size);
             }
+            if worker_id == 0 && snapshot.viewer.state == ViewerState::Downloading {
+                snapshot.viewer.received_bytes = size;
+                snapshot.viewer.total_bytes = Some(size);
+            }
         })
         .await;
     Ok(temp_path)
@@ -3380,6 +4179,10 @@ async fn download_http_url_to_temp(
                 {
                     active.received_bytes = received;
                     active.total_bytes = total;
+                }
+                if worker_id == 0 && snapshot.viewer.state == ViewerState::Downloading {
+                    snapshot.viewer.received_bytes = received;
+                    snapshot.viewer.total_bytes = total;
                 }
             })
             .await;
@@ -3476,6 +4279,10 @@ async fn direct_remote_media_download_to_temp(
                     {
                         active.received_bytes = received;
                         active.total_bytes = total;
+                    }
+                    if worker_id == 0 && snapshot.viewer.state == ViewerState::Downloading {
+                        snapshot.viewer.received_bytes = received;
+                        snapshot.viewer.total_bytes = total;
                     }
                 })
                 .await;
@@ -3657,13 +4464,16 @@ fn timeline_discovery(
         if let Some(sticker) = event.content().as_sticker() {
             let content = sticker.content();
             let source: MediaSource = content.source.clone().into();
+            let encoded_source = encode_media_source(&source)?;
             return Ok(Some(AttachmentDiscovery {
                 room_id: room_id.to_owned(),
                 event_id: event_id.to_owned(),
                 origin_server_timestamp: timestamp,
                 source_kind: MediaSourceKind::Matrix,
                 direct_url: None,
-                mxc_url: encode_media_source(&source)?,
+                mxc_url: encoded_source.clone(),
+                thumbnail_source_url: Some(encoded_source),
+                thumbnail_cached_path: None,
                 original_filename: Some(content.body.clone()),
                 mime_type: content.info.mimetype.clone(),
                 category: MediaCategory::Images,
@@ -3680,6 +4490,8 @@ fn timeline_discovery(
             source_kind: MediaSourceKind::Matrix,
             direct_url: None,
             mxc_url: encode_media_source(&content.source)?,
+            thumbnail_source_url: Some(encode_media_source(&content.source)?),
+            thumbnail_cached_path: None,
             original_filename: content
                 .filename
                 .clone()
@@ -3694,6 +4506,13 @@ fn timeline_discovery(
             source_kind: MediaSourceKind::Matrix,
             direct_url: None,
             mxc_url: encode_media_source(&content.source)?,
+            thumbnail_source_url: content
+                .info
+                .as_ref()
+                .and_then(|info| info.thumbnail_source.as_ref())
+                .map(encode_media_source)
+                .transpose()?,
+            thumbnail_cached_path: None,
             original_filename: content
                 .filename
                 .clone()
@@ -3708,6 +4527,8 @@ fn timeline_discovery(
             source_kind: MediaSourceKind::Matrix,
             direct_url: None,
             mxc_url: encode_media_source(&content.source)?,
+            thumbnail_source_url: None,
+            thumbnail_cached_path: None,
             original_filename: content
                 .filename
                 .clone()
@@ -3722,6 +4543,13 @@ fn timeline_discovery(
             source_kind: MediaSourceKind::Matrix,
             direct_url: None,
             mxc_url: encode_media_source(&content.source)?,
+            thumbnail_source_url: content
+                .info
+                .as_ref()
+                .and_then(|info| info.thumbnail_source.as_ref())
+                .map(encode_media_source)
+                .transpose()?,
+            thumbnail_cached_path: None,
             original_filename: content
                 .filename
                 .clone()

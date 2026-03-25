@@ -158,6 +158,39 @@ bool columnExists(const QSqlDatabase &database, const QString &tableName, const 
     }
     return false;
 }
+
+QString normalizedText(const QString &value)
+{
+    return value.isNull() ? QStringLiteral("") : value;
+}
+
+AttachmentDiscovery readDiscoveryRecord(const QSqlQuery &query)
+{
+    AttachmentDiscovery discovery;
+    discovery.roomId = query.value(0).toString();
+    discovery.eventId = query.value(1).toString();
+    discovery.originServerTimestamp = QDateTime::fromString(query.value(2).toString(), Qt::ISODateWithMs);
+    discovery.sourceKind = parseMediaSourceKind(query.value(3).toString());
+    discovery.directUrl = query.value(4).toString();
+    discovery.mxcUrl = query.value(5).toString();
+    discovery.thumbnailSourceUrl = query.value(6).toString();
+    discovery.thumbnailCachedPath = query.value(7).toString();
+    discovery.originalFilename = query.value(8).toString();
+    discovery.mimeType = query.value(9).toString();
+    discovery.category = parseMediaCategory(query.value(10).toString());
+    return discovery;
+}
+
+ActivityLogEntry readActivityLogEntry(const QSqlQuery &query)
+{
+    ActivityLogEntry entry;
+    entry.id = query.value(0).toLongLong();
+    entry.createdAt = QDateTime::fromString(query.value(1).toString(), Qt::ISODateWithMs);
+    entry.level = parseLogLevel(query.value(2).toString());
+    entry.subsystem = query.value(3).toString();
+    entry.message = query.value(4).toString();
+    return entry;
+}
 }
 
 AppDatabase::AppDatabase(const QString &databasePath)
@@ -165,7 +198,10 @@ AppDatabase::AppDatabase(const QString &databasePath)
     database_ = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName());
     database_.setConnectOptions(QStringLiteral("QSQLITE_BUSY_TIMEOUT=5000"));
     database_.setDatabaseName(databasePath);
-    database_.open();
+    if (!database_.open()) {
+        lastErrorText_ = database_.lastError().text();
+        return;
+    }
     execute(QStringLiteral("PRAGMA journal_mode = WAL"));
     execute(QStringLiteral("PRAGMA synchronous = NORMAL"));
     execute(QStringLiteral("PRAGMA foreign_keys = ON"));
@@ -183,13 +219,16 @@ AppSettings AppDatabase::loadSettings(const QString &defaultDestinationRootPath)
 {
     QSqlQuery query(database_);
     query.prepare(QStringLiteral("SELECT * FROM app_settings ORDER BY id DESC LIMIT 1"));
-    if (query.exec() && query.next()) {
+    if (!query.exec()) {
+        lastErrorText_ = query.lastError().text();
+    } else if (query.next()) {
         AppSettings settings;
         settings.homeserverUrl = query.value(QStringLiteral("homeserver_url")).toString();
         settings.username = query.value(QStringLiteral("username")).toString();
         settings.ownerUserId.clear();
         settings.destinationRootPath = query.value(QStringLiteral("destination_root_path")).toString();
         settings.libraryRootPath = query.value(QStringLiteral("library_root_path")).toString();
+        settings.flatFolderLayout = query.value(QStringLiteral("flat_folder_layout")).toBool();
         settings.archiveRootPath = query.value(QStringLiteral("archive_root_path")).toString();
         settings.archiveScanEnabled = query.value(QStringLiteral("archive_scan_enabled")).toBool();
         settings.archiveScanHighPriority = query.value(QStringLiteral("archive_scan_high_priority")).toBool();
@@ -217,39 +256,51 @@ AppSettings AppDatabase::loadSettings(const QString &defaultDestinationRootPath)
         settings.autoJoinSpaceRooms = query.value(QStringLiteral("auto_join_space_rooms")).toBool();
         settings.autoDownloadNewMedia = query.value(QStringLiteral("auto_download_new_media")).toBool();
         settings.desiredPowerState = query.value(QStringLiteral("desired_power_state")).toBool();
+        lastErrorText_.clear();
         return settings;
     }
 
     const AppSettings defaults = AppSettings::defaults(defaultDestinationRootPath);
-    saveSettings(defaults);
+    if (saveSettings(defaults)) {
+        lastErrorText_.clear();
+    }
     return defaults;
 }
 
 bool AppDatabase::saveSettings(const AppSettings &settings)
 {
     AppSettings sanitizedSettings = settings;
-    sanitizedSettings.ownerUserId.clear();
+    sanitizedSettings.homeserverUrl = normalizedText(sanitizedSettings.homeserverUrl);
+    sanitizedSettings.username = normalizedText(sanitizedSettings.username);
+    sanitizedSettings.ownerUserId = normalizedText(sanitizedSettings.ownerUserId);
+    sanitizedSettings.destinationRootPath = normalizedText(sanitizedSettings.destinationRootPath);
+    sanitizedSettings.libraryRootPath = normalizedText(sanitizedSettings.libraryRootPath);
+    sanitizedSettings.archiveRootPath = normalizedText(sanitizedSettings.archiveRootPath);
+    sanitizedSettings.manualDownloadRootPath = normalizedText(sanitizedSettings.manualDownloadRootPath);
+    sanitizedSettings.primaryGatewayUrl = normalizedText(sanitizedSettings.primaryGatewayUrl);
 
     QSqlQuery deleteQuery(database_);
     if (!deleteQuery.exec(QStringLiteral("DELETE FROM app_settings"))) {
+        lastErrorText_ = deleteQuery.lastError().text();
         return false;
     }
 
     QSqlQuery query(database_);
     query.prepare(QStringLiteral(
         "INSERT INTO app_settings ("
-        "homeserver_url, username, owner_user_id, destination_root_path, library_root_path, archive_root_path, archive_scan_enabled, archive_scan_high_priority, manual_download_root_path, "
+        "homeserver_url, username, owner_user_id, destination_root_path, library_root_path, flat_folder_layout, archive_root_path, archive_scan_enabled, archive_scan_high_priority, manual_download_root_path, "
         "message_limit, time_window_value, time_window_unit, "
         "retry_cooldown_minutes, retry_limit, download_worker_count, "
         "failed_job_retention_value, failed_job_retention_unit, primary_gateway_url, preferred_gateway_urls, "
         "autostart_enabled, minimize_to_tray, start_hidden, bandwidth_limit_kib_per_sec, preview_worker_count, "
         "auto_join_space_rooms, auto_download_new_media, desired_power_state, updated_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
     query.addBindValue(sanitizedSettings.homeserverUrl);
     query.addBindValue(sanitizedSettings.username);
     query.addBindValue(sanitizedSettings.ownerUserId);
     query.addBindValue(sanitizedSettings.destinationRootPath);
     query.addBindValue(sanitizedSettings.libraryRootPath);
+    query.addBindValue(sanitizedSettings.flatFolderLayout ? 1 : 0);
     query.addBindValue(sanitizedSettings.archiveRootPath);
     query.addBindValue(sanitizedSettings.archiveScanEnabled ? 1 : 0);
     query.addBindValue(sanitizedSettings.archiveScanHighPriority ? 1 : 0);
@@ -273,7 +324,18 @@ bool AppDatabase::saveSettings(const AppSettings &settings)
     query.addBindValue(sanitizedSettings.autoDownloadNewMedia ? 1 : 0);
     query.addBindValue(sanitizedSettings.desiredPowerState ? 1 : 0);
     query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
-    return query.exec();
+    if (!query.exec()) {
+        lastErrorText_ = query.lastError().text();
+        return false;
+    }
+
+    lastErrorText_.clear();
+    return true;
+}
+
+QString AppDatabase::lastErrorText() const
+{
+    return lastErrorText_;
 }
 
 UpdateCheckState AppDatabase::loadUpdateCheckState() const
@@ -325,7 +387,8 @@ QVector<RoomRecord> AppDatabase::fetchRooms() const
     QVector<RoomRecord> rooms;
     QSqlQuery query(database_);
     query.prepare(QStringLiteral(
-        "SELECT room_id, display_name, canonical_alias, active_folder_label, is_space, membership, updated_at "
+        "SELECT room_id, display_name, canonical_alias, active_folder_label, is_space, membership, updated_at, "
+        "COALESCE((SELECT COUNT(*) FROM discovered_attachments WHERE room_id = rooms.room_id), 0) "
         "FROM rooms "
         "ORDER BY COALESCE(display_name, canonical_alias, room_id) COLLATE NOCASE ASC"));
 
@@ -342,6 +405,7 @@ QVector<RoomRecord> AppDatabase::fetchRooms() const
         room.isSpace = query.value(4).toBool();
         room.membership = query.value(5).toString();
         room.updatedAt = QDateTime::fromString(query.value(6).toString(), Qt::ISODateWithMs);
+        room.discoveredMediaCount = query.value(7).toInt();
         rooms.append(room);
     }
 
@@ -350,32 +414,61 @@ QVector<RoomRecord> AppDatabase::fetchRooms() const
 
 QVector<AttachmentDiscovery> AppDatabase::fetchDiscoveries() const
 {
+    return fetchDiscoveriesPage(QString(), 0, 500);
+}
+
+QVector<AttachmentDiscovery> AppDatabase::fetchDiscoveriesPage(const QString &roomId, const int offset, const int limit) const
+{
     QVector<AttachmentDiscovery> discoveries;
+    const int safeOffset = qMax(0, offset);
+    const int safeLimit = qBound(1, limit, 500);
+
     QSqlQuery query(database_);
-    query.prepare(QStringLiteral(
-        "SELECT room_id, event_id, origin_ts, source_kind, direct_url, mxc_url, original_filename, mime_type, category "
-        "FROM discovered_attachments "
-        "ORDER BY origin_ts DESC"));
+    if (roomId.trimmed().isEmpty()) {
+        query.prepare(QStringLiteral(
+            "SELECT room_id, event_id, origin_ts, source_kind, direct_url, mxc_url, thumbnail_source_url, thumbnail_cached_path, original_filename, mime_type, category "
+            "FROM discovered_attachments "
+            "ORDER BY origin_ts DESC, id DESC "
+            "LIMIT ? OFFSET ?"));
+        query.addBindValue(safeLimit);
+        query.addBindValue(safeOffset);
+    } else {
+        query.prepare(QStringLiteral(
+            "SELECT room_id, event_id, origin_ts, source_kind, direct_url, mxc_url, thumbnail_source_url, thumbnail_cached_path, original_filename, mime_type, category "
+            "FROM discovered_attachments "
+            "WHERE room_id = ? "
+            "ORDER BY origin_ts DESC, id DESC "
+            "LIMIT ? OFFSET ?"));
+        query.addBindValue(roomId);
+        query.addBindValue(safeLimit);
+        query.addBindValue(safeOffset);
+    }
 
     if (!query.exec()) {
         return discoveries;
     }
 
     while (query.next()) {
-        AttachmentDiscovery discovery;
-        discovery.roomId = query.value(0).toString();
-        discovery.eventId = query.value(1).toString();
-        discovery.originServerTimestamp = QDateTime::fromString(query.value(2).toString(), Qt::ISODateWithMs);
-        discovery.sourceKind = parseMediaSourceKind(query.value(3).toString());
-        discovery.directUrl = query.value(4).toString();
-        discovery.mxcUrl = query.value(5).toString();
-        discovery.originalFilename = query.value(6).toString();
-        discovery.mimeType = query.value(7).toString();
-        discovery.category = parseMediaCategory(query.value(8).toString());
-        discoveries.append(discovery);
+        discoveries.append(readDiscoveryRecord(query));
     }
 
     return discoveries;
+}
+
+int AppDatabase::fetchDiscoveryCount(const QString &roomId) const
+{
+    QSqlQuery query(database_);
+    if (roomId.trimmed().isEmpty()) {
+        query.prepare(QStringLiteral("SELECT COUNT(*) FROM discovered_attachments"));
+    } else {
+        query.prepare(QStringLiteral("SELECT COUNT(*) FROM discovered_attachments WHERE room_id = ?"));
+        query.addBindValue(roomId);
+    }
+
+    if (!query.exec() || !query.next()) {
+        return 0;
+    }
+    return query.value(0).toInt();
 }
 
 QVector<DownloadJobRecord> AppDatabase::fetchJobs() const
@@ -432,27 +525,57 @@ QVector<DownloadJobRecord> AppDatabase::fetchJobs() const
 
 QVector<ActivityLogEntry> AppDatabase::fetchRecentLogs(const int limit) const
 {
+    return fetchLogsPage(0, limit, false);
+}
+
+QVector<ActivityLogEntry> AppDatabase::fetchLogsPage(const int offset, const int limit, const bool problemsOnly) const
+{
     QVector<ActivityLogEntry> logs;
+    const int safeOffset = qMax(0, offset);
+    const int safeLimit = qBound(1, limit, 500);
+
     QSqlQuery query(database_);
-    query.prepare(QStringLiteral(
-        "SELECT id, created_at, level, subsystem, message "
-        "FROM activity_log ORDER BY id DESC LIMIT ?"));
-    query.addBindValue(limit);
+    if (problemsOnly) {
+        query.prepare(QStringLiteral(
+            "SELECT id, created_at, level, subsystem, message "
+            "FROM activity_log "
+            "WHERE level IN ('warning', 'error') "
+            "ORDER BY id DESC "
+            "LIMIT ? OFFSET ?"));
+    } else {
+        query.prepare(QStringLiteral(
+            "SELECT id, created_at, level, subsystem, message "
+            "FROM activity_log "
+            "ORDER BY id DESC "
+            "LIMIT ? OFFSET ?"));
+    }
+    query.addBindValue(safeLimit);
+    query.addBindValue(safeOffset);
     if (!query.exec()) {
         return logs;
     }
 
     while (query.next()) {
-        ActivityLogEntry entry;
-        entry.id = query.value(0).toLongLong();
-        entry.createdAt = QDateTime::fromString(query.value(1).toString(), Qt::ISODateWithMs);
-        entry.level = parseLogLevel(query.value(2).toString());
-        entry.subsystem = query.value(3).toString();
-        entry.message = query.value(4).toString();
-        logs.prepend(entry);
+        logs.append(readActivityLogEntry(query));
     }
 
     return logs;
+}
+
+int AppDatabase::fetchLogCount(const bool problemsOnly) const
+{
+    QSqlQuery query(database_);
+    if (problemsOnly) {
+        query.prepare(QStringLiteral(
+            "SELECT COUNT(*) FROM activity_log WHERE level IN ('warning', 'error')"));
+    } else {
+        query.prepare(QStringLiteral("SELECT COUNT(*) FROM activity_log"));
+    }
+
+    if (!query.exec() || !query.next()) {
+        return 0;
+    }
+    return query.value(0).toInt();
 }
 
 QStringList AppDatabase::aliasHistory(const QString &roomId) const
@@ -602,6 +725,7 @@ void AppDatabase::initializeSchema()
         "owner_user_id TEXT NOT NULL,"
         "destination_root_path TEXT NOT NULL,"
         "library_root_path TEXT NOT NULL DEFAULT '',"
+        "flat_folder_layout INTEGER NOT NULL DEFAULT 0,"
         "archive_root_path TEXT NOT NULL DEFAULT '',"
         "archive_scan_enabled INTEGER NOT NULL DEFAULT 0,"
         "archive_scan_high_priority INTEGER NOT NULL DEFAULT 0,"
@@ -669,6 +793,8 @@ void AppDatabase::initializeSchema()
         "source_kind TEXT NOT NULL DEFAULT 'matrix',"
         "direct_url TEXT,"
         "mxc_url TEXT NOT NULL,"
+        "thumbnail_source_url TEXT,"
+        "thumbnail_cached_path TEXT,"
         "original_filename TEXT,"
         "mime_type TEXT,"
         "category TEXT NOT NULL,"
@@ -681,6 +807,24 @@ void AppDatabase::initializeSchema()
     if (!columnExists(database_, QStringLiteral("discovered_attachments"), QStringLiteral("direct_url"))) {
         execute(QStringLiteral(
             "ALTER TABLE discovered_attachments ADD COLUMN direct_url TEXT"));
+    }
+    if (!columnExists(database_, QStringLiteral("discovered_attachments"), QStringLiteral("thumbnail_source_url"))) {
+        execute(QStringLiteral(
+            "ALTER TABLE discovered_attachments ADD COLUMN thumbnail_source_url TEXT"));
+    }
+    if (!columnExists(database_, QStringLiteral("discovered_attachments"), QStringLiteral("thumbnail_cached_path"))) {
+        execute(QStringLiteral(
+            "ALTER TABLE discovered_attachments ADD COLUMN thumbnail_cached_path TEXT"));
+    }
+    execute(QStringLiteral(
+        "CREATE INDEX IF NOT EXISTS idx_discovered_attachments_room_origin "
+        "ON discovered_attachments(room_id, origin_ts DESC, id DESC)"));
+    execute(QStringLiteral(
+        "CREATE INDEX IF NOT EXISTS idx_discovered_attachments_origin "
+        "ON discovered_attachments(origin_ts DESC, id DESC)"));
+    if (!columnExists(database_, QStringLiteral("app_settings"), QStringLiteral("flat_folder_layout"))) {
+        execute(QStringLiteral(
+            "ALTER TABLE app_settings ADD COLUMN flat_folder_layout INTEGER NOT NULL DEFAULT 0"));
     }
 
     execute(QStringLiteral(
@@ -715,6 +859,9 @@ void AppDatabase::initializeSchema()
         "subsystem TEXT NOT NULL,"
         "message TEXT NOT NULL"
         ")"));
+    execute(QStringLiteral(
+        "CREATE INDEX IF NOT EXISTS idx_activity_log_level_id "
+        "ON activity_log(level, id DESC)"));
 
     execute(QStringLiteral(
         "CREATE TABLE IF NOT EXISTS update_check_state ("

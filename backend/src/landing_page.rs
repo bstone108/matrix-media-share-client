@@ -21,11 +21,19 @@ pub fn render_landing_page(
 
     let alternate_links = alternates
         .iter()
-        .map(|(label, gateway_url, supports_html)| {
+        .enumerate()
+        .map(|(index, (label, gateway_url, supports_html))| {
             let note = if *supports_html { "" } else { " <span>(file only)</span>" };
+            let href = if *supports_html {
+                "#".to_owned()
+            } else {
+                raw_file_url(gateway_url, file_cid)
+            };
             format!(
-                "<li><a href=\"{}\">{} via {}</a>{}</li>",
-                raw_file_url(gateway_url, file_cid),
+                "<li><a id=\"gateway-link-{index}\" data-gateway=\"{}\" data-supports-html=\"{}\" href=\"{}\">{} via {}</a>{}</li>",
+                escape_html(gateway_url),
+                if *supports_html { "1" } else { "0" },
+                href,
                 escaped_title,
                 escape_html(label),
                 note
@@ -100,12 +108,27 @@ pub fn render_landing_page(
     <ul>{alternate_links}</ul>
     <div class=\"warning\">If a gateway is slow or unavailable, try another one. Gateways labeled <strong>file only</strong> are fallback download links rather than preferred HTML landing-page hosts.</div>
   </main>
+  <script>
+    (function() {{
+      const currentPath = window.location.pathname + window.location.search;
+      const fileCid = {file_cid:?};
+      document.querySelectorAll('a[data-gateway]').forEach(function(link) {{
+        const gateway = (link.getAttribute('data-gateway') || '').replace(/\\/+$/, '');
+        if (!gateway) {{
+          return;
+        }}
+        const supportsHtml = link.getAttribute('data-supports-html') === '1';
+        link.href = supportsHtml ? (gateway + currentPath) : (gateway + '/ipfs/' + fileCid);
+      }});
+    }})();
+  </script>
 </body>
 </html>",
         title = escaped_title,
         thumbnail = thumbnail_html,
         primary_download = primary_download,
-        alternate_links = alternate_links
+        alternate_links = alternate_links,
+        file_cid = file_cid,
     )
 }
 
@@ -133,7 +156,8 @@ mod tests {
         );
 
         assert!(html.contains("https://dweb.link/ipfs/bafyfile"));
-        assert!(html.contains("https://ipfs.io/ipfs/bafyfile"));
+        assert!(html.contains("window.location.pathname"));
+        assert!(html.contains("data-gateway=\"https://ipfs.io\""));
         assert!(html.contains("file only"));
     }
 }

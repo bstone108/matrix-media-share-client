@@ -4,12 +4,16 @@
 
 #include <QAbstractItemView>
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QDir>
 #include <QDesktopServices>
+#include <QDialog>
 #include <QDragEnterEvent>
 #include <QDropEvent>
+#include <QEvent>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QGuiApplication>
 #include <QGridLayout>
@@ -19,27 +23,54 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QListView>
 #include <QLocale>
-#include <QMessageBox>
 #include <QMimeData>
+#include <QAudioOutput>
+#include <QMediaPlayer>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QPainter>
+#include <QPainterPath>
 #include <QPlainTextEdit>
+#include <QPixmap>
 #include <QPushButton>
+#include <QProgressBar>
 #include <QResizeEvent>
+#include <QScrollBar>
 #include <QScrollArea>
 #include <QScreen>
+#include <QSignalBlocker>
 #include <QShowEvent>
 #include <QSizePolicy>
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QTableWidget>
 #include <QTextEdit>
+#include <QTimer>
 #include <QUrl>
+#include <QUrlQuery>
 #include <QVBoxLayout>
+#include <QVideoWidget>
 #include <QWindow>
 
 class QMoveEvent;
 
 namespace {
+
+constexpr int kDiscoveryTileWidth = 236;
+constexpr int kDiscoveryTileHeight = 188;
+constexpr int kDiscoveryGridWidth = 248;
+constexpr int kDiscoveryGridHeight = 236;
+constexpr int kBrowserPageSize = 60;
+constexpr int kBrowserBufferedPages = 2;
+constexpr int kBrowserMaxWindowPages = 5;
+constexpr int kBrowserThumbnailCacheLimit = 160;
+constexpr int kBrowserBackgroundThumbnailBatchSize = 10;
+constexpr int kLogsPageSize = 200;
+constexpr int kLogsBufferedPages = 2;
+constexpr int kLogsMaxWindowPages = 5;
 
 QString jobTitle(const DownloadJobRecord &job)
 {
@@ -74,6 +105,244 @@ QString displayDateTime(const QDateTime &timestamp)
     return QLocale().toString(timestamp.toLocalTime(), QLocale::ShortFormat);
 }
 
+QColor categoryAccent(const MediaCategory category)
+{
+    switch (category) {
+    case MediaCategory::Images:
+        return QColor(QStringLiteral("#0ea5e9"));
+    case MediaCategory::Videos:
+        return QColor(QStringLiteral("#f97316"));
+    case MediaCategory::Audio:
+        return QColor(QStringLiteral("#10b981"));
+    case MediaCategory::Documents:
+        return QColor(QStringLiteral("#6366f1"));
+    case MediaCategory::Archives:
+        return QColor(QStringLiteral("#eab308"));
+    case MediaCategory::Programs:
+        return QColor(QStringLiteral("#ef4444"));
+    case MediaCategory::Other:
+        break;
+    }
+    return QColor(QStringLiteral("#64748b"));
+}
+
+QString elidedTileText(const QString &value, const int maxLength)
+{
+    const QString trimmed = value.trimmed();
+    if (trimmed.size() <= maxLength) {
+        return trimmed;
+    }
+    return trimmed.left(maxLength - 1) + QChar(0x2026);
+}
+
+QString dataSizeText(const qint64 bytes)
+{
+    if (bytes < 0) {
+        return QStringLiteral("Unknown");
+    }
+    return QLocale().formattedDataSize(bytes);
+}
+
+QPixmap renderDiscoveryTile(
+    const QSize &size,
+    const QString &headline,
+    const QString &subline,
+    const QColor &accent,
+    const QPixmap *preview,
+    const bool isVideo,
+    const double progressFraction = -1.0,
+    const QString &progressText = QString())
+{
+    QPixmap canvas(size);
+    canvas.fill(Qt::transparent);
+
+    QPainter painter(&canvas);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+
+    const QRect bounds = canvas.rect().adjusted(3, 3, -3, -3);
+    QPainterPath clipPath;
+    clipPath.addRoundedRect(bounds, 20, 20);
+    painter.setClipPath(clipPath);
+
+    if (preview != nullptr && !preview->isNull()) {
+        const QPixmap scaled = preview->scaled(bounds.size(), Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+        painter.drawPixmap(bounds, scaled, scaled.rect());
+        painter.fillRect(bounds, QColor(0, 0, 0, isVideo ? 28 : 18));
+    } else {
+        QLinearGradient gradient(bounds.topLeft(), bounds.bottomRight());
+        gradient.setColorAt(0.0, accent.lighter(145));
+        gradient.setColorAt(1.0, QColor(QStringLiteral("#111827")));
+        painter.fillRect(bounds, gradient);
+    }
+
+    QLinearGradient topShade(bounds.topLeft(), QPoint(bounds.left(), bounds.top() + qMin(bounds.height() / 3, 72)));
+    topShade.setColorAt(0.0, QColor(0, 0, 0, 120));
+    topShade.setColorAt(1.0, QColor(0, 0, 0, 0));
+    painter.fillRect(bounds, topShade);
+
+    if (isVideo) {
+        const int playSize = qMin(bounds.width(), bounds.height()) / 4;
+        const QPoint center = bounds.center();
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(15, 23, 42, 120));
+        painter.drawEllipse(center, playSize / 2 + 10, playSize / 2 + 10);
+        QPainterPath triangle;
+        triangle.moveTo(center.x() - playSize / 3, center.y() - playSize / 2);
+        triangle.lineTo(center.x() - playSize / 3, center.y() + playSize / 2);
+        triangle.lineTo(center.x() + playSize / 2, center.y());
+        triangle.closeSubpath();
+        painter.setBrush(QColor(255, 255, 255, 210));
+        painter.drawPath(triangle);
+    }
+
+    if (progressFraction >= 0.0) {
+        const QRect progressBounds(bounds.left() + 16, bounds.bottom() - 24, bounds.width() - 32, 10);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(15, 23, 42, 180));
+        painter.drawRoundedRect(progressBounds, 5, 5);
+        QRect fillBounds = progressBounds;
+        fillBounds.setWidth(qMax(8, static_cast<int>(progressBounds.width() * qBound(0.0, progressFraction, 1.0))));
+        painter.setBrush(accent);
+        painter.drawRoundedRect(fillBounds, 5, 5);
+
+        if (!progressText.trimmed().isEmpty()) {
+            QFont progressFont = painter.font();
+            progressFont.setBold(true);
+            progressFont.setPointSizeF(progressFont.pointSizeF() - 1.0);
+            painter.setFont(progressFont);
+            painter.setPen(QColor(QStringLiteral("#f8fafc")));
+            painter.drawText(bounds.adjusted(16, 16, -16, -36), Qt::AlignLeft | Qt::AlignBottom, progressText);
+        }
+    } else if (!subline.trimmed().isEmpty()) {
+        QFont sublineFont = painter.font();
+        sublineFont.setBold(true);
+        sublineFont.setPointSizeF(sublineFont.pointSizeF() - 1.0);
+        painter.setFont(sublineFont);
+        painter.setPen(QColor(QStringLiteral("#f8fafc")));
+        painter.drawText(bounds.adjusted(16, 16, -16, -20), Qt::AlignLeft | Qt::AlignBottom, subline.toUpper());
+    }
+
+    painter.setClipping(false);
+    painter.setBrush(Qt::NoBrush);
+    painter.setPen(QPen(QColor(255, 255, 255, 48), 1.0));
+    painter.drawRoundedRect(bounds, 20, 20);
+
+    if (preview == nullptr || preview->isNull()) {
+        QFont titleFont = painter.font();
+        titleFont.setBold(true);
+        titleFont.setPointSizeF(titleFont.pointSizeF() + 1.0);
+        painter.setFont(titleFont);
+        painter.setPen(QColor(QStringLiteral("#f8fafc")));
+        painter.drawText(
+            bounds.adjusted(16, 24, -16, -24),
+            Qt::AlignHCenter | Qt::AlignVCenter | Qt::TextWordWrap,
+            elidedTileText(headline, 40));
+    }
+
+    return canvas;
+}
+
+QIcon overlayDiscoveryStatusIcon(
+    const QIcon &baseIcon,
+    const QSize &size,
+    const QColor &accent,
+    const double progressFraction,
+    const QString &statusText)
+{
+    if (baseIcon.isNull()) {
+        return baseIcon;
+    }
+
+    QPixmap canvas = baseIcon.pixmap(size);
+    if (canvas.isNull()) {
+        return baseIcon;
+    }
+
+    QPainter painter(&canvas);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+    const QRect bounds = canvas.rect().adjusted(3, 3, -3, -3);
+
+    if (progressFraction >= 0.0) {
+        const QRect progressBounds(bounds.left() + 16, bounds.bottom() - 24, bounds.width() - 32, 10);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(15, 23, 42, 180));
+        painter.drawRoundedRect(progressBounds, 5, 5);
+        QRect fillBounds = progressBounds;
+        fillBounds.setWidth(qMax(8, static_cast<int>(progressBounds.width() * qBound(0.0, progressFraction, 1.0))));
+        painter.setBrush(accent);
+        painter.drawRoundedRect(fillBounds, 5, 5);
+    }
+
+    if (!statusText.trimmed().isEmpty()) {
+        QFont statusFont = painter.font();
+        statusFont.setBold(true);
+        statusFont.setPointSizeF(statusFont.pointSizeF() - 1.0);
+        painter.setFont(statusFont);
+
+        const QString status = statusText.trimmed();
+        const QRect statusRect = bounds.adjusted(14, bounds.height() - 52, -14, -30);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(15, 23, 42, 180));
+        painter.drawRoundedRect(statusRect, 10, 10);
+        painter.setPen(QColor(QStringLiteral("#f8fafc")));
+        painter.drawText(statusRect.adjusted(10, 0, -10, 0), Qt::AlignLeft | Qt::AlignVCenter, status);
+    }
+
+    return QIcon(canvas);
+}
+
+bool parseMxcUrl(const QString &value, QString &serverName, QString &mediaId)
+{
+    if (!value.startsWith(QStringLiteral("mxc://"))) {
+        return false;
+    }
+    const QString trimmed = value.mid(6);
+    const int slashIndex = trimmed.indexOf(QLatin1Char('/'));
+    if (slashIndex <= 0 || slashIndex == trimmed.size() - 1) {
+        return false;
+    }
+    serverName = trimmed.left(slashIndex);
+    mediaId = trimmed.mid(slashIndex + 1);
+    return !serverName.isEmpty() && !mediaId.isEmpty();
+}
+
+QString matrixThumbnailUrl(const QString &homeserverUrl, const QString &mxcUrl, const int size)
+{
+    QString serverName;
+    QString mediaId;
+    if (!parseMxcUrl(mxcUrl, serverName, mediaId)) {
+        return {};
+    }
+
+    QUrl base(homeserverUrl);
+    if (!base.isValid()) {
+        return {};
+    }
+
+    QString path = base.path();
+    if (!path.endsWith(QLatin1Char('/'))) {
+        path.append(QLatin1Char('/'));
+    }
+    path += QStringLiteral("_matrix/media/v3/thumbnail/%1/%2")
+                .arg(QString::fromUtf8(QUrl::toPercentEncoding(serverName)),
+                     QString::fromUtf8(QUrl::toPercentEncoding(mediaId)));
+    base.setPath(path);
+
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("width"), QString::number(size));
+    query.addQueryItem(QStringLiteral("height"), QString::number(size));
+    query.addQueryItem(QStringLiteral("method"), QStringLiteral("scale"));
+    base.setQuery(query);
+    return base.toString();
+}
+
+bool sectionUsesRoomSidebar(const AppSection section)
+{
+    return section == AppSection::Browser || section == AppSection::Rooms;
+}
+
 }
 
 MainWindow::MainWindow(AppController *controller, QWidget *parent)
@@ -83,32 +352,106 @@ MainWindow::MainWindow(AppController *controller, QWidget *parent)
     setWindowTitle(QStringLiteral("Matrix Media Share Client"));
     resize(1380, 860);
     setAcceptDrops(true);
+    thumbnailNetworkManager_ = new QNetworkAccessManager(this);
 
     auto *central = new QWidget(this);
     auto *layout = new QHBoxLayout(central);
 
-    sectionList_ = new QListWidget(central);
-    sectionList_->setFixedWidth(220);
-    stack_ = new QStackedWidget(central);
+    roomSidebarContainer_ = new QWidget(central);
+    roomSidebarContainer_->setFixedWidth(280);
+    auto *roomSidebarLayout = new QVBoxLayout(roomSidebarContainer_);
+    roomSidebarTitleLabel_ = new QLabel(QStringLiteral("Rooms"), roomSidebarContainer_);
+    roomsList_ = new QListWidget(roomSidebarContainer_);
+    roomsList_->setSelectionMode(QAbstractItemView::SingleSelection);
+    roomSidebarLayout->addWidget(roomSidebarTitleLabel_);
+    roomSidebarLayout->addWidget(roomsList_, 1);
 
-    populateSectionSidebar();
-    stack_->addWidget(buildRoomsPage());
+    auto *contentContainer = new QWidget(central);
+    auto *contentLayout = new QVBoxLayout(contentContainer);
+    auto *navigationRow = new QHBoxLayout();
+    auto *navigationLabel = new QLabel(QStringLiteral("Page"), contentContainer);
+    sectionCombo_ = new QComboBox(contentContainer);
+    sectionCombo_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    sectionCombo_->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
+    sectionCombo_->setMinimumContentsLength(0);
+    navigationLabel->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    navigationRow->addStretch();
+    navigationRow->addWidget(navigationLabel);
+    navigationRow->addWidget(sectionCombo_);
+
+    stack_ = new QStackedWidget(contentContainer);
+
+    populateSectionNavigation();
     stack_->addWidget(buildBrowserPage());
+    stack_->addWidget(buildRoomsPage());
     stack_->addWidget(buildLibraryPage());
     stack_->addWidget(buildTransfersPage());
+    stack_->addWidget(buildLogsPage());
     stack_->addWidget(buildSettingsPage());
     stack_->addWidget(buildVerificationPage());
 
-    layout->addWidget(sectionList_);
-    layout->addWidget(stack_, 1);
+    contentLayout->addLayout(navigationRow);
+    contentLayout->addWidget(stack_, 1);
+
+    layout->addWidget(roomSidebarContainer_);
+    layout->addWidget(contentContainer, 1);
     setCentralWidget(central);
 
-    connect(sectionList_, &QListWidget::currentRowChanged, stack_, &QStackedWidget::setCurrentIndex);
+    connect(sectionCombo_, &QComboBox::currentIndexChanged, this, [this](const int index) {
+        const AppSection previousSection = currentSection();
+        if (stack_ != nullptr) {
+            stack_->setCurrentIndex(index);
+        }
+        const AppSection nextSection = currentSection();
+        if (previousSection == AppSection::Browser && nextSection != AppSection::Browser) {
+            resetBrowserPageState();
+        }
+        if (previousSection == AppSection::Logs && nextSection != AppSection::Logs) {
+            resetLogsPageState();
+        }
+        updateRoomSidebarVisibility();
+        refreshView();
+        if (currentSectionUsesRoomSidebar()) {
+            const QString roomId = selectedRoomId();
+            if (!roomId.isEmpty()) {
+                controller_->focusRoom(roomId);
+            }
+        }
+    });
+    connect(roomsList_, &QListWidget::currentRowChanged, this, [this]() {
+        const QString roomId = selectedRoomId();
+        if (currentSection() == AppSection::Browser) {
+            browserSelectedRoomId_ = roomId;
+        } else if (currentSection() == AppSection::Rooms) {
+            roomsPageSelectedRoomId_ = roomId;
+        }
+        populateRoomsPage();
+        populateBrowserPage();
+        if (!roomId.isEmpty()) {
+            controller_->focusRoom(roomId);
+        }
+    });
     connect(controller_, &AppController::stateChanged, this, &MainWindow::refreshView);
 
     constrainToAvailableGeometry();
-    sectionList_->setCurrentRow(0);
+    sectionCombo_->setCurrentIndex(sectionIndex(AppSection::Browser));
+    updateRoomSidebarVisibility();
     refreshView();
+    if (currentSectionUsesRoomSidebar()) {
+        const QString roomId = selectedRoomId();
+        if (!roomId.isEmpty()) {
+            controller_->focusRoom(roomId);
+        }
+    }
+}
+
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+    if (event != nullptr && settingsPageInitialized_ && settingsDirty_ && !saveSettingsFromUi(true)) {
+        event->ignore();
+        return;
+    }
+    QMainWindow::closeEvent(event);
 }
 
 void MainWindow::showEvent(QShowEvent *event)
@@ -195,25 +538,49 @@ void MainWindow::constrainToAvailableGeometry()
 
 void MainWindow::refreshView()
 {
-    populateRoomsPage();
-    populateBrowserPage();
-    populateLibraryPage();
-    populateTransfersPage();
-    populateSettingsPage();
-    populateVerificationPage();
+    refreshViewerDialog();
+
+    if (currentSectionUsesRoomSidebar()) {
+        populateRoomSidebar();
+    }
+
+    switch (currentSection()) {
+    case AppSection::Browser:
+        populateBrowserPage();
+        break;
+    case AppSection::Rooms:
+        populateRoomsPage();
+        break;
+    case AppSection::Library:
+        populateLibraryPage();
+        break;
+    case AppSection::Transfers:
+        populateTransfersPage();
+        break;
+    case AppSection::Logs:
+        populateLogsPage();
+        break;
+    case AppSection::Settings:
+        populateSettingsPage();
+        break;
+    case AppSection::Verification:
+        populateVerificationPage();
+        break;
+    }
 
     if (!controller_->lastErrorMessage().isEmpty()) {
-        QMessageBox::warning(this, QStringLiteral("Matrix Media Share Client"), controller_->lastErrorMessage());
         controller_->dismissError();
     }
 }
 
-void MainWindow::populateSectionSidebar()
+void MainWindow::populateSectionNavigation()
 {
-    sectionList_->clear();
+    sectionCombo_->blockSignals(true);
+    sectionCombo_->clear();
     for (const AppSection section : allSections()) {
-        sectionList_->addItem(sectionTitle(section));
+        sectionCombo_->addItem(sectionTitle(section), static_cast<int>(section));
     }
+    sectionCombo_->blockSignals(false);
 }
 
 QWidget *MainWindow::buildRoomsPage()
@@ -229,15 +596,17 @@ QWidget *MainWindow::buildRoomsPage()
     joinRow->addWidget(joinButton);
     layout->addLayout(joinRow);
 
-    roomsList_ = new QListWidget(page);
-    roomsList_->setSelectionMode(QAbstractItemView::SingleSelection);
-    layout->addWidget(roomsList_, 1);
-
     roomDetailLabel_ = new QLabel(page);
     roomDetailLabel_->setWordWrap(true);
     leaveRoomButton_ = new QPushButton(QStringLiteral("Leave Selected"), page);
+    auto *roomHelpLabel = new QLabel(
+        QStringLiteral("Use the room list in the left pane to inspect memberships, aliases, and folders."),
+        page);
+    roomHelpLabel->setWordWrap(true);
+    layout->addWidget(roomHelpLabel);
     layout->addWidget(roomDetailLabel_);
     layout->addWidget(leaveRoomButton_);
+    layout->addStretch();
 
     connect(joinButton, &QPushButton::clicked, this, [this]() {
         controller_->joinRoom(joinRoomEdit_->text());
@@ -248,24 +617,23 @@ QWidget *MainWindow::buildRoomsPage()
             controller_->leaveRoom(item->data(Qt::UserRole).toString());
         }
     });
-    connect(roomsList_, &QListWidget::currentRowChanged, this, [this]() {
-        populateRoomsPage();
-    });
 
     return page;
 }
 
 QWidget *MainWindow::buildBrowserPage()
 {
-    auto *page = new QWidget(this);
-    auto *layout = new QVBoxLayout(page);
+    browserPage_ = new QWidget(this);
+    browserPage_->setAcceptDrops(true);
+    browserPage_->installEventFilter(this);
+    auto *layout = new QVBoxLayout(browserPage_);
 
     auto *statusRow = new QHBoxLayout();
-    powerToggle_ = new QCheckBox(QStringLiteral("Power"), page);
-    connectionLabel_ = new QLabel(page);
-    ipfsStatusLabel_ = new QLabel(page);
-    uploadLimitLabel_ = new QLabel(page);
-    updateBannerLabel_ = new QLabel(page);
+    powerToggle_ = new QCheckBox(QStringLiteral("Power"), browserPage_);
+    connectionLabel_ = new QLabel(browserPage_);
+    ipfsStatusLabel_ = new QLabel(browserPage_);
+    uploadLimitLabel_ = new QLabel(browserPage_);
+    updateBannerLabel_ = new QLabel(browserPage_);
     updateBannerLabel_->setWordWrap(true);
     statusRow->addWidget(powerToggle_);
     statusRow->addWidget(connectionLabel_);
@@ -276,30 +644,44 @@ QWidget *MainWindow::buildBrowserPage()
     layout->addLayout(statusRow);
 
     auto *shareRow = new QHBoxLayout();
-    shareRoomCombo_ = new QComboBox(page);
-    auto *shareButton = new QPushButton(QStringLiteral("Upload Files"), page);
-    auto *importButton = new QPushButton(QStringLiteral("Import IPFS Link"), page);
-    auto *refreshButton = new QPushButton(QStringLiteral("Refresh"), page);
-    shareRow->addWidget(new QLabel(QStringLiteral("Room"), page));
-    shareRow->addWidget(shareRoomCombo_, 1);
-    shareRow->addWidget(shareButton);
+    browserSelectedRoomLabel_ = new QLabel(browserPage_);
+    browserSelectedRoomLabel_->setWordWrap(true);
+    shareFilesButton_ = new QPushButton(QStringLiteral("Upload Files"), browserPage_);
+    auto *importButton = new QPushButton(QStringLiteral("Import IPFS Link"), browserPage_);
+    auto *refreshButton = new QPushButton(QStringLiteral("Refresh"), browserPage_);
+    shareRow->addWidget(new QLabel(QStringLiteral("Selected Room"), browserPage_));
+    shareRow->addWidget(browserSelectedRoomLabel_, 1);
+    shareRow->addWidget(shareFilesButton_);
     shareRow->addWidget(importButton);
     shareRow->addWidget(refreshButton);
     layout->addLayout(shareRow);
 
     browserDropHintLabel_ = new QLabel(
         QStringLiteral("Drop one or more files anywhere on this window while Browser is open to queue uploads into the selected room."),
-        page);
+        browserPage_);
     browserDropHintLabel_->setWordWrap(true);
     layout->addWidget(browserDropHintLabel_);
 
-    discoveriesList_ = new QListWidget(page);
+    discoveriesList_ = new QListWidget(browserPage_);
+    discoveriesList_->setAcceptDrops(true);
+    discoveriesList_->installEventFilter(this);
+    discoveriesList_->viewport()->setAcceptDrops(true);
+    discoveriesList_->viewport()->installEventFilter(this);
     discoveriesList_->setSelectionMode(QAbstractItemView::SingleSelection);
+    discoveriesList_->setViewMode(QListView::IconMode);
+    discoveriesList_->setResizeMode(QListView::Adjust);
+    discoveriesList_->setMovement(QListView::Static);
+    discoveriesList_->setWordWrap(true);
+    discoveriesList_->setSpacing(12);
+    discoveriesList_->setIconSize(QSize(kDiscoveryTileWidth, kDiscoveryTileHeight));
+    discoveriesList_->setGridSize(QSize(kDiscoveryGridWidth, kDiscoveryGridHeight));
+    discoveriesList_->setUniformItemSizes(false);
+    discoveriesList_->setTextElideMode(Qt::ElideNone);
     layout->addWidget(discoveriesList_, 1);
 
     auto *browserButtonRow = new QHBoxLayout();
-    openDiscoveryButton_ = new QPushButton(QStringLiteral("Open Selected"), page);
-    downloadDiscoveryButton_ = new QPushButton(QStringLiteral("Download Selected"), page);
+    openDiscoveryButton_ = new QPushButton(QStringLiteral("Open Selected"), browserPage_);
+    downloadDiscoveryButton_ = new QPushButton(QStringLiteral("Download Selected"), browserPage_);
     browserButtonRow->addWidget(openDiscoveryButton_);
     browserButtonRow->addWidget(downloadDiscoveryButton_);
     browserButtonRow->addStretch();
@@ -307,13 +689,16 @@ QWidget *MainWindow::buildBrowserPage()
 
     connect(powerToggle_, &QCheckBox::toggled, controller_, &AppController::togglePower);
     connect(refreshButton, &QPushButton::clicked, controller_, &AppController::refreshCatalog);
-    connect(shareRoomCombo_, &QComboBox::currentIndexChanged, this, [this]() {
-        populateBrowserPage();
-    });
-    connect(shareButton, &QPushButton::clicked, this, [this]() {
-        const QString roomId = shareRoomCombo_->currentData().toString();
+    connect(shareFilesButton_, &QPushButton::clicked, this, [this]() {
+        const QString roomId = selectedBrowserRoomId();
         const QStringList filePaths = QFileDialog::getOpenFileNames(this, QStringLiteral("Choose Files To Share"));
-        if (!roomId.isEmpty() && !filePaths.isEmpty()) {
+        if (!isUploadableBrowserRoom(roomId)) {
+            controller_->recordWarning(
+                QStringLiteral("share"),
+                QStringLiteral("Pick a joined room from the Browser room list before sharing files."));
+            return;
+        }
+        if (!filePaths.isEmpty()) {
             controller_->shareLocalFiles(roomId, filePaths);
         }
     });
@@ -357,8 +742,13 @@ QWidget *MainWindow::buildBrowserPage()
         openDiscoveryButton_->setEnabled(discoveriesList_->currentItem() != nullptr);
         downloadDiscoveryButton_->setEnabled(discoveriesList_->currentItem() != nullptr);
     });
+    connect(discoveriesList_->verticalScrollBar(), &QScrollBar::valueChanged, this, [this](int value) {
+        Q_UNUSED(value);
+        requestVisibleBrowserThumbnails();
+        maybeLoadMoreBrowserDiscoveries();
+    });
 
-    return page;
+    return browserPage_;
 }
 
 QWidget *MainWindow::buildLibraryPage()
@@ -417,6 +807,47 @@ QWidget *MainWindow::buildTransfersPage()
     return page;
 }
 
+QWidget *MainWindow::buildLogsPage()
+{
+    auto *page = new QWidget(this);
+    auto *layout = new QVBoxLayout(page);
+
+    logsSummaryLabel_ = new QLabel(page);
+    logsSummaryLabel_->setWordWrap(true);
+    layout->addWidget(logsSummaryLabel_);
+
+    logProblemsOnlyCheck_ = new QCheckBox(QStringLiteral("Show only warnings and errors"), page);
+    layout->addWidget(logProblemsOnlyCheck_);
+
+    logsTable_ = new QTableWidget(page);
+    logsTable_->setColumnCount(4);
+    logsTable_->setHorizontalHeaderLabels({
+        QStringLiteral("Time"),
+        QStringLiteral("Level"),
+        QStringLiteral("Subsystem"),
+        QStringLiteral("Message"),
+    });
+    logsTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    logsTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    logsTable_->setSelectionMode(QAbstractItemView::SingleSelection);
+    logsTable_->verticalHeader()->setVisible(false);
+    logsTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    logsTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    logsTable_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    logsTable_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    layout->addWidget(logsTable_, 1);
+
+    connect(logProblemsOnlyCheck_, &QCheckBox::toggled, this, [this]() {
+        populateLogsPage();
+    });
+    connect(logsTable_->verticalScrollBar(), &QScrollBar::valueChanged, this, [this](int value) {
+        Q_UNUSED(value);
+        maybeLoadMoreLogs();
+    });
+
+    return page;
+}
+
 QWidget *MainWindow::buildSettingsPage()
 {
     auto *page = new QWidget(this);
@@ -458,6 +889,7 @@ QWidget *MainWindow::buildSettingsPage()
     startHiddenCheck_ = new QCheckBox(content);
     archiveScanEnabledCheck_ = new QCheckBox(content);
     archiveHighPriorityCheck_ = new QCheckBox(content);
+    flatFolderLayoutCheck_ = new QCheckBox(content);
     autoJoinSpacesCheck_ = new QCheckBox(content);
     autoDownloadCheck_ = new QCheckBox(content);
 
@@ -523,6 +955,7 @@ QWidget *MainWindow::buildSettingsPage()
     form->addRow(QStringLiteral("Last Checked"), lastCheckedLabel_);
     form->addRow(QStringLiteral("Archive Scan Enabled"), archiveScanEnabledCheck_);
     form->addRow(QStringLiteral("Archive Scan High Priority"), archiveHighPriorityCheck_);
+    form->addRow(QStringLiteral("Flat Folder Layout"), flatFolderLayoutCheck_);
     form->addRow(QStringLiteral("Primary Gateway"), primaryGatewayEdit_);
     form->addRow(QStringLiteral("Preferred Gateways"), preferredGatewaysEdit_);
     form->addRow(QStringLiteral("Message Limit"), messageLimitSpin_);
@@ -553,13 +986,41 @@ QWidget *MainWindow::buildSettingsPage()
     layout->addWidget(scrollArea);
 
     connect(saveButton, &QPushButton::clicked, this, [this]() {
-        controller_->saveSettings(gatherSettingsFromUi(), passwordEdit_->text());
+        saveSettingsFromUi(true);
     });
     connect(resetButton, &QPushButton::clicked, controller_, &AppController::resetHistoryScans);
     connect(checkUpdatesButton_, &QPushButton::clicked, this, [this]() {
         controller_->checkForUpdates(true);
     });
     connect(openLatestReleaseButton_, &QPushButton::clicked, controller_, &AppController::openLatestReleasePage);
+
+    settingsDatabasePathLabel_ = new QLabel(content);
+    secretStorePathLabel_ = new QLabel(content);
+    for (QLabel *label : {settingsDatabasePathLabel_, secretStorePathLabel_}) {
+        label->setWordWrap(true);
+        label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    }
+    form->insertRow(7, QStringLiteral("Settings Database"), settingsDatabasePathLabel_);
+    form->insertRow(8, QStringLiteral("Secret Store"), secretStorePathLabel_);
+
+    for (QLineEdit *edit : {homeserverEdit_, usernameEdit_, passwordEdit_, destinationEdit_, libraryEdit_, archiveEdit_, manualDownloadsEdit_, primaryGatewayEdit_}) {
+        connect(edit, &QLineEdit::textChanged, this, [this]() {
+            markSettingsDirty();
+        });
+    }
+    connect(preferredGatewaysEdit_, &QTextEdit::textChanged, this, [this]() {
+        markSettingsDirty();
+    });
+    for (QSpinBox *spin : {messageLimitSpin_, retryCooldownSpin_, retryLimitSpin_, downloadWorkersSpin_, bandwidthSpin_, previewWorkersSpin_}) {
+        connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) {
+            markSettingsDirty();
+        });
+    }
+    for (QCheckBox *check : {archiveScanEnabledCheck_, archiveHighPriorityCheck_, flatFolderLayoutCheck_, autostartCheck_, minimizeToTrayCheck_, startHiddenCheck_, autoJoinSpacesCheck_, autoDownloadCheck_}) {
+        connect(check, &QCheckBox::toggled, this, [this](bool) {
+            markSettingsDirty();
+        });
+    }
 
     return page;
 }
@@ -571,52 +1032,39 @@ QWidget *MainWindow::buildVerificationPage()
 
     verificationStatusLabel_ = new QLabel(page);
     verificationDeviceIdLabel_ = new QLabel(page);
+    verificationMessageLabel_ = new QLabel(page);
+    verificationMessageLabel_->setWordWrap(true);
     verificationEmojiList_ = new QListWidget(page);
     verificationDecimalsLabel_ = new QLabel(page);
 
     auto *buttonRow = new QHBoxLayout();
-    auto *requestButton = new QPushButton(QStringLiteral("Request"), page);
-    auto *startButton = new QPushButton(QStringLiteral("Start SAS"), page);
-    auto *approveButton = new QPushButton(QStringLiteral("Approve"), page);
-    auto *declineButton = new QPushButton(QStringLiteral("Reject"), page);
-    buttonRow->addWidget(requestButton);
-    buttonRow->addWidget(startButton);
-    buttonRow->addWidget(approveButton);
-    buttonRow->addWidget(declineButton);
+    requestVerificationButton_ = new QPushButton(QStringLiteral("Set Up / Request"), page);
+    startVerificationButton_ = new QPushButton(QStringLiteral("Start SAS"), page);
+    approveVerificationButton_ = new QPushButton(QStringLiteral("Approve"), page);
+    declineVerificationButton_ = new QPushButton(QStringLiteral("Reject"), page);
+    buttonRow->addWidget(requestVerificationButton_);
+    buttonRow->addWidget(startVerificationButton_);
+    buttonRow->addWidget(approveVerificationButton_);
+    buttonRow->addWidget(declineVerificationButton_);
     buttonRow->addStretch();
 
     layout->addWidget(verificationStatusLabel_);
     layout->addWidget(verificationDeviceIdLabel_);
+    layout->addWidget(verificationMessageLabel_);
     layout->addLayout(buttonRow);
     layout->addWidget(verificationEmojiList_, 1);
     layout->addWidget(verificationDecimalsLabel_);
 
-    connect(requestButton, &QPushButton::clicked, controller_, &AppController::requestVerification);
-    connect(startButton, &QPushButton::clicked, controller_, &AppController::startSasVerification);
-    connect(approveButton, &QPushButton::clicked, controller_, &AppController::approveVerification);
-    connect(declineButton, &QPushButton::clicked, controller_, &AppController::declineVerification);
+    connect(requestVerificationButton_, &QPushButton::clicked, controller_, &AppController::requestVerification);
+    connect(startVerificationButton_, &QPushButton::clicked, controller_, &AppController::startSasVerification);
+    connect(approveVerificationButton_, &QPushButton::clicked, controller_, &AppController::approveVerification);
+    connect(declineVerificationButton_, &QPushButton::clicked, controller_, &AppController::declineVerification);
 
     return page;
 }
 
 void MainWindow::populateRoomsPage()
 {
-    const QString selectedRoomId = roomsList_->currentItem() != nullptr
-        ? roomsList_->currentItem()->data(Qt::UserRole).toString()
-        : QString();
-
-    roomsList_->clear();
-    for (const RoomRecord &room : controller_->rooms()) {
-        auto *item = new QListWidgetItem(roomDisplayTitle(room), roomsList_);
-        item->setData(Qt::UserRole, room.roomId);
-        if (room.isSpace) {
-            item->setText(item->text() + QStringLiteral(" [Space]"));
-        }
-        if (room.roomId == selectedRoomId) {
-            roomsList_->setCurrentItem(item);
-        }
-    }
-
     const QListWidgetItem *currentItem = roomsList_->currentItem();
     if (currentItem == nullptr) {
         roomDetailLabel_->setText(QStringLiteral("Join a room or space to begin browsing shared media."));
@@ -624,13 +1072,18 @@ void MainWindow::populateRoomsPage()
         return;
     }
 
-    leaveRoomButton_->setEnabled(true);
+    leaveRoomButton_->setEnabled(currentSection() == AppSection::Rooms);
     const QString roomId = currentItem->data(Qt::UserRole).toString();
     const auto rooms = controller_->rooms();
     for (const RoomRecord &room : rooms) {
         if (room.roomId == roomId) {
-            roomDetailLabel_->setText(QStringLiteral("ID: %1\nAlias: %2\nFolder: %3\nMembership: %4")
-                                          .arg(room.roomId, room.currentCanonicalAlias, room.activeFolderLabel, room.membership));
+            roomDetailLabel_->setText(QStringLiteral("ID: %1\nAlias: %2\nFolder: %3\nMembership: %4\nCached Media: %5")
+                                          .arg(
+                                              room.roomId,
+                                              room.currentCanonicalAlias,
+                                              room.activeFolderLabel,
+                                              room.membership,
+                                              QString::number(room.discoveredMediaCount)));
             break;
         }
     }
@@ -651,35 +1104,58 @@ void MainWindow::populateBrowserPage()
         updateBannerLabel_->clear();
     }
 
-    const QString previousRoomId = shareRoomCombo_->currentData().toString();
-    shareRoomCombo_->blockSignals(true);
-    shareRoomCombo_->clear();
-    for (const RoomRecord &room : controller_->joinedRooms()) {
-        shareRoomCombo_->addItem(roomDisplayTitle(room), room.roomId);
-    }
-    const int restoredIndex = previousRoomId.isEmpty() ? 0 : shareRoomCombo_->findData(previousRoomId);
-    if (restoredIndex >= 0) {
-        shareRoomCombo_->setCurrentIndex(restoredIndex);
-    }
-    shareRoomCombo_->blockSignals(false);
-    const QString selectedRoomId = shareRoomCombo_->currentData().toString();
-
-    discoveriesList_->clear();
-    for (const AttachmentDiscovery &discovery : controller_->discoveries()) {
-        if (!selectedRoomId.isEmpty() && discovery.roomId != selectedRoomId) {
-            continue;
+    const QString currentRoomId = selectedBrowserRoomId();
+    QString selectedRoomTitle = QStringLiteral("None");
+    QString selectedMembership;
+    bool selectedIsSpace = false;
+    for (const RoomRecord &room : controller_->rooms()) {
+        if (room.roomId == currentRoomId) {
+            selectedRoomTitle = roomDisplayTitle(room);
+            selectedMembership = room.membership;
+            selectedIsSpace = room.isSpace;
+            if (room.isSpace) {
+                selectedRoomTitle += QStringLiteral(" [Space]");
+            }
+            break;
         }
-        QString title = discovery.originalFilename.isEmpty() ? discovery.eventId : discovery.originalFilename;
-        title += QStringLiteral("  [%1 | %2]")
-                     .arg(mediaCategoryTitle(discovery.category), mediaSourceKindTitle(discovery.sourceKind));
-        auto *item = new QListWidgetItem(title, discoveriesList_);
-        const QString sourceUrl = discovery.directUrl.isEmpty() ? discovery.mxcUrl : discovery.directUrl;
-        item->setToolTip(QStringLiteral("%1\n%2").arg(discovery.roomId, sourceUrl));
-        item->setData(Qt::UserRole, discovery.roomId);
-        item->setData(Qt::UserRole + 1, discovery.eventId);
     }
-    openDiscoveryButton_->setEnabled(discoveriesList_->currentItem() != nullptr);
-    downloadDiscoveryButton_->setEnabled(discoveriesList_->currentItem() != nullptr);
+    browserSelectedRoomLabel_->setText(selectedRoomTitle);
+    const bool uploadable = !currentRoomId.isEmpty() && !selectedIsSpace && selectedMembership == QStringLiteral("joined");
+    if (shareFilesButton_ != nullptr) {
+        shareFilesButton_->setEnabled(uploadable);
+    }
+    browserDropHintLabel_->setText(currentRoomId.isEmpty()
+            ? QStringLiteral("Pick a room from the left pane before dropping files or uploading.")
+            : uploadable
+                ? QStringLiteral("Drop one or more files anywhere on this window while Browser is open to queue uploads into %1.")
+                      .arg(selectedRoomTitle)
+                : QStringLiteral("%1 is cached for browsing, but you need to join it from the Rooms page before uploading.")
+                      .arg(selectedRoomTitle));
+
+    const int totalDiscoveries = currentRoomId.isEmpty() ? 0 : controller_->discoveryCount(currentRoomId);
+    const bool roomChanged = browserLoadedRoomId_ != currentRoomId;
+    if (roomChanged || totalDiscoveries != browserTotalDiscoveryCount_) {
+        resetBrowserPageState();
+        browserLoadedRoomId_ = currentRoomId;
+        browserTotalDiscoveryCount_ = totalDiscoveries;
+    }
+
+    if (currentRoomId.isEmpty() || browserTotalDiscoveryCount_ <= 0) {
+        discoveriesList_->setEnabled(false);
+        openDiscoveryButton_->setEnabled(false);
+        downloadDiscoveryButton_->setEnabled(false);
+        return;
+    }
+
+    discoveriesList_->setEnabled(true);
+    if (browserLoadedDiscoveries_.isEmpty()) {
+        loadMoreBrowserDiscoveries(true);
+    } else {
+        requestVisibleBrowserThumbnails();
+        maybeLoadMoreBrowserDiscoveries();
+        openDiscoveryButton_->setEnabled(discoveriesList_->currentItem() != nullptr);
+        downloadDiscoveryButton_->setEnabled(discoveriesList_->currentItem() != nullptr);
+    }
 }
 
 void MainWindow::populateLibraryPage()
@@ -694,6 +1170,62 @@ void MainWindow::populateLibraryPage()
         item->setToolTip(job.savedRelativePath);
     }
     openLibraryButton_->setEnabled(libraryList_->currentItem() != nullptr);
+}
+
+void MainWindow::populateRoomSidebar()
+{
+    if (roomsList_ == nullptr) {
+        return;
+    }
+
+    const AppSection section = currentSection();
+    const QString previousRoomId = section == AppSection::Browser
+        ? browserSelectedRoomId_
+        : roomsPageSelectedRoomId_;
+    roomsList_->blockSignals(true);
+    roomsList_->clear();
+    roomSidebarTitleLabel_->setText(section == AppSection::Browser
+            ? QStringLiteral("Browser Rooms")
+            : QStringLiteral("Rooms"));
+
+    int restoredRow = -1;
+    const auto rooms = roomSidebarRoomsForCurrentSection();
+    for (int index = 0; index < rooms.size(); ++index) {
+        const RoomRecord &room = rooms.at(index);
+        auto *item = new QListWidgetItem(roomDisplayTitle(room), roomsList_);
+        item->setData(Qt::UserRole, room.roomId);
+        if (room.isSpace) {
+            item->setText(item->text() + QStringLiteral(" [Space]"));
+        } else if (section == AppSection::Browser && room.membership != QStringLiteral("joined")) {
+            item->setText(item->text() + QStringLiteral(" [Cached]"));
+        }
+        if (room.roomId == previousRoomId) {
+            restoredRow = index;
+        }
+    }
+
+    if (restoredRow < 0 && section == AppSection::Browser) {
+        for (int index = 0; index < rooms.size(); ++index) {
+            if (!rooms.at(index).isSpace && rooms.at(index).membership == QStringLiteral("joined")) {
+                restoredRow = index;
+                break;
+            }
+        }
+    }
+
+    if (roomsList_->count() > 0) {
+        roomsList_->setCurrentRow(restoredRow >= 0 ? restoredRow : 0);
+        if (section == AppSection::Browser) {
+            browserSelectedRoomId_ = selectedRoomId();
+        } else if (section == AppSection::Rooms) {
+            roomsPageSelectedRoomId_ = selectedRoomId();
+        }
+    } else if (section == AppSection::Browser) {
+        browserSelectedRoomId_.clear();
+    } else if (section == AppSection::Rooms) {
+        roomsPageSelectedRoomId_.clear();
+    }
+    roomsList_->blockSignals(false);
 }
 
 void MainWindow::populateTransfersPage()
@@ -740,9 +1272,59 @@ void MainWindow::populateTransfersPage()
     }
 }
 
+void MainWindow::populateLogsPage()
+{
+    const bool problemsOnly = logProblemsOnlyCheck_ != nullptr && logProblemsOnlyCheck_->isChecked();
+    const int totalLogs = controller_->logCount(problemsOnly);
+    if (problemsOnly != logsProblemsOnly_ || totalLogs != logTotalCount_) {
+        resetLogsPageState();
+        logsProblemsOnly_ = problemsOnly;
+        logTotalCount_ = totalLogs;
+    }
+
+    if (logsSummaryLabel_ != nullptr) {
+        const QString filterText = problemsOnly
+            ? QStringLiteral("warnings/errors")
+            : QStringLiteral("all entries");
+        logsSummaryLabel_->setText(
+            QStringLiteral("Showing %1 of %2 %3 from the local activity log. Newest entries appear first.")
+                .arg(loadedLogEntries_.size())
+                .arg(logTotalCount_)
+                .arg(filterText));
+    }
+
+    if (logsTable_ == nullptr || logTotalCount_ <= 0) {
+        if (logsTable_ != nullptr) {
+            logsTable_->setRowCount(0);
+        }
+        return;
+    }
+
+    if (loadedLogEntries_.isEmpty()) {
+        loadMoreLogs(true);
+    } else {
+        maybeLoadMoreLogs();
+    }
+}
+
 void MainWindow::populateSettingsPage()
 {
+    currentVersionLabel_->setText(controller_->currentVersion());
+    updateStatusLabel_->setText(controller_->updateStatusText());
+    latestReleaseLabel_->setText(controller_->latestReleaseSummaryText());
+    lastCheckedLabel_->setText(displayDateTime(controller_->updateCheckState().lastCheckedAt));
+    settingsDatabasePathLabel_->setText(QDir::toNativeSeparators(controller_->settingsDatabasePath()));
+    secretStorePathLabel_->setText(QDir::toNativeSeparators(controller_->secretStorePath()));
+    checkUpdatesButton_->setEnabled(!controller_->isUpdateCheckInProgress());
+    openLatestReleaseButton_->setEnabled(!controller_->latestReleasePageUrl().trimmed().isEmpty());
+
+    if (settingsDirty_) {
+        settingsPageInitialized_ = true;
+        return;
+    }
+
     const AppSettings &settings = controller_->settings();
+    populatingSettingsUi_ = true;
     homeserverEdit_->setText(settings.homeserverUrl);
     usernameEdit_->setText(settings.username);
     passwordEdit_->setText(controller_->password());
@@ -751,6 +1333,7 @@ void MainWindow::populateSettingsPage()
     archiveEdit_->setText(settings.archiveRootPath);
     archiveScanEnabledCheck_->setChecked(settings.archiveScanEnabled);
     archiveHighPriorityCheck_->setChecked(settings.archiveScanHighPriority);
+    flatFolderLayoutCheck_->setChecked(settings.flatFolderLayout);
     manualDownloadsEdit_->setText(settings.manualDownloadRootPath);
     primaryGatewayEdit_->setText(settings.primaryGatewayUrl);
     preferredGatewaysEdit_->setPlainText(settings.preferredGatewayUrls.join(QStringLiteral("\n")));
@@ -765,12 +1348,8 @@ void MainWindow::populateSettingsPage()
     startHiddenCheck_->setChecked(settings.startHidden);
     autoJoinSpacesCheck_->setChecked(settings.autoJoinSpaceRooms);
     autoDownloadCheck_->setChecked(settings.autoDownloadNewMedia);
-    currentVersionLabel_->setText(controller_->currentVersion());
-    updateStatusLabel_->setText(controller_->updateStatusText());
-    latestReleaseLabel_->setText(controller_->latestReleaseSummaryText());
-    lastCheckedLabel_->setText(displayDateTime(controller_->updateCheckState().lastCheckedAt));
-    checkUpdatesButton_->setEnabled(!controller_->isUpdateCheckInProgress());
-    openLatestReleaseButton_->setEnabled(!controller_->latestReleasePageUrl().trimmed().isEmpty());
+    populatingSettingsUi_ = false;
+    settingsDirty_ = false;
     settingsPageInitialized_ = true;
 }
 
@@ -778,7 +1357,9 @@ void MainWindow::populateVerificationPage()
 {
     const VerificationSnapshot &verification = controller_->runtime().verification;
     verificationStatusLabel_->setText(QStringLiteral("Status: %1").arg(verificationStatusTitle(verification.state)));
-    verificationDeviceIdLabel_->setText(QStringLiteral("Device: %1").arg(verification.deviceId));
+    verificationDeviceIdLabel_->setText(
+        QStringLiteral("Device: %1").arg(verification.deviceId.isEmpty() ? QStringLiteral("Unknown") : verification.deviceId));
+    verificationMessageLabel_->setText(verification.message);
     verificationEmojiList_->clear();
     for (const VerificationEmoji &emoji : verification.emojis) {
         verificationEmojiList_->addItem(QStringLiteral("%1  %2").arg(emoji.symbol, emoji.description));
@@ -789,6 +1370,255 @@ void MainWindow::populateVerificationPage()
         decimals.append(QString::number(value));
     }
     verificationDecimalsLabel_->setText(QStringLiteral("Decimals: %1").arg(decimals.join(QStringLiteral(", "))));
+
+    if (verification.canBootstrapCrossSigning) {
+        requestVerificationButton_->setText(QStringLiteral("Set Up Verification"));
+    } else if (verification.otherDeviceCount > 0) {
+        requestVerificationButton_->setText(QStringLiteral("Request Other Device"));
+    } else {
+        requestVerificationButton_->setText(QStringLiteral("Repair Verification"));
+    }
+
+    if (verification.requestCanAccept) {
+        startVerificationButton_->setText(QStringLiteral("Accept Request"));
+    } else if (verification.sasCanAccept) {
+        startVerificationButton_->setText(QStringLiteral("Accept SAS"));
+    } else {
+        startVerificationButton_->setText(QStringLiteral("Start SAS"));
+    }
+
+    const bool connected = controller_->runtime().connectionState == ConnectionState::Running;
+    requestVerificationButton_->setEnabled(connected);
+    startVerificationButton_->setEnabled(
+        connected && (verification.requestReady || verification.requestCanAccept || verification.sasCanAccept));
+    approveVerificationButton_->setEnabled(
+        connected && verification.hasActiveSas && (!verification.emojis.isEmpty() || !verification.decimals.isEmpty()));
+    declineVerificationButton_->setEnabled(connected && (verification.hasActiveRequest || verification.hasActiveSas));
+}
+
+void MainWindow::refreshViewerDialog()
+{
+    const ViewerSnapshot &viewer = controller_->runtime().viewer;
+    if (viewer.state == ViewerState::Idle || viewer.sessionId == 0) {
+        if (viewerDialog_ != nullptr) {
+            viewerDialog_->hide();
+        }
+        if (viewerMediaPlayer_ != nullptr) {
+            viewerMediaPlayer_->stop();
+        }
+        viewerLoadedSessionId_ = 0;
+        viewerLoadedLocalPath_.clear();
+        viewerLoadedState_ = ViewerState::Idle;
+        return;
+    }
+
+    if (viewer.sessionId == viewerDismissedSessionId_) {
+        return;
+    }
+
+    ensureViewerDialog();
+    if (viewerDialog_ == nullptr) {
+        return;
+    }
+
+    if (!viewerDialog_->isVisible()) {
+        viewerDialog_->show();
+        viewerDialog_->raise();
+        viewerDialog_->activateWindow();
+    }
+
+    viewerTitleLabel_->setText(viewer.fileName.isEmpty() ? QStringLiteral("Viewer") : viewer.fileName);
+    switch (viewer.state) {
+    case ViewerState::Downloading:
+        if (viewer.totalBytes > 0) {
+            viewerProgressBar_->setRange(0, 1000);
+            viewerProgressBar_->setValue(static_cast<int>(
+                qBound(0.0, static_cast<double>(viewer.receivedBytes) / static_cast<double>(viewer.totalBytes), 1.0)
+                * 1000.0));
+            viewerStatusLabel_->setText(QStringLiteral("Downloading %1 of %2")
+                                            .arg(dataSizeText(viewer.receivedBytes), dataSizeText(viewer.totalBytes)));
+        } else {
+            viewerProgressBar_->setRange(0, 0);
+            viewerStatusLabel_->setText(QStringLiteral("Downloading media for viewing..."));
+        }
+        break;
+    case ViewerState::Ready:
+        viewerProgressBar_->setRange(0, 1000);
+        viewerProgressBar_->setValue(1000);
+        viewerStatusLabel_->setText(QStringLiteral("Ready"));
+        break;
+    case ViewerState::Error:
+        viewerProgressBar_->setRange(0, 1000);
+        viewerProgressBar_->setValue(0);
+        viewerStatusLabel_->setText(viewer.error.isEmpty() ? QStringLiteral("Viewer error") : viewer.error);
+        break;
+    case ViewerState::Idle:
+        break;
+    }
+
+    if (viewer.sessionId != viewerLoadedSessionId_
+        || viewer.localPath != viewerLoadedLocalPath_
+        || viewer.state != viewerLoadedState_) {
+        loadViewerMedia(viewer);
+    }
+}
+
+void MainWindow::ensureViewerDialog()
+{
+    if (viewerDialog_ != nullptr) {
+        return;
+    }
+
+    viewerDialog_ = new QDialog(this, Qt::Window);
+    viewerDialog_->setAttribute(Qt::WA_DeleteOnClose, false);
+    viewerDialog_->setWindowTitle(QStringLiteral("Media Viewer"));
+    viewerDialog_->setMinimumSize(420, 320);
+
+    auto *layout = new QVBoxLayout(viewerDialog_);
+    viewerTitleLabel_ = new QLabel(viewerDialog_);
+    viewerTitleLabel_->setWordWrap(true);
+    viewerStatusLabel_ = new QLabel(viewerDialog_);
+    viewerStatusLabel_->setWordWrap(true);
+    viewerProgressBar_ = new QProgressBar(viewerDialog_);
+    viewerProgressBar_->setTextVisible(true);
+
+    viewerContentStack_ = new QStackedWidget(viewerDialog_);
+
+    viewerImageScrollArea_ = new QScrollArea(viewerDialog_);
+    viewerImageScrollArea_->setWidgetResizable(true);
+    viewerImageLabel_ = new QLabel(viewerImageScrollArea_);
+    viewerImageLabel_->setAlignment(Qt::AlignCenter);
+    viewerImageScrollArea_->setWidget(viewerImageLabel_);
+
+    viewerVideoWidget_ = new QVideoWidget(viewerDialog_);
+    viewerFallbackLabel_ = new QLabel(viewerDialog_);
+    viewerFallbackLabel_->setAlignment(Qt::AlignCenter);
+    viewerFallbackLabel_->setWordWrap(true);
+
+    viewerContentStack_->addWidget(viewerImageScrollArea_);
+    viewerContentStack_->addWidget(viewerVideoWidget_);
+    viewerContentStack_->addWidget(viewerFallbackLabel_);
+
+    auto *closeButton = new QPushButton(QStringLiteral("Close"), viewerDialog_);
+    auto *buttonRow = new QHBoxLayout();
+    buttonRow->addStretch();
+    buttonRow->addWidget(closeButton);
+
+    layout->addWidget(viewerTitleLabel_);
+    layout->addWidget(viewerStatusLabel_);
+    layout->addWidget(viewerProgressBar_);
+    layout->addWidget(viewerContentStack_, 1);
+    layout->addLayout(buttonRow);
+
+    viewerMediaPlayer_ = new QMediaPlayer(viewerDialog_);
+    viewerAudioOutput_ = new QAudioOutput(viewerDialog_);
+    viewerMediaPlayer_->setAudioOutput(viewerAudioOutput_);
+    viewerMediaPlayer_->setVideoOutput(viewerVideoWidget_);
+
+    connect(closeButton, &QPushButton::clicked, this, [this]() {
+        viewerDismissedSessionId_ = controller_->runtime().viewer.sessionId;
+        if (viewerMediaPlayer_ != nullptr) {
+            viewerMediaPlayer_->stop();
+        }
+        if (viewerDialog_ != nullptr) {
+            viewerDialog_->hide();
+        }
+    });
+    connect(viewerDialog_, &QDialog::finished, this, [this](int result) {
+        Q_UNUSED(result);
+        viewerDismissedSessionId_ = controller_->runtime().viewer.sessionId;
+        if (viewerMediaPlayer_ != nullptr) {
+            viewerMediaPlayer_->stop();
+        }
+    });
+}
+
+void MainWindow::loadViewerMedia(const ViewerSnapshot &viewer)
+{
+    if (viewerDialog_ == nullptr || viewerContentStack_ == nullptr) {
+        return;
+    }
+
+    viewerLoadedSessionId_ = viewer.sessionId;
+    viewerLoadedLocalPath_ = viewer.localPath;
+    viewerLoadedState_ = viewer.state;
+    if (viewerMediaPlayer_ != nullptr) {
+        viewerMediaPlayer_->stop();
+        viewerMediaPlayer_->setSource(QUrl());
+    }
+
+    QScreen *targetScreen = windowHandle() != nullptr ? windowHandle()->screen() : QGuiApplication::primaryScreen();
+    const QRect available = targetScreen != nullptr
+        ? targetScreen->availableGeometry()
+        : QRect(80, 80, 1200, 800);
+    const QSize maxContentSize(qMax(320, available.width() - 140), qMax(220, available.height() - 220));
+    QSize dialogSize(qMin(available.width() - 80, 1100), qMin(available.height() - 80, 860));
+
+    if (viewer.state != ViewerState::Ready || viewer.localPath.isEmpty()) {
+        viewerFallbackLabel_->setText(
+            viewer.state == ViewerState::Error
+                ? (viewer.error.isEmpty() ? QStringLiteral("Unable to open this media item.") : viewer.error)
+                : QStringLiteral("Preparing media for the built-in viewer..."));
+        viewerContentStack_->setCurrentWidget(viewerFallbackLabel_);
+    } else if (viewer.category == MediaCategory::Images || viewer.mimeType.startsWith(QStringLiteral("image/"))) {
+        QPixmap pixmap(viewer.localPath);
+        if (pixmap.isNull()) {
+            viewerFallbackLabel_->setText(QStringLiteral("The image could not be loaded."));
+            viewerContentStack_->setCurrentWidget(viewerFallbackLabel_);
+        } else {
+            const QSize fitted = pixmap.size().boundedTo(maxContentSize);
+            const QPixmap scaled = pixmap.size().width() > fitted.width() || pixmap.size().height() > fitted.height()
+                ? pixmap.scaled(fitted, Qt::KeepAspectRatio, Qt::SmoothTransformation)
+                : pixmap;
+            viewerImageLabel_->setPixmap(scaled);
+            viewerImageLabel_->setMinimumSize(scaled.size());
+            viewerImageLabel_->resize(scaled.size());
+            viewerContentStack_->setCurrentWidget(viewerImageScrollArea_);
+            dialogSize = QSize(
+                qMin(available.width() - 80, scaled.width() + 80),
+                qMin(available.height() - 80, scaled.height() + 170));
+        }
+    } else if (viewer.category == MediaCategory::Videos
+               || viewer.category == MediaCategory::Audio
+               || viewer.mimeType.startsWith(QStringLiteral("video/"))
+               || viewer.mimeType.startsWith(QStringLiteral("audio/"))) {
+        viewerContentStack_->setCurrentWidget(
+            viewer.category == MediaCategory::Videos || viewer.mimeType.startsWith(QStringLiteral("video/"))
+                ? static_cast<QWidget *>(viewerVideoWidget_)
+                : static_cast<QWidget *>(viewerFallbackLabel_));
+        if (viewer.category == MediaCategory::Audio || viewer.mimeType.startsWith(QStringLiteral("audio/"))) {
+            viewerFallbackLabel_->setText(QStringLiteral("Playing audio in the built-in viewer..."));
+        }
+        if (viewerMediaPlayer_ != nullptr) {
+            viewerMediaPlayer_->setSource(QUrl::fromLocalFile(viewer.localPath));
+            viewerMediaPlayer_->play();
+        }
+    } else {
+        viewerFallbackLabel_->setText(
+            QStringLiteral("This file type is downloaded, but the built-in viewer does not support displaying it yet.\n\n%1")
+                .arg(QDir::toNativeSeparators(viewer.localPath)));
+        viewerContentStack_->setCurrentWidget(viewerFallbackLabel_);
+    }
+
+    dialogSize.setWidth(qBound(420, dialogSize.width(), available.width()));
+    dialogSize.setHeight(qBound(320, dialogSize.height(), available.height()));
+    viewerDialog_->resize(dialogSize);
+    QRect geometry = viewerDialog_->frameGeometry();
+    geometry.setSize(dialogSize);
+    geometry.moveCenter(available.center());
+    if (geometry.left() < available.left()) {
+        geometry.moveLeft(available.left());
+    }
+    if (geometry.top() < available.top()) {
+        geometry.moveTop(available.top());
+    }
+    if (geometry.right() > available.right()) {
+        geometry.moveRight(available.right());
+    }
+    if (geometry.bottom() > available.bottom()) {
+        geometry.moveBottom(available.bottom());
+    }
+    viewerDialog_->setGeometry(geometry);
 }
 
 AppSettings MainWindow::gatherSettingsFromUi() const
@@ -799,6 +1629,7 @@ AppSettings MainWindow::gatherSettingsFromUi() const
     settings.ownerUserId.clear();
     settings.destinationRootPath = destinationEdit_->text().trimmed();
     settings.libraryRootPath = libraryEdit_->text().trimmed();
+    settings.flatFolderLayout = flatFolderLayoutCheck_->isChecked();
     settings.archiveRootPath = archiveEdit_->text().trimmed();
     settings.archiveScanEnabled = archiveScanEnabledCheck_->isChecked();
     settings.archiveScanHighPriority = archiveHighPriorityCheck_->isChecked();
@@ -819,6 +1650,774 @@ AppSettings MainWindow::gatherSettingsFromUi() const
     return settings;
 }
 
+const ActiveDownloadSnapshot *MainWindow::activeDownloadForDiscovery(const AttachmentDiscovery &discovery) const
+{
+    const QVector<ActiveDownloadSnapshot> &activeDownloads = controller_->runtime().activeDownloads;
+    for (const ActiveDownloadSnapshot &active : activeDownloads) {
+        if (active.roomId == discovery.roomId && active.eventId == discovery.eventId) {
+            return &active;
+        }
+    }
+    return nullptr;
+}
+
+const DownloadJobRecord *MainWindow::jobForDiscovery(const AttachmentDiscovery &discovery) const
+{
+    const QVector<DownloadJobRecord> &jobs = controller_->jobs();
+    for (const DownloadJobRecord &job : jobs) {
+        if (job.roomId == discovery.roomId && job.eventId == discovery.eventId) {
+            return &job;
+        }
+    }
+    return nullptr;
+}
+
+void MainWindow::applyDiscoveryPresentation(QListWidgetItem *item, const AttachmentDiscovery &discovery)
+{
+    if (item == nullptr) {
+        return;
+    }
+
+    const QString title = discovery.originalFilename.isEmpty() ? discovery.eventId : discovery.originalFilename;
+    const QString tileLabel = QStringLiteral("%1 | %2")
+                                  .arg(mediaCategoryTitle(discovery.category).toUpper(),
+                                       mediaSourceKindTitle(discovery.sourceKind).toUpper());
+    const QString sourceUrl = discovery.directUrl.isEmpty() ? discovery.mxcUrl : discovery.directUrl;
+    const QString cacheKey = browserThumbnailKey(discovery);
+    const ActiveDownloadSnapshot *activeDownload = activeDownloadForDiscovery(discovery);
+    const DownloadJobRecord *job = jobForDiscovery(discovery);
+    QString secondaryText;
+    double progressFraction = -1.0;
+    QString progressText;
+
+    if (activeDownload != nullptr) {
+        if (activeDownload->totalBytes > 0) {
+            progressFraction = qBound(
+                0.0,
+                static_cast<double>(activeDownload->receivedBytes) / static_cast<double>(activeDownload->totalBytes),
+                1.0);
+            progressText = QStringLiteral("%1%").arg(QString::number(progressFraction * 100.0, 'f', 0));
+        } else {
+            progressFraction = 0.2;
+        }
+        secondaryText = activeDownload->workerId == 0
+            ? QStringLiteral("Opening %1").arg(progressText.isEmpty() ? QStringLiteral("...") : progressText)
+            : QStringLiteral("Downloading %1").arg(progressText.isEmpty() ? QStringLiteral("...") : progressText);
+    } else if (job != nullptr) {
+        switch (job->state) {
+        case DownloadJobState::Queued:
+            secondaryText = QStringLiteral("Queued");
+            progressFraction = 0.0;
+            break;
+        case DownloadJobState::CoolingDown:
+            secondaryText = QStringLiteral("Retrying Soon");
+            progressFraction = 0.0;
+            break;
+        case DownloadJobState::UndecryptablePending:
+            secondaryText = QStringLiteral("Pending");
+            progressFraction = 0.0;
+            break;
+        case DownloadJobState::FailedPermanent:
+            secondaryText = QStringLiteral("Failed");
+            break;
+        case DownloadJobState::Completed:
+        case DownloadJobState::DuplicateCompleted:
+            secondaryText = QStringLiteral("Downloaded");
+            break;
+        case DownloadJobState::Downloading:
+            secondaryText = QStringLiteral("Downloading");
+            progressFraction = 0.2;
+            break;
+        }
+    }
+
+    item->setText(secondaryText.isEmpty() ? tileLabel : QStringLiteral("%1\n%2").arg(tileLabel, secondaryText));
+    item->setTextAlignment(Qt::AlignHCenter | Qt::AlignTop);
+    item->setToolTip(QStringLiteral("%1\n%2\n%3").arg(title, discovery.roomId, sourceUrl));
+    item->setSizeHint(QSize(kDiscoveryGridWidth, kDiscoveryGridHeight));
+    item->setData(Qt::UserRole + 2, cacheKey);
+
+    QIcon baseIcon;
+    const auto cachedIcon = browserThumbnailIconCache_.constFind(cacheKey);
+    if (cachedIcon != browserThumbnailIconCache_.cend()) {
+        baseIcon = *cachedIcon;
+    } else {
+        baseIcon = placeholderDiscoveryIcon(discovery);
+        if (cacheKey.startsWith(QStringLiteral("placeholder:"))) {
+            cacheBrowserThumbnailIcon(cacheKey, baseIcon);
+        }
+    }
+
+    item->setIcon(
+        (progressFraction >= 0.0 || !secondaryText.isEmpty())
+            ? overlayDiscoveryStatusIcon(
+                  baseIcon,
+                  QSize(kDiscoveryTileWidth, kDiscoveryTileHeight),
+                  categoryAccent(discovery.category),
+                  progressFraction,
+                  secondaryText)
+            : baseIcon);
+}
+
+void MainWindow::resetBrowserPageState()
+{
+    browserLoadedRoomId_.clear();
+    browserLoadedOffset_ = 0;
+    browserLoadedDiscoveries_.clear();
+    browserTotalDiscoveryCount_ = 0;
+    browserLoadingPage_ = false;
+    browserBackgroundThumbnailPrefetchScheduled_ = false;
+    if (discoveriesList_ == nullptr) {
+        return;
+    }
+
+    const QSignalBlocker blocker(discoveriesList_);
+    discoveriesList_->clear();
+    discoveriesList_->verticalScrollBar()->setValue(0);
+}
+
+void MainWindow::loadMoreBrowserDiscoveries(const bool reset)
+{
+    if (discoveriesList_ == nullptr || browserLoadingPage_) {
+        return;
+    }
+
+    const QString roomId = selectedBrowserRoomId();
+    if (roomId.isEmpty()) {
+        return;
+    }
+
+    browserLoadingPage_ = true;
+
+    const QString selectedEventId = discoveriesList_->currentItem() != nullptr
+        ? discoveriesList_->currentItem()->data(Qt::UserRole + 1).toString()
+        : QString();
+
+    if (reset) {
+        resetBrowserPageState();
+        browserLoadedRoomId_ = roomId;
+        browserTotalDiscoveryCount_ = controller_->discoveryCount(roomId);
+        browserLoadingPage_ = true;
+    }
+
+    const QVector<AttachmentDiscovery> page = controller_->fetchDiscoveriesPage(
+        roomId,
+        browserLoadedOffset_ + browserLoadedDiscoveries_.size(),
+        kBrowserPageSize);
+
+    QListWidgetItem *restoredSelection = nullptr;
+    discoveriesList_->setUpdatesEnabled(false);
+    for (const AttachmentDiscovery &discovery : page) {
+        browserLoadedDiscoveries_.append(discovery);
+        auto *item = new QListWidgetItem(discoveriesList_);
+        applyDiscoveryPresentation(item, discovery);
+        item->setData(Qt::UserRole, discovery.roomId);
+        item->setData(Qt::UserRole + 1, discovery.eventId);
+        if (!selectedEventId.isEmpty() && discovery.eventId == selectedEventId) {
+            restoredSelection = item;
+        }
+    }
+    discoveriesList_->setUpdatesEnabled(true);
+
+    if (restoredSelection != nullptr) {
+        discoveriesList_->setCurrentItem(restoredSelection);
+    }
+
+    browserLoadingPage_ = false;
+    requestVisibleBrowserThumbnails();
+    scheduleBackgroundBrowserThumbnailPrefetch();
+    openDiscoveryButton_->setEnabled(discoveriesList_->currentItem() != nullptr);
+    downloadDiscoveryButton_->setEnabled(discoveriesList_->currentItem() != nullptr);
+
+    if (!page.isEmpty() && browserLoadedDiscoveries_.size() < browserTotalDiscoveryCount_) {
+        QTimer::singleShot(0, this, [this]() {
+            maybeLoadMoreBrowserDiscoveries();
+        });
+    }
+}
+
+void MainWindow::maybeLoadMoreBrowserDiscoveries()
+{
+    if (discoveriesList_ == nullptr
+        || browserLoadingPage_
+        || browserTotalDiscoveryCount_ <= 0
+        || browserLoadedDiscoveries_.isEmpty()) {
+        return;
+    }
+
+    QScrollBar *scrollBar = discoveriesList_->verticalScrollBar();
+    if (scrollBar == nullptr) {
+        return;
+    }
+
+    int firstVisibleIndex = -1;
+    int lastVisibleIndex = -1;
+    const QRect viewportRect = discoveriesList_->viewport()->rect();
+    for (int index = 0; index < discoveriesList_->count(); ++index) {
+        QListWidgetItem *item = discoveriesList_->item(index);
+        if (item != nullptr && discoveriesList_->visualItemRect(item).intersects(viewportRect)) {
+            if (firstVisibleIndex < 0) {
+                firstVisibleIndex = index;
+            }
+            lastVisibleIndex = index;
+        }
+    }
+    if (firstVisibleIndex < 0) {
+        firstVisibleIndex = 0;
+    }
+    if (lastVisibleIndex < 0) {
+        lastVisibleIndex = qMin(discoveriesList_->count() - 1, kBrowserPageSize - 1);
+    }
+
+    const int visibleColumns = qMax(1, discoveriesList_->viewport()->width() / qMax(1, discoveriesList_->gridSize().width()));
+    const int gridHeight = qMax(1, discoveriesList_->gridSize().height());
+
+    if (browserLoadedOffset_ > 0 && firstVisibleIndex <= (kBrowserPageSize * kBrowserBufferedPages)) {
+        const int prependCount = qMin(kBrowserPageSize, browserLoadedOffset_);
+        const int newOffset = browserLoadedOffset_ - prependCount;
+        const QVector<AttachmentDiscovery> page = controller_->fetchDiscoveriesPage(
+            browserLoadedRoomId_,
+            newOffset,
+            prependCount);
+        if (!page.isEmpty()) {
+            discoveriesList_->setUpdatesEnabled(false);
+            for (int index = page.size() - 1; index >= 0; --index) {
+                const AttachmentDiscovery &discovery = page.at(index);
+                browserLoadedDiscoveries_.prepend(discovery);
+                auto *item = new QListWidgetItem();
+                applyDiscoveryPresentation(item, discovery);
+                item->setData(Qt::UserRole, discovery.roomId);
+                item->setData(Qt::UserRole + 1, discovery.eventId);
+                discoveriesList_->insertItem(0, item);
+            }
+            discoveriesList_->setUpdatesEnabled(true);
+            browserLoadedOffset_ = newOffset;
+            const int addedRows = (page.size() + visibleColumns - 1) / visibleColumns;
+            scrollBar->setValue(scrollBar->value() + addedRows * gridHeight);
+            requestVisibleBrowserThumbnails();
+            scheduleBackgroundBrowserThumbnailPrefetch();
+        }
+    }
+
+    const int bufferedAhead = browserLoadedDiscoveries_.size() - (lastVisibleIndex + 1);
+    if ((browserLoadedOffset_ + browserLoadedDiscoveries_.size()) < browserTotalDiscoveryCount_
+        && (scrollBar->maximum() <= 0 || bufferedAhead <= (kBrowserPageSize * kBrowserBufferedPages))) {
+        loadMoreBrowserDiscoveries(false);
+        return;
+    }
+
+    trimBrowserDiscoveryWindow();
+}
+
+void MainWindow::trimBrowserDiscoveryWindow()
+{
+    if (discoveriesList_ == nullptr) {
+        return;
+    }
+
+    const int maxItems = kBrowserPageSize * kBrowserMaxWindowPages;
+    if (browserLoadedDiscoveries_.size() <= maxItems) {
+        return;
+    }
+
+    QScrollBar *scrollBar = discoveriesList_->verticalScrollBar();
+    if (scrollBar == nullptr) {
+        return;
+    }
+
+    int firstVisibleIndex = discoveriesList_->indexAt(QPoint(8, 8)).row();
+    if (firstVisibleIndex < 0) {
+        firstVisibleIndex = 0;
+    }
+    int lastVisibleIndex = firstVisibleIndex;
+    const QRect viewportRect = discoveriesList_->viewport()->rect();
+    for (int index = firstVisibleIndex; index < discoveriesList_->count(); ++index) {
+        QListWidgetItem *item = discoveriesList_->item(index);
+        if (item == nullptr || !discoveriesList_->visualItemRect(item).intersects(viewportRect)) {
+            continue;
+        }
+        lastVisibleIndex = index;
+    }
+
+    const int visibleColumns = qMax(1, discoveriesList_->viewport()->width() / qMax(1, discoveriesList_->gridSize().width()));
+    const int gridHeight = qMax(1, discoveriesList_->gridSize().height());
+    while (browserLoadedDiscoveries_.size() > maxItems
+           && firstVisibleIndex > (kBrowserPageSize * (kBrowserBufferedPages + 1))) {
+        const int removeCount = qMin(kBrowserPageSize, browserLoadedDiscoveries_.size() - maxItems);
+        browserLoadedDiscoveries_.remove(0, removeCount);
+        for (int row = 0; row < removeCount; ++row) {
+            delete discoveriesList_->takeItem(0);
+        }
+        browserLoadedOffset_ += removeCount;
+        firstVisibleIndex -= removeCount;
+        lastVisibleIndex -= removeCount;
+        const int removedRows = (removeCount + visibleColumns - 1) / visibleColumns;
+        scrollBar->setValue(qMax(0, scrollBar->value() - removedRows * gridHeight));
+    }
+
+    while (browserLoadedDiscoveries_.size() > maxItems
+           && (browserLoadedDiscoveries_.size() - (lastVisibleIndex + 1))
+               > (kBrowserPageSize * (kBrowserBufferedPages + 1))) {
+        const int removeCount = qMin(kBrowserPageSize, browserLoadedDiscoveries_.size() - maxItems);
+        const int startIndex = browserLoadedDiscoveries_.size() - removeCount;
+        browserLoadedDiscoveries_.remove(startIndex, removeCount);
+        for (int row = 0; row < removeCount; ++row) {
+            delete discoveriesList_->takeItem(discoveriesList_->count() - 1);
+        }
+    }
+}
+
+void MainWindow::requestVisibleBrowserThumbnails()
+{
+    if (discoveriesList_ == nullptr || browserLoadedDiscoveries_.isEmpty()) {
+        return;
+    }
+
+    const QRect viewportRect = discoveriesList_->viewport()->rect();
+    for (int index = 0; index < browserLoadedDiscoveries_.size() && index < discoveriesList_->count(); ++index) {
+        QListWidgetItem *item = discoveriesList_->item(index);
+        if (item == nullptr || !discoveriesList_->visualItemRect(item).intersects(viewportRect)) {
+            continue;
+        }
+        requestBrowserThumbnail(browserLoadedDiscoveries_.at(index));
+    }
+}
+
+void MainWindow::scheduleBackgroundBrowserThumbnailPrefetch()
+{
+    if (browserBackgroundThumbnailPrefetchScheduled_ || discoveriesList_ == nullptr) {
+        return;
+    }
+
+    browserBackgroundThumbnailPrefetchScheduled_ = true;
+    QTimer::singleShot(180, this, [this]() {
+        browserBackgroundThumbnailPrefetchScheduled_ = false;
+        if (discoveriesList_ == nullptr) {
+            return;
+        }
+
+        const QRect viewportRect = discoveriesList_->viewport()->rect();
+        int requested = 0;
+        bool morePending = false;
+        for (int index = 0; index < browserLoadedDiscoveries_.size() && index < discoveriesList_->count(); ++index) {
+            const AttachmentDiscovery &discovery = browserLoadedDiscoveries_.at(index);
+            QListWidgetItem *item = discoveriesList_->item(index);
+            if (item == nullptr || discoveriesList_->visualItemRect(item).intersects(viewportRect)) {
+                continue;
+            }
+
+            const QString cacheKey = browserThumbnailKey(discovery);
+            if (browserThumbnailIconCache_.contains(cacheKey) || browserThumbnailRequestsInFlight_.contains(cacheKey)) {
+                continue;
+            }
+
+            if (requested >= kBrowserBackgroundThumbnailBatchSize) {
+                morePending = true;
+                break;
+            }
+
+            requestBrowserThumbnail(discovery);
+            ++requested;
+        }
+
+        if (morePending) {
+            scheduleBackgroundBrowserThumbnailPrefetch();
+        }
+    });
+}
+
+QString MainWindow::browserThumbnailKey(const AttachmentDiscovery &discovery) const
+{
+    const QString imageUrl = browserThumbnailUrl(discovery);
+    if (!imageUrl.isEmpty()) {
+        return imageUrl;
+    }
+    return QStringLiteral("placeholder:%1:%2").arg(discovery.roomId, discovery.eventId);
+}
+
+QString MainWindow::browserThumbnailUrl(const AttachmentDiscovery &discovery) const
+{
+    const auto isHttpSource = [](const QString &value) {
+        const QUrl url(value);
+        return url.isValid() && (url.scheme() == QStringLiteral("http") || url.scheme() == QStringLiteral("https"));
+    };
+    const auto isLocalFile = [](const QString &value) {
+        return !value.trimmed().isEmpty() && QFileInfo::exists(value);
+    };
+
+    if (isLocalFile(discovery.thumbnailCachedPath)) {
+        return QUrl::fromLocalFile(discovery.thumbnailCachedPath).toString();
+    }
+
+    if (discovery.sourceKind == MediaSourceKind::Matrix
+        && (discovery.category == MediaCategory::Images || discovery.category == MediaCategory::Videos)) {
+        const QString matrixSource = discovery.thumbnailSourceUrl.isEmpty()
+            ? discovery.mxcUrl
+            : discovery.thumbnailSourceUrl;
+        const QString url = matrixThumbnailUrl(controller_->settings().homeserverUrl, matrixSource, 384);
+        if (!url.isEmpty()) {
+            return url;
+        }
+    }
+
+    if (discovery.category == MediaCategory::Images
+        && isHttpSource(!discovery.thumbnailSourceUrl.isEmpty() ? discovery.thumbnailSourceUrl : discovery.directUrl)) {
+        return !discovery.thumbnailSourceUrl.isEmpty() ? discovery.thumbnailSourceUrl : discovery.directUrl;
+    }
+
+    return {};
+}
+
+QIcon MainWindow::placeholderDiscoveryIcon(const AttachmentDiscovery &discovery) const
+{
+    const QString title = discovery.originalFilename.isEmpty() ? discovery.eventId : discovery.originalFilename;
+    const QString subtitle = QStringLiteral("%1 | %2")
+                                 .arg(mediaCategoryTitle(discovery.category), mediaSourceKindTitle(discovery.sourceKind));
+    const QPixmap tile = renderDiscoveryTile(
+        QSize(kDiscoveryTileWidth, kDiscoveryTileHeight),
+        title,
+        subtitle,
+        categoryAccent(discovery.category),
+        nullptr,
+        discovery.category == MediaCategory::Videos);
+    return QIcon(tile);
+}
+
+void MainWindow::requestBrowserThumbnail(const AttachmentDiscovery &discovery)
+{
+    if (thumbnailNetworkManager_ == nullptr) {
+        return;
+    }
+
+    const QString cacheKey = browserThumbnailKey(discovery);
+    if (cacheKey.startsWith(QStringLiteral("placeholder:"))
+        || browserThumbnailRequestsInFlight_.contains(cacheKey)
+        || browserThumbnailIconCache_.contains(cacheKey)) {
+        return;
+    }
+
+    const QString url = browserThumbnailUrl(discovery);
+    if (url.isEmpty()) {
+        return;
+    }
+
+    QNetworkRequest request {QUrl(url)};
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+    browserThumbnailRequestsInFlight_.insert(cacheKey);
+    QNetworkReply *reply = thumbnailNetworkManager_->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, cacheKey, discovery]() {
+        browserThumbnailRequestsInFlight_.remove(cacheKey);
+
+        if (reply == nullptr || reply->error() != QNetworkReply::NoError) {
+            if (reply != nullptr) {
+                reply->deleteLater();
+            }
+            return;
+        }
+
+        const QByteArray bytes = reply->readAll();
+        reply->deleteLater();
+
+        QPixmap preview;
+        if (!preview.loadFromData(bytes)) {
+            return;
+        }
+
+        const QString title = discovery.originalFilename.isEmpty() ? discovery.eventId : discovery.originalFilename;
+        const QString subtitle = QStringLiteral("%1 | %2")
+                                     .arg(mediaCategoryTitle(discovery.category), mediaSourceKindTitle(discovery.sourceKind));
+        const QPixmap tile = renderDiscoveryTile(
+            QSize(kDiscoveryTileWidth, kDiscoveryTileHeight),
+            title,
+            subtitle,
+            categoryAccent(discovery.category),
+            &preview,
+            discovery.category == MediaCategory::Videos);
+        const QIcon icon(tile);
+        cacheBrowserThumbnailIcon(cacheKey, icon);
+        updateBrowserThumbnailItems(cacheKey, icon);
+    });
+}
+
+void MainWindow::cacheBrowserThumbnailIcon(const QString &cacheKey, const QIcon &icon)
+{
+    if (cacheKey.isEmpty()) {
+        return;
+    }
+
+    if (!browserThumbnailIconCache_.contains(cacheKey)) {
+        browserThumbnailCacheOrder_.append(cacheKey);
+    }
+    browserThumbnailIconCache_.insert(cacheKey, icon);
+
+    while (browserThumbnailCacheOrder_.size() > kBrowserThumbnailCacheLimit) {
+        const QString expiredKey = browserThumbnailCacheOrder_.takeFirst();
+        if (!expiredKey.isEmpty()) {
+            browserThumbnailIconCache_.remove(expiredKey);
+        }
+    }
+}
+
+void MainWindow::updateBrowserThumbnailItems(const QString &cacheKey, const QIcon &icon)
+{
+    if (discoveriesList_ == nullptr) {
+        return;
+    }
+
+    Q_UNUSED(icon);
+
+    for (int index = 0; index < discoveriesList_->count(); ++index) {
+        QListWidgetItem *item = discoveriesList_->item(index);
+        if (item == nullptr) {
+            continue;
+        }
+        if (item->data(Qt::UserRole + 2).toString() == cacheKey) {
+            if (index >= 0 && index < browserLoadedDiscoveries_.size()) {
+                applyDiscoveryPresentation(item, browserLoadedDiscoveries_.at(index));
+            }
+        }
+    }
+}
+
+void MainWindow::resetLogsPageState()
+{
+    loadedLogEntries_.clear();
+    logsLoadedOffset_ = 0;
+    logTotalCount_ = 0;
+    logsLoadingPage_ = false;
+    if (logsTable_ != nullptr) {
+        logsTable_->setRowCount(0);
+    }
+}
+
+void MainWindow::loadMoreLogs(const bool reset)
+{
+    if (logsTable_ == nullptr || logsLoadingPage_) {
+        return;
+    }
+
+    if (reset) {
+        resetLogsPageState();
+        logsProblemsOnly_ = logProblemsOnlyCheck_ != nullptr && logProblemsOnlyCheck_->isChecked();
+        logTotalCount_ = controller_->logCount(logsProblemsOnly_);
+    }
+
+    if (loadedLogEntries_.size() >= logTotalCount_) {
+        return;
+    }
+
+    logsLoadingPage_ = true;
+    const QVector<ActivityLogEntry> page = controller_->fetchLogsPage(
+        logsLoadedOffset_ + loadedLogEntries_.size(),
+        kLogsPageSize,
+        logsProblemsOnly_);
+
+    logsTable_->setUpdatesEnabled(false);
+    for (const ActivityLogEntry &entry : page) {
+        const int row = logsTable_->rowCount();
+        logsTable_->insertRow(row);
+
+        const QString levelText = appLogLevelTitle(entry.level);
+        const QString timeText = entry.createdAt.isValid()
+            ? QLocale().toString(entry.createdAt.toLocalTime(), QLocale::ShortFormat)
+            : QStringLiteral("Unknown");
+
+        auto *timeItem = new QTableWidgetItem(timeText);
+        auto *levelItem = new QTableWidgetItem(levelText);
+        auto *subsystemItem = new QTableWidgetItem(entry.subsystem);
+        auto *messageItem = new QTableWidgetItem(entry.message);
+        timeItem->setToolTip(entry.createdAt.toString(Qt::ISODateWithMs));
+        messageItem->setToolTip(entry.message);
+
+        logsTable_->setItem(row, 0, timeItem);
+        logsTable_->setItem(row, 1, levelItem);
+        logsTable_->setItem(row, 2, subsystemItem);
+        logsTable_->setItem(row, 3, messageItem);
+        loadedLogEntries_.append(entry);
+    }
+    logsTable_->setUpdatesEnabled(true);
+    logsLoadingPage_ = false;
+
+    if (logsSummaryLabel_ != nullptr) {
+        const QString filterText = logsProblemsOnly_
+            ? QStringLiteral("warnings/errors")
+            : QStringLiteral("all entries");
+        logsSummaryLabel_->setText(
+            QStringLiteral("Showing %1 of %2 %3 from the local activity log. Newest entries appear first.")
+                .arg(loadedLogEntries_.size())
+                .arg(logTotalCount_)
+                .arg(filterText));
+    }
+
+    if (!page.isEmpty() && loadedLogEntries_.size() < logTotalCount_) {
+        QTimer::singleShot(0, this, [this]() {
+            maybeLoadMoreLogs();
+        });
+    }
+}
+
+void MainWindow::maybeLoadMoreLogs()
+{
+    if (logsTable_ == nullptr
+        || logsLoadingPage_
+        || logTotalCount_ <= 0
+        || loadedLogEntries_.isEmpty()) {
+        return;
+    }
+
+    QScrollBar *scrollBar = logsTable_->verticalScrollBar();
+    if (scrollBar == nullptr) {
+        return;
+    }
+
+    int firstVisibleRow = logsTable_->rowAt(0);
+    if (firstVisibleRow < 0) {
+        firstVisibleRow = 0;
+    }
+    int lastVisibleRow = logsTable_->rowAt(logsTable_->viewport()->height() - 1);
+    if (lastVisibleRow < 0) {
+        lastVisibleRow = qMin(logsTable_->rowCount() - 1, kLogsPageSize - 1);
+    }
+
+    const int rowHeight = logsTable_->rowCount() > 0
+        ? logsTable_->rowHeight(0)
+        : logsTable_->verticalHeader()->defaultSectionSize();
+
+    if (logsLoadedOffset_ > 0 && firstVisibleRow <= (kLogsPageSize * kLogsBufferedPages)) {
+        const int prependCount = qMin(kLogsPageSize, logsLoadedOffset_);
+        const int newOffset = logsLoadedOffset_ - prependCount;
+        const QVector<ActivityLogEntry> page = controller_->fetchLogsPage(
+            newOffset,
+            prependCount,
+            logsProblemsOnly_);
+        if (!page.isEmpty()) {
+            logsTable_->setUpdatesEnabled(false);
+            for (int index = page.size() - 1; index >= 0; --index) {
+                const ActivityLogEntry &entry = page.at(index);
+                logsTable_->insertRow(0);
+
+                const QString levelText = appLogLevelTitle(entry.level);
+                const QString timeText = entry.createdAt.isValid()
+                    ? QLocale().toString(entry.createdAt.toLocalTime(), QLocale::ShortFormat)
+                    : QStringLiteral("Unknown");
+
+                auto *timeItem = new QTableWidgetItem(timeText);
+                auto *levelItem = new QTableWidgetItem(levelText);
+                auto *subsystemItem = new QTableWidgetItem(entry.subsystem);
+                auto *messageItem = new QTableWidgetItem(entry.message);
+                timeItem->setToolTip(entry.createdAt.toString(Qt::ISODateWithMs));
+                messageItem->setToolTip(entry.message);
+
+                logsTable_->setItem(0, 0, timeItem);
+                logsTable_->setItem(0, 1, levelItem);
+                logsTable_->setItem(0, 2, subsystemItem);
+                logsTable_->setItem(0, 3, messageItem);
+                loadedLogEntries_.prepend(entry);
+            }
+            logsTable_->setUpdatesEnabled(true);
+            logsLoadedOffset_ = newOffset;
+            scrollBar->setValue(scrollBar->value() + (page.size() * rowHeight));
+        }
+    }
+
+    const int bufferedAhead = loadedLogEntries_.size() - (lastVisibleRow + 1);
+    if ((logsLoadedOffset_ + loadedLogEntries_.size()) < logTotalCount_
+        && (scrollBar->maximum() <= 0 || bufferedAhead <= (kLogsPageSize * kLogsBufferedPages))) {
+        loadMoreLogs(false);
+        return;
+    }
+
+    trimLogWindow();
+    if (logsSummaryLabel_ != nullptr) {
+        const QString filterText = logsProblemsOnly_
+            ? QStringLiteral("warnings/errors")
+            : QStringLiteral("all entries");
+        logsSummaryLabel_->setText(
+            QStringLiteral("Showing %1 of %2 %3 from the local activity log. Newest entries appear first.")
+                .arg(loadedLogEntries_.size())
+                .arg(logTotalCount_)
+                .arg(filterText));
+    }
+}
+
+void MainWindow::trimLogWindow()
+{
+    if (logsTable_ == nullptr) {
+        return;
+    }
+
+    const int maxRows = kLogsPageSize * kLogsMaxWindowPages;
+    if (loadedLogEntries_.size() <= maxRows) {
+        return;
+    }
+
+    QScrollBar *scrollBar = logsTable_->verticalScrollBar();
+    if (scrollBar == nullptr) {
+        return;
+    }
+
+    int firstVisibleRow = logsTable_->rowAt(0);
+    if (firstVisibleRow < 0) {
+        firstVisibleRow = 0;
+    }
+    int lastVisibleRow = logsTable_->rowAt(logsTable_->viewport()->height() - 1);
+    if (lastVisibleRow < 0) {
+        lastVisibleRow = qMin(logsTable_->rowCount() - 1, kLogsPageSize - 1);
+    }
+
+    const int rowHeight = logsTable_->rowCount() > 0
+        ? logsTable_->rowHeight(0)
+        : logsTable_->verticalHeader()->defaultSectionSize();
+
+    while (loadedLogEntries_.size() > maxRows
+           && firstVisibleRow > (kLogsPageSize * (kLogsBufferedPages + 1))) {
+        const int removeCount = qMin(kLogsPageSize, loadedLogEntries_.size() - maxRows);
+        loadedLogEntries_.remove(0, removeCount);
+        logsLoadedOffset_ += removeCount;
+        for (int row = 0; row < removeCount; ++row) {
+            logsTable_->removeRow(0);
+        }
+        firstVisibleRow -= removeCount;
+        lastVisibleRow -= removeCount;
+        scrollBar->setValue(qMax(0, scrollBar->value() - (removeCount * rowHeight)));
+    }
+
+    while (loadedLogEntries_.size() > maxRows
+           && (loadedLogEntries_.size() - (lastVisibleRow + 1))
+               > (kLogsPageSize * (kLogsBufferedPages + 1))) {
+        const int removeCount = qMin(kLogsPageSize, loadedLogEntries_.size() - maxRows);
+        for (int row = 0; row < removeCount; ++row) {
+            loadedLogEntries_.removeLast();
+            logsTable_->removeRow(logsTable_->rowCount() - 1);
+        }
+    }
+}
+
+bool MainWindow::saveSettingsFromUi(const bool interactive)
+{
+    if (!settingsPageInitialized_) {
+        return true;
+    }
+
+    if (!controller_->saveSettings(gatherSettingsFromUi(), passwordEdit_->text())) {
+        if (interactive && controller_->lastErrorMessage().trimmed().isEmpty()) {
+            controller_->recordError(QStringLiteral("settings"), QStringLiteral("Failed to save settings."));
+        }
+        return false;
+    }
+
+    settingsDirty_ = false;
+    return true;
+}
+
+void MainWindow::markSettingsDirty()
+{
+    if (populatingSettingsUi_) {
+        return;
+    }
+    settingsDirty_ = true;
+}
+
 QString MainWindow::roomDisplayTitle(const RoomRecord &room) const
 {
     if (!room.currentDisplayName.isEmpty()) {
@@ -830,11 +2429,100 @@ QString MainWindow::roomDisplayTitle(const RoomRecord &room) const
     return room.roomId;
 }
 
+AppSection MainWindow::currentSection() const
+{
+    const QList<AppSection> sections = allSections();
+    const int index = stack_ != nullptr ? stack_->currentIndex() : -1;
+    if (index >= 0 && index < sections.size()) {
+        return sections.at(index);
+    }
+    return AppSection::Browser;
+}
+
+QVector<RoomRecord> MainWindow::roomSidebarRoomsForCurrentSection() const
+{
+    if (currentSection() == AppSection::Browser) {
+        QVector<RoomRecord> rooms;
+        for (const RoomRecord &room : controller_->rooms()) {
+            if (room.isSpace) {
+                continue;
+            }
+            if (room.membership == QStringLiteral("joined") || room.discoveredMediaCount > 0) {
+                rooms.append(room);
+            }
+        }
+        return rooms;
+    }
+
+    return controller_->rooms();
+}
+
+QString MainWindow::selectedRoomId() const
+{
+    return roomsList_ != nullptr && roomsList_->currentItem() != nullptr
+        ? roomsList_->currentItem()->data(Qt::UserRole).toString()
+        : QString();
+}
+
+QString MainWindow::selectedBrowserRoomId() const
+{
+    if (currentSection() == AppSection::Browser) {
+        return selectedRoomId();
+    }
+    return browserSelectedRoomId_;
+}
+
+bool MainWindow::isUploadableBrowserRoom(const QString &roomId) const
+{
+    for (const RoomRecord &room : controller_->rooms()) {
+        if (room.roomId == roomId) {
+            return !room.isSpace && room.membership == QStringLiteral("joined");
+        }
+    }
+    return false;
+}
+
+bool MainWindow::currentSectionUsesRoomSidebar() const
+{
+    return sectionUsesRoomSidebar(currentSection());
+}
+
+void MainWindow::updateRoomSidebarVisibility()
+{
+    if (roomSidebarContainer_ == nullptr) {
+        return;
+    }
+    roomSidebarContainer_->setVisible(currentSectionUsesRoomSidebar());
+}
+
+bool MainWindow::eventFilter(QObject *watched, QEvent *event)
+{
+    if (currentSection() == AppSection::Browser
+        && (watched == browserPage_
+            || watched == discoveriesList_
+            || (discoveriesList_ != nullptr && watched == discoveriesList_->viewport()))
+        && event != nullptr) {
+        switch (event->type()) {
+        case QEvent::DragEnter:
+            dragEnterEvent(static_cast<QDragEnterEvent *>(event));
+            return event->isAccepted();
+        case QEvent::DragMove:
+            dragMoveEvent(static_cast<QDragMoveEvent *>(event));
+            return event->isAccepted();
+        case QEvent::Drop:
+            dropEvent(static_cast<QDropEvent *>(event));
+            return event->isAccepted();
+        default:
+            break;
+        }
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
 void MainWindow::dragEnterEvent(QDragEnterEvent *event)
 {
     if (event != nullptr
-        && stack_ != nullptr
-        && stack_->currentIndex() == 1
+        && currentSection() == AppSection::Browser
         && event->mimeData() != nullptr
         && event->mimeData()->hasUrls()) {
         event->acceptProposedAction();
@@ -846,8 +2534,7 @@ void MainWindow::dragEnterEvent(QDragEnterEvent *event)
 void MainWindow::dragMoveEvent(QDragMoveEvent *event)
 {
     if (event != nullptr
-        && stack_ != nullptr
-        && stack_->currentIndex() == 1
+        && currentSection() == AppSection::Browser
         && event->mimeData() != nullptr
         && event->mimeData()->hasUrls()) {
         event->acceptProposedAction();
@@ -858,14 +2545,18 @@ void MainWindow::dragMoveEvent(QDragMoveEvent *event)
 
 void MainWindow::dropEvent(QDropEvent *event)
 {
-    if (event == nullptr || stack_ == nullptr || stack_->currentIndex() != 1 || event->mimeData() == nullptr) {
+    if (event == nullptr
+        || currentSection() != AppSection::Browser
+        || event->mimeData() == nullptr) {
         QMainWindow::dropEvent(event);
         return;
     }
 
-    const QString roomId = shareRoomCombo_ != nullptr ? shareRoomCombo_->currentData().toString() : QString {};
-    if (roomId.isEmpty()) {
-        QMessageBox::information(this, QStringLiteral("Matrix Media Share Client"), QStringLiteral("Pick a destination room before dropping files."));
+    const QString roomId = selectedBrowserRoomId();
+    if (!isUploadableBrowserRoom(roomId)) {
+        controller_->recordWarning(
+            QStringLiteral("share"),
+            QStringLiteral("Pick a joined room before dropping files."));
         event->ignore();
         return;
     }

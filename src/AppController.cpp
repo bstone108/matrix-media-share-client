@@ -133,6 +133,7 @@ AppController::AppController(QObject *parent)
             return;
         }
         lastErrorMessage_ = message;
+        logError(QStringLiteral("backend"), message);
         updateRefreshTimer();
         scheduleRefresh();
     });
@@ -143,6 +144,15 @@ void AppController::initialize()
     settings_ = database_.loadSettings(defaultDestinationRootPath());
     password_ = secretStore_.loadPassword();
     updateCheckState_ = database_.loadUpdateCheckState();
+    logInfo(QStringLiteral("app"), QStringLiteral("Application initialized."));
+    logInfo(
+        QStringLiteral("settings"),
+        QStringLiteral("Settings database: %1 | Secret store: %2")
+            .arg(QDir::toNativeSeparators(paths_.databasePath()), QDir::toNativeSeparators(paths_.secretStorePath())));
+    if (!database_.lastErrorText().trimmed().isEmpty()) {
+        lastErrorMessage_ = QStringLiteral("Settings storage error: %1").arg(database_.lastErrorText().trimmed());
+        logError(QStringLiteral("settings"), lastErrorMessage_);
+    }
     refresh();
     updateRefreshTimer();
 
@@ -161,9 +171,7 @@ void AppController::refresh()
 {
     refreshQueued_ = false;
     rooms_ = database_.fetchRooms();
-    discoveries_ = database_.fetchDiscoveries();
     jobs_ = database_.fetchJobs();
-    logs_ = database_.fetchRecentLogs();
     waitingQueueCount_ = database_.fetchWaitingJobCount();
     emit stateChanged();
 }
@@ -188,9 +196,14 @@ const QVector<RoomRecord> &AppController::rooms() const
     return rooms_;
 }
 
-const QVector<AttachmentDiscovery> &AppController::discoveries() const
+QVector<AttachmentDiscovery> AppController::fetchDiscoveriesPage(const QString &roomId, const int offset, const int limit) const
 {
-    return discoveries_;
+    return database_.fetchDiscoveriesPage(roomId, offset, limit);
+}
+
+int AppController::discoveryCount(const QString &roomId) const
+{
+    return database_.fetchDiscoveryCount(roomId);
 }
 
 QVector<RoomRecord> AppController::joinedRooms() const
@@ -220,23 +233,14 @@ const QVector<DownloadJobRecord> &AppController::jobs() const
     return jobs_;
 }
 
-const QVector<ActivityLogEntry> &AppController::logs() const
+QVector<ActivityLogEntry> AppController::fetchLogsPage(const int offset, const int limit, const bool problemsOnly) const
 {
-    return logs_;
+    return database_.fetchLogsPage(offset, limit, problemsOnly);
 }
 
-QVector<ActivityLogEntry> AppController::visibleLogs() const
+int AppController::logCount(const bool problemsOnly) const
 {
-    QVector<ActivityLogEntry> result;
-    for (const ActivityLogEntry &entry : logs_) {
-        if (entry.subsystem == QStringLiteral("queue")
-            || entry.subsystem == QStringLiteral("commands")
-            || entry.level == AppLogLevel::Warning
-            || entry.level == AppLogLevel::Error) {
-            result.append(entry);
-        }
-    }
-    return result;
+    return database_.fetchLogCount(problemsOnly);
 }
 
 int AppController::waitingQueueCount() const
@@ -320,10 +324,50 @@ QString AppController::latestReleasePageUrl() const
     return QString::fromLatin1(kReleasesPageUrl);
 }
 
+QString AppController::settingsDatabasePath() const
+{
+    return paths_.databasePath();
+}
+
+QString AppController::secretStorePath() const
+{
+    return paths_.secretStorePath();
+}
+
+void AppController::recordInfo(const QString &subsystem, const QString &message)
+{
+    if (message.trimmed().isEmpty()) {
+        return;
+    }
+    logInfo(subsystem, message.trimmed());
+    scheduleRefresh();
+}
+
+void AppController::recordWarning(const QString &subsystem, const QString &message)
+{
+    if (message.trimmed().isEmpty()) {
+        return;
+    }
+    logWarning(subsystem, message.trimmed());
+    scheduleRefresh();
+}
+
+void AppController::recordError(const QString &subsystem, const QString &message)
+{
+    if (message.trimmed().isEmpty()) {
+        return;
+    }
+    logError(subsystem, message.trimmed());
+    scheduleRefresh();
+}
+
 void AppController::togglePower(const bool enabled)
 {
     settings_.desiredPowerState = enabled;
-    database_.saveSettings(settings_);
+    if (!database_.saveSettings(settings_)) {
+        lastErrorMessage_ = QStringLiteral("Failed to save power state: %1").arg(database_.lastErrorText().trimmed());
+        logError(QStringLiteral("settings"), lastErrorMessage_);
+    }
 
     if (!enabled) {
         QString errorMessage;
@@ -354,11 +398,18 @@ void AppController::togglePower(const bool enabled)
     refresh();
 }
 
-void AppController::saveSettings(const AppSettings &settings, const QString &password)
+bool AppController::saveSettings(const AppSettings &settings, const QString &password)
 {
     settings_ = settings;
     password_ = password;
-    database_.saveSettings(settings_);
+    if (!database_.saveSettings(settings_)) {
+        lastErrorMessage_ = QStringLiteral("Failed to save settings: %1").arg(database_.lastErrorText().trimmed());
+        logError(QStringLiteral("settings"), lastErrorMessage_);
+        updateRefreshTimer();
+        refresh();
+        return false;
+    }
+
     secretStore_.savePassword(password_);
 
     QString errorMessage;
@@ -372,6 +423,7 @@ void AppController::saveSettings(const AppSettings &settings, const QString &pas
 
     updateRefreshTimer();
     refresh();
+    return true;
 }
 
 void AppController::resetHistoryScans()
@@ -459,6 +511,21 @@ void AppController::openDiscovery(const QString &roomId, const QString &eventId)
         logInfo(QStringLiteral("browser"), QStringLiteral("Opening %1 from %2.").arg(eventId, roomId));
     }
     refresh();
+}
+
+void AppController::focusRoom(const QString &roomId)
+{
+    const QString trimmedRoomId = roomId.trimmed();
+    if (trimmedRoomId.isEmpty() || runtime_.connectionState != ConnectionState::Running) {
+        return;
+    }
+
+    QString errorMessage;
+    if (!backend_->focusRoom(trimmedRoomId, errorMessage) && !errorMessage.trimmed().isEmpty()) {
+        lastErrorMessage_ = errorMessage;
+        logWarning(QStringLiteral("rooms"), QStringLiteral("Unable to prioritize %1: %2").arg(trimmedRoomId, errorMessage));
+        refresh();
+    }
 }
 
 void AppController::shareLocalFile(const QString &roomId, const QString &filePath)

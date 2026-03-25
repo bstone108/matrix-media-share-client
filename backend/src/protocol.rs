@@ -36,6 +36,9 @@ pub enum Command {
         room_id: String,
         event_id: String,
     },
+    FocusRoom {
+        room_id: String,
+    },
     OpenMedia {
         media_item_id: i64,
     },

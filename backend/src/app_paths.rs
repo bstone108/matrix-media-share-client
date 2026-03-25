@@ -12,6 +12,7 @@ pub struct AppPaths {
     pub matrix_data_path: PathBuf,
     pub matrix_cache_path: PathBuf,
     pub temp_downloads_path: PathBuf,
+    pub thumbnail_cache_path: PathBuf,
     pub library_path: PathBuf,
     pub manual_downloads_path: PathBuf,
     pub landing_pages_path: PathBuf,
@@ -27,6 +28,7 @@ impl AppPaths {
             matrix_data_path: root_path.join("matrix-sdk").join("data"),
             matrix_cache_path: root_path.join("matrix-sdk").join("cache"),
             temp_downloads_path: root_path.join("tmp-downloads"),
+            thumbnail_cache_path: root_path.join("thumbnail-cache"),
             library_path: root_path.join("shared-files"),
             manual_downloads_path: root_path.join("downloads"),
             landing_pages_path: root_path.join("gateway-pages"),
@@ -42,6 +44,7 @@ impl AppPaths {
         self.ensure_directory(&self.matrix_data_path)?;
         self.ensure_directory(&self.matrix_cache_path)?;
         self.ensure_directory(&self.temp_downloads_path)?;
+        self.ensure_directory(&self.thumbnail_cache_path)?;
         self.ensure_directory(&self.library_path)?;
         self.ensure_directory(&self.manual_downloads_path)?;
         self.ensure_directory(&self.landing_pages_path)?;

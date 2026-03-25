@@ -81,6 +81,7 @@ impl AppDatabase {
             owner_user_id: String::new(),
             destination_root_path: default_destination_root_path.to_owned(),
             library_root_path: format!("{default_destination_root_path}/Shared Files"),
+            flat_folder_layout: false,
             archive_root_path: String::new(),
             archive_scan_enabled: false,
             archive_scan_high_priority: false,
@@ -123,7 +124,7 @@ impl AppDatabase {
         connection.execute(
             "INSERT INTO app_settings (
                 homeserver_url, username, owner_user_id, destination_root_path,
-                library_root_path, archive_root_path, archive_scan_enabled, archive_scan_high_priority,
+                library_root_path, flat_folder_layout, archive_root_path, archive_scan_enabled, archive_scan_high_priority,
                 manual_download_root_path,
                 message_limit, time_window_value, time_window_unit,
                 retry_cooldown_minutes, retry_limit, download_worker_count,
@@ -133,13 +134,14 @@ impl AppDatabase {
                 bandwidth_limit_kib_per_sec, preview_worker_count,
                 auto_join_space_rooms, auto_download_new_media,
                 desired_power_state, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             params![
                 settings.homeserver_url,
                 settings.username,
                 settings.owner_user_id,
                 settings.destination_root_path,
                 settings.library_root_path,
+                if settings.flat_folder_layout { 1 } else { 0 },
                 settings.archive_root_path,
                 if settings.archive_scan_enabled { 1 } else { 0 },
                 if settings.archive_scan_high_priority { 1 } else { 0 },
@@ -446,10 +448,18 @@ impl AppDatabase {
         queue_download: bool,
     ) -> Result<bool> {
         let connection = self.inner.lock().await;
+        let existed = connection
+            .query_row(
+                "SELECT 1 FROM discovered_attachments WHERE room_id = ?1 AND event_id = ?2",
+                params![discovery.room_id, discovery.event_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
         connection.execute(
             "INSERT OR IGNORE INTO discovered_attachments (
-                room_id, event_id, origin_ts, source_kind, direct_url, mxc_url, original_filename, mime_type, category
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                room_id, event_id, origin_ts, source_kind, direct_url, mxc_url, thumbnail_source_url, thumbnail_cached_path, original_filename, mime_type, category
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 discovery.room_id,
                 discovery.event_id,
@@ -457,12 +467,39 @@ impl AppDatabase {
                 discovery.source_kind.as_storage_key(),
                 discovery.direct_url,
                 discovery.mxc_url,
+                discovery.thumbnail_source_url,
+                discovery.thumbnail_cached_path,
                 discovery.original_filename,
                 discovery.mime_type,
                 discovery.category.as_storage_key(),
             ],
         )?;
-        if connection.changes() == 0 {
+        connection.execute(
+            "UPDATE discovered_attachments
+             SET source_kind = ?3,
+                 direct_url = COALESCE(?4, direct_url),
+                 mxc_url = ?5,
+                 thumbnail_source_url = COALESCE(?6, thumbnail_source_url),
+                 thumbnail_cached_path = COALESCE(?7, thumbnail_cached_path),
+                 original_filename = COALESCE(?8, original_filename),
+                 mime_type = COALESCE(?9, mime_type),
+                 category = ?10
+             WHERE room_id = ?1 AND event_id = ?2",
+            params![
+                discovery.room_id,
+                discovery.event_id,
+                discovery.source_kind.as_storage_key(),
+                discovery.direct_url,
+                discovery.mxc_url,
+                discovery.thumbnail_source_url,
+                discovery.thumbnail_cached_path,
+                discovery.original_filename,
+                discovery.mime_type,
+                discovery.category.as_storage_key(),
+            ],
+        )?;
+
+        if existed {
             return Ok(false);
         }
 
@@ -535,7 +572,7 @@ impl AppDatabase {
         let connection = self.inner.lock().await;
         connection
             .query_row(
-                "SELECT room_id, event_id, origin_ts, source_kind, direct_url, mxc_url, original_filename, mime_type, category
+                "SELECT room_id, event_id, origin_ts, source_kind, direct_url, mxc_url, thumbnail_source_url, thumbnail_cached_path, original_filename, mime_type, category
                  FROM discovered_attachments
                  WHERE room_id = ?1 AND event_id = ?2",
                 params![room_id, event_id],
@@ -543,6 +580,56 @@ impl AppDatabase {
             )
             .optional()
             .context("Failed to load discovery record")
+    }
+
+    pub async fn set_discovery_thumbnail_cached_path(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        thumbnail_cached_path: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.inner.lock().await;
+        connection.execute(
+            "UPDATE discovered_attachments
+             SET thumbnail_cached_path = ?3
+             WHERE room_id = ?1 AND event_id = ?2",
+            params![room_id, event_id, thumbnail_cached_path],
+        )?;
+        Ok(())
+    }
+
+    pub async fn prune_discovery_cache(&self, max_entries: usize) -> Result<Vec<String>> {
+        let connection = self.inner.lock().await;
+        let mut statement = connection.prepare(
+            "SELECT id, thumbnail_cached_path
+             FROM discovered_attachments
+             ORDER BY origin_ts DESC, id DESC
+             LIMIT -1 OFFSET ?1",
+        )?;
+        let stale_rows = statement
+            .query_map(params![max_entries as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+
+        if stale_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let stale_ids = stale_rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let thumbnail_paths = stale_rows
+            .into_iter()
+            .filter_map(|(_, path)| path)
+            .collect::<Vec<_>>();
+
+        let placeholders = std::iter::repeat("?")
+            .take(stale_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM discovered_attachments WHERE id IN ({placeholders})");
+        connection.execute(&sql, rusqlite::params_from_iter(stale_ids.iter()))?;
+        Ok(thumbnail_paths)
     }
 
     pub async fn mark_job_queued(&self, id: i64, last_error: Option<&str>) -> Result<()> {
@@ -1036,6 +1123,7 @@ impl AppDatabase {
                 owner_user_id TEXT NOT NULL,
                 destination_root_path TEXT NOT NULL,
                 library_root_path TEXT NOT NULL DEFAULT '',
+                flat_folder_layout INTEGER NOT NULL DEFAULT 0,
                 archive_root_path TEXT NOT NULL DEFAULT '',
                 archive_scan_enabled INTEGER NOT NULL DEFAULT 0,
                 archive_scan_high_priority INTEGER NOT NULL DEFAULT 0,
@@ -1095,6 +1183,8 @@ impl AppDatabase {
                 source_kind TEXT NOT NULL DEFAULT 'matrix',
                 direct_url TEXT,
                 mxc_url TEXT NOT NULL,
+                thumbnail_source_url TEXT,
+                thumbnail_cached_path TEXT,
                 original_filename TEXT,
                 mime_type TEXT,
                 category TEXT NOT NULL,
@@ -1171,6 +1261,24 @@ impl AppDatabase {
             "direct_url",
             "TEXT",
         )?;
+        Self::ensure_column(
+            &connection,
+            "discovered_attachments",
+            "thumbnail_source_url",
+            "TEXT",
+        )?;
+        Self::ensure_column(
+            &connection,
+            "discovered_attachments",
+            "thumbnail_cached_path",
+            "TEXT",
+        )?;
+        Self::ensure_column(
+            &connection,
+            "app_settings",
+            "flat_folder_layout",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 
@@ -1224,6 +1332,7 @@ impl AppDatabase {
             owner_user_id: row.get("owner_user_id")?,
             destination_root_path: row.get("destination_root_path")?,
             library_root_path: row.get("library_root_path")?,
+            flat_folder_layout: row.get::<_, i64>("flat_folder_layout")? != 0,
             archive_root_path: row.get("archive_root_path")?,
             archive_scan_enabled: row.get::<_, i64>("archive_scan_enabled")? != 0,
             archive_scan_high_priority: row.get::<_, i64>("archive_scan_high_priority")? != 0,
@@ -1323,6 +1432,8 @@ impl AppDatabase {
             ),
             direct_url: row.get("direct_url")?,
             mxc_url: row.get("mxc_url")?,
+            thumbnail_source_url: row.get("thumbnail_source_url")?,
+            thumbnail_cached_path: row.get("thumbnail_cached_path")?,
             original_filename: row.get("original_filename")?,
             mime_type: row.get("mime_type")?,
             category: MediaCategory::from_storage_key(&row.get::<_, String>("category")?),
@@ -1540,6 +1651,8 @@ mod tests {
             source_kind: crate::domain::MediaSourceKind::Matrix,
             direct_url: None,
             mxc_url: format!("mxc://example.org/{event_id}"),
+            thumbnail_source_url: None,
+            thumbnail_cached_path: None,
             original_filename: Some(format!("{event_id}.bin")),
             mime_type: Some("application/octet-stream".to_owned()),
             category: MediaCategory::Other,

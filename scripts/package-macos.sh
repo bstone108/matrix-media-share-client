@@ -102,6 +102,13 @@ fi
 
 "${MACDEPLOYQT_BIN}" "${STAGE_DIR}/${APP_NAME}.app" -always-overwrite
 
+# Clear Finder/resource metadata before re-signing the bundle. Without this,
+# the shipped app can end up with a malformed ad-hoc signature that Finder
+# refuses to launch on Apple Silicon.
+xattr -cr "${STAGE_DIR}/${APP_NAME}.app"
+codesign --force --deep --sign - "${STAGE_DIR}/${APP_NAME}.app"
+codesign --verify --deep --verbose=2 "${STAGE_DIR}/${APP_NAME}.app"
+
 rm -f "${ARCHIVE_PATH}"
 ditto -c -k --sequesterRsrc --keepParent \
   "${STAGE_DIR}/${APP_NAME}.app" \

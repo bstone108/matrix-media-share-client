@@ -81,6 +81,9 @@ impl RoomCatalog {
 
             let root = PathBuf::from(&settings.destination_root_path);
             fs::create_dir_all(&root)?;
+            if settings.flat_folder_layout {
+                return Ok(root);
+            }
             let folder = root.join(&record.active_folder_label);
             fs::create_dir_all(&folder)?;
             return Ok(folder);
@@ -91,9 +94,15 @@ impl RoomCatalog {
             .upsert_room(room_id, None, None, &label, false, "joined")
             .await?;
 
-        let folder = PathBuf::from(&settings.destination_root_path).join(label);
-        fs::create_dir_all(&folder)?;
-        Ok(folder)
+        let root = PathBuf::from(&settings.destination_root_path);
+        fs::create_dir_all(&root)?;
+        if settings.flat_folder_layout {
+            Ok(root)
+        } else {
+            let folder = root.join(label);
+            fs::create_dir_all(&folder)?;
+            Ok(folder)
+        }
     }
 
     pub async fn category_folder(
@@ -103,6 +112,9 @@ impl RoomCatalog {
         settings: &AppSettings,
     ) -> Result<PathBuf> {
         let room_folder = self.ensure_room_folder(room_id, settings).await?;
+        if settings.flat_folder_layout {
+            return Ok(room_folder);
+        }
         let category_folder = room_folder.join(category.as_storage_key());
         fs::create_dir_all(&category_folder)?;
         Ok(category_folder)
@@ -159,11 +171,9 @@ impl RoomCatalog {
             &existing_labels,
         );
 
-        if !resolved_is_space {
+        if !resolved_is_space && !settings.flat_folder_layout {
             let root = PathBuf::from(&settings.destination_root_path);
-            fs::create_dir_all(&root)?;
             maybe_rename_room_folder(&root, existing.as_ref(), &label, &self.database).await?;
-            fs::create_dir_all(root.join(&label))?;
         }
 
         self.database

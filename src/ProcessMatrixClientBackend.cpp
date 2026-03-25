@@ -63,6 +63,29 @@ QString mediaSourceKindJsonKey(const MediaSourceKind kind)
     return QStringLiteral("matrix");
 }
 
+MediaCategory parseMediaCategory(const QString &value)
+{
+    if (value == QStringLiteral("images")) {
+        return MediaCategory::Images;
+    }
+    if (value == QStringLiteral("videos")) {
+        return MediaCategory::Videos;
+    }
+    if (value == QStringLiteral("audio")) {
+        return MediaCategory::Audio;
+    }
+    if (value == QStringLiteral("documents")) {
+        return MediaCategory::Documents;
+    }
+    if (value == QStringLiteral("archives")) {
+        return MediaCategory::Archives;
+    }
+    if (value == QStringLiteral("programs")) {
+        return MediaCategory::Programs;
+    }
+    return MediaCategory::Other;
+}
+
 ConnectionState parseConnectionState(const QString &value)
 {
     if (value == QStringLiteral("starting")) {
@@ -105,6 +128,20 @@ VerificationStatus parseVerificationStatus(const QString &value)
     return VerificationStatus::Unknown;
 }
 
+ViewerState parseViewerState(const QString &value)
+{
+    if (value == QStringLiteral("downloading")) {
+        return ViewerState::Downloading;
+    }
+    if (value == QStringLiteral("ready")) {
+        return ViewerState::Ready;
+    }
+    if (value == QStringLiteral("error")) {
+        return ViewerState::Error;
+    }
+    return ViewerState::Idle;
+}
+
 IpfsRuntimeState parseIpfsRuntimeState(const QString &value)
 {
     if (value == QStringLiteral("starting")) {
@@ -130,6 +167,7 @@ QJsonObject settingsToJson(const AppSettings &settings)
         {QStringLiteral("ownerUserId"), settings.ownerUserId},
         {QStringLiteral("destinationRootPath"), settings.destinationRootPath},
         {QStringLiteral("libraryRootPath"), settings.libraryRootPath},
+        {QStringLiteral("flatFolderLayout"), settings.flatFolderLayout},
         {QStringLiteral("archiveRootPath"), settings.archiveRootPath},
         {QStringLiteral("archiveScanEnabled"), settings.archiveScanEnabled},
         {QStringLiteral("archiveScanHighPriority"), settings.archiveScanHighPriority},
@@ -175,9 +213,35 @@ BotRuntimeSnapshot parseRuntimeSnapshot(const QJsonObject &object)
     snapshot.ipfs.primaryGatewayUrl = ipfsObject.value(QStringLiteral("primaryGatewayUrl")).toString();
     snapshot.ipfs.lastError = ipfsObject.value(QStringLiteral("lastError")).toString();
 
+    const QJsonObject viewerObject = object.value(QStringLiteral("viewer")).toObject();
+    snapshot.viewer.sessionId = viewerObject.value(QStringLiteral("sessionId")).toVariant().toULongLong();
+    snapshot.viewer.state = parseViewerState(viewerObject.value(QStringLiteral("state")).toString());
+    snapshot.viewer.roomId = viewerObject.value(QStringLiteral("roomId")).toString();
+    snapshot.viewer.eventId = viewerObject.value(QStringLiteral("eventId")).toString();
+    snapshot.viewer.fileName = viewerObject.value(QStringLiteral("fileName")).toString();
+    snapshot.viewer.mimeType = viewerObject.value(QStringLiteral("mimeType")).toString();
+    snapshot.viewer.category = parseMediaCategory(viewerObject.value(QStringLiteral("category")).toString());
+    snapshot.viewer.localPath = viewerObject.value(QStringLiteral("localPath")).toString();
+    snapshot.viewer.receivedBytes = viewerObject.value(QStringLiteral("receivedBytes")).toVariant().toLongLong();
+    snapshot.viewer.totalBytes = viewerObject.contains(QStringLiteral("totalBytes"))
+        ? viewerObject.value(QStringLiteral("totalBytes")).toVariant().toLongLong()
+        : -1;
+    snapshot.viewer.error = viewerObject.value(QStringLiteral("error")).toString();
+
     const QJsonObject verificationObject = object.value(QStringLiteral("verification")).toObject();
     snapshot.verification.state = parseVerificationStatus(verificationObject.value(QStringLiteral("state")).toString());
     snapshot.verification.deviceId = verificationObject.value(QStringLiteral("deviceId")).toString();
+    snapshot.verification.message = verificationObject.value(QStringLiteral("message")).toString();
+    snapshot.verification.requestFlowId = verificationObject.value(QStringLiteral("requestFlowId")).toString();
+    snapshot.verification.requestState = verificationObject.value(QStringLiteral("requestState")).toString();
+    snapshot.verification.hasActiveRequest = verificationObject.value(QStringLiteral("hasActiveRequest")).toBool();
+    snapshot.verification.requestReady = verificationObject.value(QStringLiteral("requestReady")).toBool();
+    snapshot.verification.requestCanAccept = verificationObject.value(QStringLiteral("requestCanAccept")).toBool();
+    snapshot.verification.hasActiveSas = verificationObject.value(QStringLiteral("hasActiveSas")).toBool();
+    snapshot.verification.sasCanAccept = verificationObject.value(QStringLiteral("sasCanAccept")).toBool();
+    snapshot.verification.canBootstrapCrossSigning =
+        verificationObject.value(QStringLiteral("canBootstrapCrossSigning")).toBool();
+    snapshot.verification.otherDeviceCount = verificationObject.value(QStringLiteral("otherDeviceCount")).toInt();
 
     const QJsonArray emojis = verificationObject.value(QStringLiteral("emojis")).toArray();
     for (const QJsonValue &value : emojis) {
@@ -211,6 +275,7 @@ BotRuntimeSnapshot parseRuntimeSnapshot(const QJsonObject &object)
         download.workerId = downloadObject.value(QStringLiteral("workerId")).toInt();
         download.jobId = downloadObject.value(QStringLiteral("jobId")).toVariant().toLongLong();
         download.roomId = downloadObject.value(QStringLiteral("roomId")).toString();
+        download.eventId = downloadObject.value(QStringLiteral("eventId")).toString();
         download.filename = downloadObject.value(QStringLiteral("filename")).toString();
         download.receivedBytes = downloadObject.value(QStringLiteral("receivedBytes")).toVariant().toLongLong();
         download.totalBytes = downloadObject.value(QStringLiteral("totalBytes")).toVariant().toLongLong();
@@ -336,6 +401,7 @@ bool ProcessMatrixClientBackend::stop(BotRuntimeSnapshot &runtime, QString &erro
         stopped.connectionState = ConnectionState::Stopped;
         stopped.workerStates.clear();
         stopped.activeDownloads.clear();
+        stopped.viewer = ViewerSnapshot {};
         stopped.verification = VerificationSnapshot {};
         publishRuntime(stopped);
     }
@@ -424,6 +490,17 @@ bool ProcessMatrixClientBackend::openDiscovery(const QString &roomId, const QStr
         300000);
 }
 
+bool ProcessMatrixClientBackend::focusRoom(const QString &roomId, QString &errorMessage)
+{
+    return commandRequiringRunningProcess(
+        QJsonObject {
+            {QStringLiteral("type"), QStringLiteral("focusRoom")},
+            {QStringLiteral("roomId"), roomId},
+        },
+        errorMessage,
+        60000);
+}
+
 bool ProcessMatrixClientBackend::refreshCatalog(QString &errorMessage)
 {
     return commandRequiringRunningProcess(
@@ -509,6 +586,31 @@ QString ProcessMatrixClientBackend::backendExecutablePath() const
     return candidates.first();
 }
 
+QString ProcessMatrixClientBackend::bundledKuboBinaryPath() const
+{
+#ifdef Q_OS_WIN
+    const QString binaryName = QStringLiteral("ipfs.exe");
+#else
+    const QString binaryName = QStringLiteral("ipfs");
+#endif
+
+    const QDir appDir(QCoreApplication::applicationDirPath());
+    const QStringList candidates = {
+        QDir::cleanPath(appDir.filePath(QStringLiteral("../Resources/kubo/%1").arg(binaryName))),
+        QDir::cleanPath(appDir.filePath(QStringLiteral("kubo/%1").arg(binaryName))),
+        QDir::cleanPath(appDir.filePath(QStringLiteral("../kubo/%1").arg(binaryName))),
+    };
+
+    for (const QString &candidate : candidates) {
+        const QFileInfo info(candidate);
+        if (info.exists() && info.isFile() && info.isExecutable() && !info.isSymLink()) {
+            return info.absoluteFilePath();
+        }
+    }
+
+    return {};
+}
+
 QString ProcessMatrixClientBackend::stderrSummary() const
 {
     QString summary = QString::fromLocal8Bit(stderrBuffer_).trimmed();
@@ -569,6 +671,13 @@ bool ProcessMatrixClientBackend::launchProcess(QString &errorMessage)
     environment.remove(QStringLiteral("LD_PRELOAD"));
     environment.remove(QStringLiteral("DYLD_INSERT_LIBRARIES"));
     environment.remove(QStringLiteral("DYLD_FORCE_FLAT_NAMESPACE"));
+    const QString bundledKuboPath = bundledKuboBinaryPath();
+    if (bundledKuboPath.isEmpty()) {
+        errorMessage = QStringLiteral("Bundled Kubo binary was not found inside the app package.");
+        process_.reset();
+        return false;
+    }
+    environment.insert(QStringLiteral("MATRIX_MEDIA_SHARE_CLIENT_KUBO"), bundledKuboPath);
     process_->setProcessEnvironment(environment);
 
     process_->start(executableInfo.canonicalFilePath(), {QStringLiteral("--root-path"), paths_.rootPath()});
@@ -766,6 +875,7 @@ void ProcessMatrixClientBackend::handleProcessFinished(const int exitCode, const
     BotRuntimeSnapshot snapshot = latestRuntime_;
     snapshot.workerStates.clear();
     snapshot.activeDownloads.clear();
+    snapshot.viewer = ViewerSnapshot {};
     snapshot.verification = VerificationSnapshot {};
 
     if (expectedShutdown) {
