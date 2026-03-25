@@ -46,6 +46,11 @@ jobs:
         with:
           toolchain: 1.93.0
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -74,6 +79,8 @@ jobs:
             curl \
             desktop-file-utils \
             libgl1-mesa-dev \
+            libpulse-dev \
+            libpulse0 \
             libxcb-cursor0 \
             libxcb-icccm4 \
             libxcb-image0 \
@@ -127,6 +134,11 @@ jobs:
         with:
           toolchain: 1.93.0
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -155,6 +167,8 @@ jobs:
             curl \
             desktop-file-utils \
             libgl1-mesa-dev \
+            libpulse-dev \
+            libpulse0 \
             libxcb-cursor0 \
             libxcb-icccm4 \
             libxcb-image0 \
@@ -212,6 +226,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -274,6 +293,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -338,6 +362,11 @@ jobs:
         with:
           toolchain: 1.93.0
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -394,6 +423,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
 
       - name: Set up Python
         uses: actions/setup-python@v6
