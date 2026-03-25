@@ -1,8 +1,10 @@
 #include "MainWindow.h"
 
 #include "AppController.h"
+#include "VideoFrameWidget.h"
 
 #include <QAbstractItemView>
+#include <QBuffer>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
@@ -19,6 +21,7 @@
 #include <QGridLayout>
 #include <QHeaderView>
 #include <QHBoxLayout>
+#include <QImageReader>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
@@ -52,7 +55,6 @@
 #include <QUrl>
 #include <QUrlQuery>
 #include <QVBoxLayout>
-#include <QVideoWidget>
 #include <QWindow>
 
 class QMoveEvent;
@@ -136,6 +138,38 @@ QString elidedTileText(const QString &value, const int maxLength)
     return trimmed.left(maxLength - 1) + QChar(0x2026);
 }
 
+QImage loadAutoTransformedImageFromBytes(const QByteArray &bytes)
+{
+    QBuffer buffer;
+    buffer.setData(bytes);
+    if (!buffer.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+
+    QImageReader reader(&buffer);
+    reader.setAutoTransform(true);
+    return reader.read();
+}
+
+QImage loadAutoTransformedImageFromFile(const QString &path)
+{
+    QImageReader reader(path);
+    reader.setAutoTransform(true);
+    return reader.read();
+}
+
+QRect centeredAspectRect(const QSize &sourceSize, const QRect &bounds)
+{
+    if (!sourceSize.isValid() || !bounds.isValid()) {
+        return bounds;
+    }
+
+    const QSize fitted = sourceSize.scaled(bounds.size(), Qt::KeepAspectRatio);
+    QRect target(QPoint(0, 0), fitted);
+    target.moveCenter(bounds.center());
+    return target;
+}
+
 QString dataSizeText(const qint64 bytes)
 {
     if (bytes < 0) {
@@ -167,8 +201,10 @@ QPixmap renderDiscoveryTile(
     painter.setClipPath(clipPath);
 
     if (preview != nullptr && !preview->isNull()) {
-        const QPixmap scaled = preview->scaled(bounds.size(), Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
-        painter.drawPixmap(bounds, scaled, scaled.rect());
+        painter.fillRect(bounds, QColor(QStringLiteral("#020617")));
+        const QPixmap scaled = preview->scaled(bounds.size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        const QRect target = centeredAspectRect(scaled.size(), bounds);
+        painter.drawPixmap(target.topLeft(), scaled);
         painter.fillRect(bounds, QColor(0, 0, 0, isVideo ? 28 : 18));
     } else {
         QLinearGradient gradient(bounds.topLeft(), bounds.bottomRight());
@@ -1407,6 +1443,9 @@ void MainWindow::refreshViewerDialog()
         if (viewerMediaPlayer_ != nullptr) {
             viewerMediaPlayer_->stop();
         }
+        if (viewerVideoWidget_ != nullptr) {
+            viewerVideoWidget_->clearFrame();
+        }
         viewerLoadedSessionId_ = 0;
         viewerLoadedLocalPath_.clear();
         viewerLoadedState_ = ViewerState::Idle;
@@ -1491,7 +1530,7 @@ void MainWindow::ensureViewerDialog()
     viewerImageLabel_->setAlignment(Qt::AlignCenter);
     viewerImageScrollArea_->setWidget(viewerImageLabel_);
 
-    viewerVideoWidget_ = new QVideoWidget(viewerDialog_);
+    viewerVideoWidget_ = new VideoFrameWidget(viewerDialog_);
     viewerFallbackLabel_ = new QLabel(viewerDialog_);
     viewerFallbackLabel_->setAlignment(Qt::AlignCenter);
     viewerFallbackLabel_->setWordWrap(true);
@@ -1514,12 +1553,23 @@ void MainWindow::ensureViewerDialog()
     viewerMediaPlayer_ = new QMediaPlayer(viewerDialog_);
     viewerAudioOutput_ = new QAudioOutput(viewerDialog_);
     viewerMediaPlayer_->setAudioOutput(viewerAudioOutput_);
-    viewerMediaPlayer_->setVideoOutput(viewerVideoWidget_);
+    viewerMediaPlayer_->setVideoSink(viewerVideoWidget_->videoSink());
+    connect(viewerMediaPlayer_, &QMediaPlayer::errorOccurred, this, [this](QMediaPlayer::Error, const QString &errorString) {
+        if (viewerFallbackLabel_ != nullptr && !errorString.trimmed().isEmpty()) {
+            viewerFallbackLabel_->setText(errorString);
+            if (viewerContentStack_ != nullptr) {
+                viewerContentStack_->setCurrentWidget(viewerFallbackLabel_);
+            }
+        }
+    });
 
     connect(closeButton, &QPushButton::clicked, this, [this]() {
         viewerDismissedSessionId_ = controller_->runtime().viewer.sessionId;
         if (viewerMediaPlayer_ != nullptr) {
             viewerMediaPlayer_->stop();
+        }
+        if (viewerVideoWidget_ != nullptr) {
+            viewerVideoWidget_->clearFrame();
         }
         if (viewerDialog_ != nullptr) {
             viewerDialog_->hide();
@@ -1530,6 +1580,9 @@ void MainWindow::ensureViewerDialog()
         viewerDismissedSessionId_ = controller_->runtime().viewer.sessionId;
         if (viewerMediaPlayer_ != nullptr) {
             viewerMediaPlayer_->stop();
+        }
+        if (viewerVideoWidget_ != nullptr) {
+            viewerVideoWidget_->clearFrame();
         }
     });
 }
@@ -1547,6 +1600,9 @@ void MainWindow::loadViewerMedia(const ViewerSnapshot &viewer)
         viewerMediaPlayer_->stop();
         viewerMediaPlayer_->setSource(QUrl());
     }
+    if (viewerVideoWidget_ != nullptr) {
+        viewerVideoWidget_->clearFrame();
+    }
 
     QScreen *targetScreen = windowHandle() != nullptr ? windowHandle()->screen() : QGuiApplication::primaryScreen();
     const QRect available = targetScreen != nullptr
@@ -1562,7 +1618,8 @@ void MainWindow::loadViewerMedia(const ViewerSnapshot &viewer)
                 : QStringLiteral("Preparing media for the built-in viewer..."));
         viewerContentStack_->setCurrentWidget(viewerFallbackLabel_);
     } else if (viewer.category == MediaCategory::Images || viewer.mimeType.startsWith(QStringLiteral("image/"))) {
-        QPixmap pixmap(viewer.localPath);
+        const QImage image = loadAutoTransformedImageFromFile(viewer.localPath);
+        const QPixmap pixmap = QPixmap::fromImage(image);
         if (pixmap.isNull()) {
             viewerFallbackLabel_->setText(QStringLiteral("The image could not be loaded."));
             viewerContentStack_->setCurrentWidget(viewerFallbackLabel_);
@@ -2282,8 +2339,9 @@ void MainWindow::requestBrowserThumbnail(const AttachmentDiscovery &discovery, c
         const QByteArray bytes = reply->readAll();
         reply->deleteLater();
 
-        QPixmap preview;
-        if (!preview.loadFromData(bytes)) {
+        const QImage image = loadAutoTransformedImageFromBytes(bytes);
+        const QPixmap preview = QPixmap::fromImage(image);
+        if (preview.isNull()) {
             pumpBrowserThumbnailRequests();
             return;
         }

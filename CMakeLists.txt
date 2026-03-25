@@ -309,6 +309,8 @@ set(MATRIX_MEDIA_ARCHIVER_QT_SOURCES
     src/ProcessMatrixClientBackend.h
     src/SecretStore.cpp
     src/SecretStore.h
+    src/VideoFrameWidget.cpp
+    src/VideoFrameWidget.h
     src/main.cpp
     ${MATRIX_MEDIA_ARCHIVER_APP_ICON_QRC}
 )

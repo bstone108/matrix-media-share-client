@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -2055,7 +2056,7 @@ async fn generate_preview_thumbnail(paths: &AppPaths, file_path: &Path) -> Resul
     let bytes = tokio_fs::read(file_path)
         .await
         .with_context(|| format!("Failed to read {}", file_path.display()))?;
-    let image = image::load_from_memory(&bytes).context("Failed to decode the image")?;
+    let image = load_oriented_image_from_bytes(&bytes).context("Failed to decode the image")?;
     let thumbnail = image.thumbnail(480, 480);
     let name = file_path
         .file_stem()
@@ -2066,6 +2067,19 @@ async fn generate_preview_thumbnail(paths: &AppPaths, file_path: &Path) -> Resul
         .save_with_format(&destination, image::ImageFormat::Jpeg)
         .with_context(|| format!("Failed to write {}", destination.display()))?;
     Ok(destination)
+}
+
+fn load_oriented_image_from_bytes(bytes: &[u8]) -> Result<image::DynamicImage> {
+    use image::{DynamicImage, ImageDecoder, ImageReader, metadata::Orientation};
+
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("Could not detect image format")?;
+    let mut decoder = reader.into_decoder().context("Could not create image decoder")?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut image = DynamicImage::from_decoder(decoder).context("Could not decode image")?;
+    image.apply_orientation(orientation);
+    Ok(image)
 }
 
 async fn reset_matrix_store(paths: &AppPaths) -> Result<()> {
@@ -2853,7 +2867,7 @@ async fn cache_discovery_thumbnail(
     };
 
     let thumbnail_bytes = load_discovery_thumbnail_bytes(&context.client, source).await?;
-    let image = image::load_from_memory(&thumbnail_bytes)
+    let image = load_oriented_image_from_bytes(&thumbnail_bytes)
         .with_context(|| format!("Thumbnail bytes were not a valid image for {}", discovery.event_id))?;
     let thumbnail = image.thumbnail(384, 384);
 

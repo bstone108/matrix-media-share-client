@@ -36,7 +36,7 @@ class QSpinBox;
 class QStackedWidget;
 class QTableWidget;
 class QTextEdit;
-class QVideoWidget;
+class VideoFrameWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -201,7 +201,7 @@ private:
     QStackedWidget *viewerContentStack_ = nullptr;
     QScrollArea *viewerImageScrollArea_ = nullptr;
     QLabel *viewerImageLabel_ = nullptr;
-    QVideoWidget *viewerVideoWidget_ = nullptr;
+    VideoFrameWidget *viewerVideoWidget_ = nullptr;
     QLabel *viewerFallbackLabel_ = nullptr;
     QMediaPlayer *viewerMediaPlayer_ = nullptr;
     QAudioOutput *viewerAudioOutput_ = nullptr;
