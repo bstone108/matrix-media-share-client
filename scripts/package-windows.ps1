@@ -98,6 +98,9 @@ $cmakeConfigureArgs = @(
     "-A", $cmakeArch,
     "-DMATRIX_MEDIA_ARCHIVER_BACKEND_RUST_TARGET=$rustTarget"
 )
+if ($env:MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT -and (Test-Path $env:MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT)) {
+    $cmakeConfigureArgs += "-DMATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT=$((Resolve-Path $env:MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT).Path)"
+}
 if ($qtPrefixEntries.Count -gt 0) {
     $cmakeConfigureArgs += "-DCMAKE_PREFIX_PATH=$($qtPrefixEntries -join ';')"
 }
@@ -151,6 +154,13 @@ New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
 
 Copy-Item $appExe $stageDir
 Copy-Item $backendExe $stageDir
+
+foreach ($bundleDirName in @("kubo", "vlc")) {
+    $bundleDir = Join-Path $releaseDir $bundleDirName
+    if (Test-Path $bundleDir) {
+        Copy-Item $bundleDir $stageDir -Recurse -Force
+    }
+}
 
 & $windeployqt `
     --release `

@@ -72,10 +72,20 @@ MATRIX_MEDIA_ARCHIVER_SQLDRIVER_STASH_DIR=""
 mkdir -p "${WORK_DIR}" "${BUILDS_DIR}"
 rm -rf "${BUILD_DIR}" "${STAGE_DIR}"
 
-cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_PREFIX_PATH="${QT_PREFIX}" \
+cmake_args=(
+  -S "${ROOT_DIR}"
+  -B "${BUILD_DIR}"
+  -G Ninja
+  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_PREFIX_PATH="${QT_PREFIX}"
   -DMATRIX_MEDIA_ARCHIVER_BUILD_TESTS=OFF
+)
+
+if [[ -n "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT:-}" && -d "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}" ]]; then
+  cmake_args+=("-DMATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}")
+fi
+
+cmake "${cmake_args[@]}"
 cmake --build "${BUILD_DIR}" --config Release
 
 APP_BUNDLE="${BUILD_DIR}/${APP_NAME}.app"

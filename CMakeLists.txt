@@ -21,6 +21,9 @@ set(MATRIX_MEDIA_ARCHIVER_BACKEND_RUST_TARGET "" CACHE STRING
 set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_SOURCE "" CACHE FILEPATH
     "Path to the Kubo/IPFS binary to bundle inside the app package"
 )
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT "" CACHE PATH
+    "Path to a VLC runtime root containing lib/ and plugins/ to bundle with the app"
+)
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
@@ -183,6 +186,21 @@ if(NOT MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_SOURCE)
     endif()
 endif()
 
+if(NOT MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT)
+    if(APPLE)
+        set(_matrix_media_share_client_default_vlc
+            "/Applications/VLC.app/Contents/MacOS"
+        )
+        if(EXISTS "${_matrix_media_share_client_default_vlc}")
+            set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT
+                "${_matrix_media_share_client_default_vlc}"
+                CACHE PATH "Path to a VLC runtime root containing lib/ and plugins/ to bundle with the app" FORCE
+            )
+        endif()
+        unset(_matrix_media_share_client_default_vlc)
+    endif()
+endif()
+
 set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_VERSION "v0.38.2" CACHE STRING
     "Pinned Kubo version to bundle when building from source"
 )
@@ -311,6 +329,8 @@ set(MATRIX_MEDIA_ARCHIVER_QT_SOURCES
     src/SecretStore.h
     src/VideoFrameWidget.cpp
     src/VideoFrameWidget.h
+    src/VlcPlayerWidget.cpp
+    src/VlcPlayerWidget.h
     src/WebVideoWidget.h
     src/main.cpp
     ${MATRIX_MEDIA_ARCHIVER_APP_ICON_QRC}
@@ -388,6 +408,27 @@ if(APPLE)
             $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/kubo/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_NAME}
         COMMENT "Copying bundled Kubo into MatrixMediaShareClientQt.app"
     )
+    if(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT
+        AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/lib"
+        AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/plugins")
+        add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E rm -rf
+                $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/vlc
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/vlc
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/lib"
+                $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/vlc/lib
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/plugins"
+                $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/vlc/plugins
+            COMMAND ${CMAKE_COMMAND}
+                -DVLC_LIB_DIR=$<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/vlc/lib
+                -DVLC_PLUGIN_DIR=$<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/vlc/plugins
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/FixBundledVlcMac.cmake
+            COMMENT "Copying bundled VLC runtime into MatrixMediaShareClientQt.app"
+        )
+    endif()
 else()
     add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory
@@ -397,6 +438,23 @@ else()
             $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/kubo/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_NAME}
         COMMENT "Copying bundled Kubo next to MatrixMediaShareClientQt"
     )
+    if(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT
+        AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/lib"
+        AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/plugins")
+        add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E rm -rf
+                $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/vlc
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/vlc
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/lib"
+                $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/vlc/lib
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/plugins"
+                $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/vlc/plugins
+            COMMENT "Copying bundled VLC runtime next to MatrixMediaShareClientQt"
+        )
+    endif()
 endif()
 
 install(TARGETS MatrixMediaShareClientQt
@@ -411,6 +469,16 @@ if(NOT APPLE)
     install(PROGRAMS ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_BINARY}
         DESTINATION ${CMAKE_INSTALL_BINDIR}/kubo
     )
+    if(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT
+        AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/lib"
+        AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/plugins")
+        install(DIRECTORY "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/lib"
+            DESTINATION ${CMAKE_INSTALL_BINDIR}/vlc
+        )
+        install(DIRECTORY "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/plugins"
+            DESTINATION ${CMAKE_INSTALL_BINDIR}/vlc
+        )
+    endif()
 endif()
 
 if(UNIX AND NOT APPLE)

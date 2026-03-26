@@ -37,6 +37,7 @@ class QStackedWidget;
 class QTableWidget;
 class QTextEdit;
 class VideoFrameWidget;
+class VlcPlayerWidget;
 class WebVideoWidget;
 
 class MainWindow : public QMainWindow
@@ -86,13 +87,17 @@ private:
     void resetBrowserPageState();
     void loadMoreBrowserDiscoveries(bool reset = false);
     void maybeLoadMoreBrowserDiscoveries();
+    void syncBrowserLoadedDiscoveries();
     void requestVisibleBrowserThumbnails();
     void scheduleBackgroundBrowserThumbnailPrefetch();
     void trimBrowserDiscoveryWindow();
+    QString currentBrowserSelectedEventId() const;
+    void restoreBrowserSelectionByEventId(const QString &eventId);
     QSet<QString> currentVisibleBrowserThumbnailKeys() const;
     QString browserThumbnailKey(const AttachmentDiscovery &discovery) const;
     QString browserThumbnailUrl(const AttachmentDiscovery &discovery) const;
     QIcon placeholderDiscoveryIcon(const AttachmentDiscovery &discovery) const;
+    bool primeBrowserThumbnailIconCache(const AttachmentDiscovery &discovery);
     void clearBrowserThumbnailRequests();
     void enqueueBrowserThumbnailRequest(const AttachmentDiscovery &discovery, bool highPriority);
     void reprioritizeBrowserThumbnailRequests(const QSet<QString> &visibleKeys);
@@ -212,6 +217,7 @@ private:
     QScrollArea *viewerImageScrollArea_ = nullptr;
     QLabel *viewerImageLabel_ = nullptr;
     VideoFrameWidget *viewerVideoWidget_ = nullptr;
+    VlcPlayerWidget *viewerVlcWidget_ = nullptr;
     WebVideoWidget *viewerWebVideoWidget_ = nullptr;
     QLabel *viewerFallbackLabel_ = nullptr;
     QMediaPlayer *viewerMediaPlayer_ = nullptr;

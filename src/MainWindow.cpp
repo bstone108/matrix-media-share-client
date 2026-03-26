@@ -2,6 +2,7 @@
 
 #include "AppController.h"
 #include "VideoFrameWidget.h"
+#include "VlcPlayerWidget.h"
 #include "WebVideoWidget.h"
 
 #include <QAbstractItemView>
@@ -1243,6 +1244,7 @@ void MainWindow::populateBrowserPage()
     if (browserLoadedDiscoveries_.isEmpty()) {
         loadMoreBrowserDiscoveries(true);
     } else {
+        syncBrowserLoadedDiscoveries();
         requestVisibleBrowserThumbnails();
         maybeLoadMoreBrowserDiscoveries();
         openDiscoveryButton_->setEnabled(discoveriesList_->currentItem() != nullptr);
@@ -1563,6 +1565,9 @@ void MainWindow::refreshViewerDialog()
         if (viewerVideoWidget_ != nullptr) {
             viewerVideoWidget_->clearFrame();
         }
+        if (viewerVlcWidget_ != nullptr) {
+            viewerVlcWidget_->stopPlayback();
+        }
         if (viewerWebVideoWidget_ != nullptr) {
             viewerWebVideoWidget_->clearMedia();
         }
@@ -1651,6 +1656,7 @@ void MainWindow::ensureViewerDialog()
     viewerImageScrollArea_->setWidget(viewerImageLabel_);
 
     viewerVideoWidget_ = new VideoFrameWidget(viewerDialog_);
+    viewerVlcWidget_ = new VlcPlayerWidget(viewerDialog_);
     viewerWebVideoWidget_ = new WebVideoWidget(viewerDialog_);
     viewerFallbackLabel_ = new QLabel(viewerDialog_);
     viewerFallbackLabel_->setAlignment(Qt::AlignCenter);
@@ -1658,6 +1664,7 @@ void MainWindow::ensureViewerDialog()
 
     viewerContentStack_->addWidget(viewerImageScrollArea_);
     viewerContentStack_->addWidget(viewerVideoWidget_);
+    viewerContentStack_->addWidget(viewerVlcWidget_);
     viewerContentStack_->addWidget(viewerWebVideoWidget_);
     viewerContentStack_->addWidget(viewerFallbackLabel_);
 
@@ -1678,10 +1685,71 @@ void MainWindow::ensureViewerDialog()
     viewerMediaPlayer_->setVideoSink(viewerVideoWidget_->videoSink());
     connect(viewerMediaPlayer_, &QMediaPlayer::errorOccurred, this, [this](QMediaPlayer::Error, const QString &errorString) {
         if (viewerFallbackLabel_ != nullptr && !errorString.trimmed().isEmpty()) {
+            if (controller_ != nullptr) {
+                controller_->recordWarning(QStringLiteral("viewer"),
+                                           QStringLiteral("Qt media playback failed: %1").arg(errorString.trimmed()));
+            }
             viewerFallbackLabel_->setText(errorString);
             if (viewerContentStack_ != nullptr) {
                 viewerContentStack_->setCurrentWidget(viewerFallbackLabel_);
             }
+        }
+    });
+    connect(viewerVlcWidget_, &VlcPlayerWidget::playbackStarted, this, [this]() {
+        if (controller_ != nullptr) {
+            controller_->recordInfo(QStringLiteral("viewer"),
+                                    QStringLiteral("Playing media with the built-in VLC viewer."));
+        }
+        if (viewerStatusLabel_ != nullptr) {
+            viewerStatusLabel_->setText(QStringLiteral("Playing in the built-in viewer..."));
+        }
+    });
+    connect(viewerVlcWidget_, &VlcPlayerWidget::playbackFailed, this, [this](const QString &error) {
+        const QString trimmed = error.trimmed().isEmpty()
+            ? QStringLiteral("The built-in VLC viewer could not play this media.")
+            : error.trimmed();
+        if (controller_ != nullptr) {
+            controller_->recordWarning(QStringLiteral("viewer"),
+                                       QStringLiteral("VLC playback failed: %1").arg(trimmed));
+        }
+
+        const ViewerSnapshot viewer = localViewerActive_
+            ? localViewerSnapshot_
+            : (controller_ != nullptr ? controller_->runtime().viewer : ViewerSnapshot {});
+        const bool usedWebFallback = viewerWebVideoWidget_ != nullptr
+            && viewerWebVideoWidget_->isAvailable()
+            && shouldUseWebVideoFallback(viewer)
+            && viewerWebVideoWidget_->loadMediaFile(viewer.localPath, viewer.mimeType);
+        if (usedWebFallback) {
+            if (viewerContentStack_ != nullptr) {
+                viewerContentStack_->setCurrentWidget(viewerWebVideoWidget_);
+            }
+            if (viewerStatusLabel_ != nullptr) {
+                viewerStatusLabel_->setText(QStringLiteral("Playing in the built-in viewer..."));
+            }
+            return;
+        }
+
+        if (viewerMediaPlayer_ != nullptr && !viewer.localPath.trimmed().isEmpty()) {
+            viewerMediaPlayer_->setSource(QUrl::fromLocalFile(viewer.localPath));
+            viewerMediaPlayer_->play();
+            if (viewerContentStack_ != nullptr) {
+                viewerContentStack_->setCurrentWidget(viewerVideoWidget_);
+            }
+            if (viewerStatusLabel_ != nullptr) {
+                viewerStatusLabel_->setText(QStringLiteral("Playing in the built-in viewer..."));
+            }
+            return;
+        }
+
+        if (viewerFallbackLabel_ != nullptr) {
+            viewerFallbackLabel_->setText(trimmed);
+        }
+        if (viewerContentStack_ != nullptr) {
+            viewerContentStack_->setCurrentWidget(viewerFallbackLabel_);
+        }
+        if (viewerStatusLabel_ != nullptr) {
+            viewerStatusLabel_->setText(QStringLiteral("Viewer error"));
         }
     });
 
@@ -1698,6 +1766,9 @@ void MainWindow::ensureViewerDialog()
         }
         if (viewerVideoWidget_ != nullptr) {
             viewerVideoWidget_->clearFrame();
+        }
+        if (viewerVlcWidget_ != nullptr) {
+            viewerVlcWidget_->stopPlayback();
         }
         if (viewerWebVideoWidget_ != nullptr) {
             viewerWebVideoWidget_->clearMedia();
@@ -1721,6 +1792,9 @@ void MainWindow::ensureViewerDialog()
         if (viewerVideoWidget_ != nullptr) {
             viewerVideoWidget_->clearFrame();
         }
+        if (viewerVlcWidget_ != nullptr) {
+            viewerVlcWidget_->stopPlayback();
+        }
         if (viewerWebVideoWidget_ != nullptr) {
             viewerWebVideoWidget_->clearMedia();
         }
@@ -1742,6 +1816,9 @@ void MainWindow::loadViewerMedia(const ViewerSnapshot &viewer)
     }
     if (viewerVideoWidget_ != nullptr) {
         viewerVideoWidget_->clearFrame();
+    }
+    if (viewerVlcWidget_ != nullptr) {
+        viewerVlcWidget_->stopPlayback();
     }
     if (viewerWebVideoWidget_ != nullptr) {
         viewerWebVideoWidget_->clearMedia();
@@ -1784,23 +1861,32 @@ void MainWindow::loadViewerMedia(const ViewerSnapshot &viewer)
                || viewer.mimeType.startsWith(QStringLiteral("video/"))
                || viewer.mimeType.startsWith(QStringLiteral("audio/"))) {
         const bool isVideo = viewer.category == MediaCategory::Videos || viewer.mimeType.startsWith(QStringLiteral("video/"));
+        const bool usingVlc = isVideo
+            && viewerVlcWidget_ != nullptr
+            && viewerVlcWidget_->isAvailable()
+            && viewerVlcWidget_->playFile(viewer.localPath);
         const bool usingWebFallback = isVideo
+            && !usingVlc
             && viewerWebVideoWidget_ != nullptr
             && viewerWebVideoWidget_->isAvailable()
             && shouldUseWebVideoFallback(viewer)
             && viewerWebVideoWidget_->loadMediaFile(viewer.localPath, viewer.mimeType);
         viewerContentStack_->setCurrentWidget(
             isVideo
-                ? (usingWebFallback
+                ? (usingVlc
+                    ? static_cast<QWidget *>(viewerVlcWidget_)
+                    : usingWebFallback
                     ? static_cast<QWidget *>(viewerWebVideoWidget_)
                     : static_cast<QWidget *>(viewerVideoWidget_))
                 : static_cast<QWidget *>(viewerFallbackLabel_));
         if (viewer.category == MediaCategory::Audio || viewer.mimeType.startsWith(QStringLiteral("audio/"))) {
             viewerFallbackLabel_->setText(QStringLiteral("Playing audio in the built-in viewer..."));
         }
-        if (!usingWebFallback && viewerMediaPlayer_ != nullptr) {
+        if (!usingVlc && !usingWebFallback && viewerMediaPlayer_ != nullptr) {
             viewerMediaPlayer_->setSource(QUrl::fromLocalFile(viewer.localPath));
             viewerMediaPlayer_->play();
+        } else if (isVideo && !usingVlc && !usingWebFallback && viewerVlcWidget_ != nullptr && !viewerVlcWidget_->lastError().trimmed().isEmpty()) {
+            viewerFallbackLabel_->setText(viewerVlcWidget_->lastError());
         }
     } else {
         viewerFallbackLabel_->setText(
@@ -2373,6 +2459,132 @@ void MainWindow::trimBrowserDiscoveryWindow()
     }
 }
 
+QString MainWindow::currentBrowserSelectedEventId() const
+{
+    if (discoveriesList_ == nullptr || discoveriesList_->currentItem() == nullptr) {
+        return QString();
+    }
+    return discoveriesList_->currentItem()->data(Qt::UserRole + 1).toString();
+}
+
+void MainWindow::restoreBrowserSelectionByEventId(const QString &eventId)
+{
+    if (discoveriesList_ == nullptr || eventId.isEmpty()) {
+        return;
+    }
+    for (int index = 0; index < discoveriesList_->count(); ++index) {
+        if (QListWidgetItem *item = discoveriesList_->item(index)) {
+            if (item->data(Qt::UserRole + 1).toString() == eventId) {
+                if (discoveriesList_->currentItem() != item) {
+                    discoveriesList_->setCurrentItem(item);
+                }
+                return;
+            }
+        }
+    }
+}
+
+void MainWindow::syncBrowserLoadedDiscoveries()
+{
+    if (discoveriesList_ == nullptr
+        || browserLoadedDiscoveries_.isEmpty()
+        || browserLoadedRoomId_.isEmpty()) {
+        return;
+    }
+
+    const QVector<AttachmentDiscovery> refreshed = controller_->fetchDiscoveriesPage(
+        browserLoadedRoomId_,
+        browserLoadedOffset_,
+        browserLoadedDiscoveries_.size());
+    if (refreshed.size() != browserLoadedDiscoveries_.size()) {
+        return;
+    }
+
+    auto discoveryVisualSignature = [this](const AttachmentDiscovery &discovery) {
+        return QStringList {
+            discovery.roomId,
+            discovery.eventId,
+            browserThumbnailKey(discovery),
+            discovery.thumbnailSourceUrl,
+            discovery.thumbnailCachedPath,
+            discovery.directUrl,
+            discovery.mxcUrl,
+            discovery.originalFilename,
+            discovery.mimeType,
+            QString::number(static_cast<int>(discovery.sourceKind)),
+            QString::number(static_cast<int>(discovery.category)),
+        }.join(QChar(0x1f));
+    };
+
+    bool structureChanged = false;
+    for (qsizetype index = 0; index < refreshed.size(); ++index) {
+        if (refreshed.at(index).roomId != browserLoadedDiscoveries_.at(index).roomId
+            || refreshed.at(index).eventId != browserLoadedDiscoveries_.at(index).eventId) {
+            structureChanged = true;
+            break;
+        }
+    }
+
+    const QString selectedEventId = currentBrowserSelectedEventId();
+    const int scrollValue = discoveriesList_->verticalScrollBar() != nullptr
+        ? discoveriesList_->verticalScrollBar()->value()
+        : 0;
+    const QSignalBlocker blocker(discoveriesList_);
+
+    if (structureChanged) {
+        discoveriesList_->setUpdatesEnabled(false);
+        discoveriesList_->clear();
+        browserLoadedDiscoveries_ = refreshed;
+        QListWidgetItem *restoredSelection = nullptr;
+        for (const AttachmentDiscovery &discovery : refreshed) {
+            primeBrowserThumbnailIconCache(discovery);
+            auto *item = new QListWidgetItem(discoveriesList_);
+            applyDiscoveryPresentation(item, discovery);
+            item->setData(Qt::UserRole, discovery.roomId);
+            item->setData(Qt::UserRole + 1, discovery.eventId);
+            if (!selectedEventId.isEmpty() && discovery.eventId == selectedEventId) {
+                restoredSelection = item;
+            }
+        }
+        discoveriesList_->setUpdatesEnabled(true);
+        if (restoredSelection != nullptr) {
+            discoveriesList_->setCurrentItem(restoredSelection);
+        } else {
+            restoreBrowserSelectionByEventId(selectedEventId);
+        }
+        if (discoveriesList_->verticalScrollBar() != nullptr) {
+            discoveriesList_->verticalScrollBar()->setValue(scrollValue);
+        }
+        return;
+    }
+
+    QListWidgetItem *restoredSelection = nullptr;
+    for (qsizetype index = 0; index < refreshed.size() && index < discoveriesList_->count(); ++index) {
+        const AttachmentDiscovery &updatedDiscovery = refreshed.at(index);
+        if (discoveryVisualSignature(updatedDiscovery) == discoveryVisualSignature(browserLoadedDiscoveries_.at(index))) {
+            browserLoadedDiscoveries_[index] = updatedDiscovery;
+            if (!selectedEventId.isEmpty() && updatedDiscovery.eventId == selectedEventId) {
+                restoredSelection = discoveriesList_->item(static_cast<int>(index));
+            }
+            continue;
+        }
+
+        browserLoadedDiscoveries_[index] = updatedDiscovery;
+        primeBrowserThumbnailIconCache(updatedDiscovery);
+        if (QListWidgetItem *item = discoveriesList_->item(static_cast<int>(index))) {
+            applyDiscoveryPresentation(item, updatedDiscovery);
+            if (!selectedEventId.isEmpty() && updatedDiscovery.eventId == selectedEventId) {
+                restoredSelection = item;
+            }
+        }
+    }
+    if (restoredSelection != nullptr && discoveriesList_->currentItem() != restoredSelection) {
+        discoveriesList_->setCurrentItem(restoredSelection);
+    } else if (!selectedEventId.isEmpty()) {
+        restoreBrowserSelectionByEventId(selectedEventId);
+    }
+}
+
 void MainWindow::requestVisibleBrowserThumbnails()
 {
     if (discoveriesList_ == nullptr || browserLoadedDiscoveries_.isEmpty()) {
@@ -2511,6 +2723,37 @@ QIcon MainWindow::placeholderDiscoveryIcon(const AttachmentDiscovery &discovery)
         nullptr,
         discovery.category == MediaCategory::Videos);
     return QIcon(tile);
+}
+
+bool MainWindow::primeBrowserThumbnailIconCache(const AttachmentDiscovery &discovery)
+{
+    const QString cacheKey = browserThumbnailKey(discovery);
+    if (cacheKey.isEmpty()
+        || cacheKey.startsWith(QStringLiteral("placeholder:"))
+        || browserThumbnailIconCache_.contains(cacheKey)
+        || discovery.thumbnailCachedPath.trimmed().isEmpty()
+        || !QFileInfo::exists(discovery.thumbnailCachedPath)) {
+        return false;
+    }
+
+    const QImage image = loadAutoTransformedImageFromFile(discovery.thumbnailCachedPath);
+    const QPixmap preview = QPixmap::fromImage(image);
+    if (preview.isNull()) {
+        return false;
+    }
+
+    const QString title = discovery.originalFilename.isEmpty() ? discovery.eventId : discovery.originalFilename;
+    const QString subtitle = QStringLiteral("%1 | %2")
+                                 .arg(mediaCategoryTitle(discovery.category), mediaSourceKindTitle(discovery.sourceKind));
+    const QPixmap tile = renderDiscoveryTile(
+        QSize(kDiscoveryTileWidth, kDiscoveryTileHeight),
+        title,
+        subtitle,
+        categoryAccent(discovery.category),
+        &preview,
+        discovery.category == MediaCategory::Videos);
+    cacheBrowserThumbnailIcon(cacheKey, QIcon(tile));
+    return true;
 }
 
 QSet<QString> MainWindow::currentVisibleBrowserThumbnailKeys() const
@@ -2741,6 +2984,8 @@ void MainWindow::updateBrowserThumbnailItems(const QString &cacheKey, const QIco
     }
 
     Q_UNUSED(icon);
+    const QString selectedEventId = currentBrowserSelectedEventId();
+    const QSignalBlocker blocker(discoveriesList_);
 
     for (int index = 0; index < discoveriesList_->count(); ++index) {
         QListWidgetItem *item = discoveriesList_->item(index);
@@ -2753,6 +2998,8 @@ void MainWindow::updateBrowserThumbnailItems(const QString &cacheKey, const QIco
             }
         }
     }
+
+    restoreBrowserSelectionByEventId(selectedEventId);
 }
 
 void MainWindow::resetLogsPageState()

@@ -40,6 +40,38 @@ Backend tests can also be run directly with:
 PATH=/opt/homebrew/opt/rustup/bin:$PATH /opt/homebrew/opt/rustup/bin/cargo test --manifest-path backend/Cargo.toml
 ```
 
+Build dependencies:
+
+- Qt 6.10 with `Core`, `Gui`, `Widgets`, `Network`, `Sql`, `Multimedia`, `MultimediaWidgets`, and `Test`
+- Rust 1.93 for the backend
+- Go 1.25 if you want the build to compile the bundled Kubo/IPFS binary for you
+- a bundled VLC runtime for in-app media playback
+
+The build can discover a local VLC install on macOS automatically. On Linux and Windows, or in CI, pass a normalized VLC runtime root through `MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT`. That root should contain:
+
+- `lib/`
+- `plugins/`
+
+Packaging helpers:
+
+- `scripts/package-macos.sh`
+- `scripts/package-appimage.sh`
+- `scripts/package-windows.ps1`
+
+These scripts now expect the same bundled-VLC layout the GitHub workflow prepares for each platform.
+
+## GitHub Actions
+
+The desktop workflow is tag-only and publishes releases from `v*` tags after every platform build succeeds.
+
+The workflow currently prepares platform runtimes like this:
+
+- macOS: downloads the official VLC DMG and bundles the app runtime
+- Windows x64/arm64: downloads the official VLC zip for each architecture and normalizes it into `lib/` + `plugins/`
+- Linux x64/arm64: installs distro VLC packages and normalizes the runtime into `lib/` + `plugins/`
+
+If you change the media viewer runtime layout, update both the packaging scripts and `.github/workflows/desktop-ci.yml` together.
+
 ## Notes
 
 - The IPFS node is treated as part of the app from the user point of view.

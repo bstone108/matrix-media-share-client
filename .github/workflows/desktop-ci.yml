@@ -22,6 +22,7 @@ on:
 env:
   APP_NAME: MatrixMediaShareClientQt
   QT_VERSION: "6.10.2"
+  VLC_VERSION: "3.0.23"
 
 permissions:
   contents: read
@@ -99,9 +100,22 @@ jobs:
             libxcb-xfixes0 \
             libxcb-xkb1 \
             libxkbcommon-x11-0 \
+            libvlc-bin \
+            libvlc5 \
             ninja-build \
             patchelf \
+            vlc-plugin-base \
             zip
+
+      - name: Normalize bundled VLC runtime
+        run: |
+          multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+          VLC_ROOT="${RUNNER_TEMP}/vlc-runtime"
+          mkdir -p "${VLC_ROOT}/lib" "${VLC_ROOT}/plugins"
+          cp -a /usr/lib/${multiarch}/libvlc.so* "${VLC_ROOT}/lib/"
+          cp -a /usr/lib/${multiarch}/libvlccore.so* "${VLC_ROOT}/lib/"
+          cp -a /usr/lib/${multiarch}/vlc/plugins/. "${VLC_ROOT}/plugins/"
+          echo "MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT=${VLC_ROOT}" >> "$GITHUB_ENV"
 
       - name: Install Qt
         run: |
@@ -194,9 +208,22 @@ jobs:
             libxcb-xfixes0 \
             libxcb-xkb1 \
             libxkbcommon-x11-0 \
+            libvlc-bin \
+            libvlc5 \
             ninja-build \
             patchelf \
+            vlc-plugin-base \
             zip
+
+      - name: Normalize bundled VLC runtime
+        run: |
+          multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+          VLC_ROOT="${RUNNER_TEMP}/vlc-runtime"
+          mkdir -p "${VLC_ROOT}/lib" "${VLC_ROOT}/plugins"
+          cp -a /usr/lib/${multiarch}/libvlc.so* "${VLC_ROOT}/lib/"
+          cp -a /usr/lib/${multiarch}/libvlccore.so* "${VLC_ROOT}/lib/"
+          cp -a /usr/lib/${multiarch}/vlc/plugins/. "${VLC_ROOT}/plugins/"
+          echo "MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT=${VLC_ROOT}" >> "$GITHUB_ENV"
 
       - name: Install Qt
         run: |
@@ -253,6 +280,20 @@ jobs:
 
       - name: Install aqtinstall
         run: python -m pip install --user "aqtinstall==3.3.*" "py7zr==1.0.*"
+
+      - name: Download bundled VLC runtime
+        run: |
+          $vlcZip = Join-Path $env:RUNNER_TEMP "vlc-win64.zip"
+          $vlcExtract = Join-Path $env:RUNNER_TEMP "vlc-win64"
+          $vlcRoot = Join-Path $env:RUNNER_TEMP "vlc-runtime-win64"
+          Invoke-WebRequest -Uri "https://get.videolan.org/vlc/$env:VLC_VERSION/win64/vlc-$env:VLC_VERSION-win64.zip" -OutFile $vlcZip
+          Expand-Archive -Path $vlcZip -DestinationPath $vlcExtract -Force
+          $sourceRoot = Get-ChildItem -Path $vlcExtract -Directory | Select-Object -First 1
+          if (-not $sourceRoot) { throw "Expanded VLC archive did not contain a directory." }
+          New-Item -ItemType Directory -Force -Path (Join-Path $vlcRoot "lib") | Out-Null
+          Copy-Item (Join-Path $sourceRoot.FullName "*.dll") (Join-Path $vlcRoot "lib") -Force
+          Copy-Item (Join-Path $sourceRoot.FullName "plugins") $vlcRoot -Recurse -Force
+          "MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT=$vlcRoot" >> $env:GITHUB_ENV
 
       - name: Restore Rust cache
         uses: actions/cache@v5
@@ -320,6 +361,20 @@ jobs:
 
       - name: Install aqtinstall
         run: python -m pip install --user "aqtinstall==3.3.*" "py7zr==1.0.*"
+
+      - name: Download bundled VLC runtime
+        run: |
+          $vlcZip = Join-Path $env:RUNNER_TEMP "vlc-winarm64.zip"
+          $vlcExtract = Join-Path $env:RUNNER_TEMP "vlc-winarm64"
+          $vlcRoot = Join-Path $env:RUNNER_TEMP "vlc-runtime-winarm64"
+          Invoke-WebRequest -Uri "https://get.videolan.org/vlc/$env:VLC_VERSION/winarm64/vlc-$env:VLC_VERSION-winarm64.zip" -OutFile $vlcZip
+          Expand-Archive -Path $vlcZip -DestinationPath $vlcExtract -Force
+          $sourceRoot = Get-ChildItem -Path $vlcExtract -Directory | Select-Object -First 1
+          if (-not $sourceRoot) { throw "Expanded VLC archive did not contain a directory." }
+          New-Item -ItemType Directory -Force -Path (Join-Path $vlcRoot "lib") | Out-Null
+          Copy-Item (Join-Path $sourceRoot.FullName "*.dll") (Join-Path $vlcRoot "lib") -Force
+          Copy-Item (Join-Path $sourceRoot.FullName "plugins") $vlcRoot -Recurse -Force
+          "MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT=$vlcRoot" >> $env:GITHUB_ENV
 
       - name: Restore Rust cache
         uses: actions/cache@v5
@@ -389,6 +444,18 @@ jobs:
       - name: Install aqtinstall
         run: python3 -m pip install --user "aqtinstall==3.3.*" "py7zr==1.0.*"
 
+      - name: Download bundled VLC runtime
+        run: |
+          VLC_DMG="${RUNNER_TEMP}/vlc.dmg"
+          VLC_MOUNT="${RUNNER_TEMP}/vlc-mount"
+          VLC_APP="${RUNNER_TEMP}/VLC.app"
+          curl -L "https://get.videolan.org/vlc/${VLC_VERSION}/macosx/vlc-${VLC_VERSION}-universal.dmg" -o "${VLC_DMG}"
+          mkdir -p "${VLC_MOUNT}"
+          hdiutil attach "${VLC_DMG}" -mountpoint "${VLC_MOUNT}" -nobrowse -quiet
+          cp -R "${VLC_MOUNT}/VLC.app" "${VLC_APP}"
+          hdiutil detach "${VLC_MOUNT}" -quiet
+          echo "MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT=${VLC_APP}/Contents/MacOS" >> "$GITHUB_ENV"
+
       - name: Restore Rust cache
         uses: actions/cache@v5
         with:
@@ -450,6 +517,18 @@ jobs:
 
       - name: Install aqtinstall
         run: python3 -m pip install --user "aqtinstall==3.3.*" "py7zr==1.0.*"
+
+      - name: Download bundled VLC runtime
+        run: |
+          VLC_DMG="${RUNNER_TEMP}/vlc.dmg"
+          VLC_MOUNT="${RUNNER_TEMP}/vlc-mount"
+          VLC_APP="${RUNNER_TEMP}/VLC.app"
+          curl -L "https://get.videolan.org/vlc/${VLC_VERSION}/macosx/vlc-${VLC_VERSION}-universal.dmg" -o "${VLC_DMG}"
+          mkdir -p "${VLC_MOUNT}"
+          hdiutil attach "${VLC_DMG}" -mountpoint "${VLC_MOUNT}" -nobrowse -quiet
+          cp -R "${VLC_MOUNT}/VLC.app" "${VLC_APP}"
+          hdiutil detach "${VLC_MOUNT}" -quiet
+          echo "MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT=${VLC_APP}/Contents/MacOS" >> "$GITHUB_ENV"
 
       - name: Restore Rust cache
         uses: actions/cache@v5

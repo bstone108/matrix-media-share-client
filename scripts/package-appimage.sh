@@ -126,7 +126,19 @@ export EXTRA_QT_PLUGINS="sqldrivers"
 export LINUXDEPLOY_OUTPUT_VERSION="${VERSION:-${APP_VERSION}}"
 export LD_LIBRARY_PATH="${QT_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="${QT_PREFIX}"
+cmake_args=(
+  -S "${ROOT_DIR}"
+  -B "${BUILD_DIR}"
+  -G Ninja
+  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_PREFIX_PATH="${QT_PREFIX}"
+)
+
+if [[ -n "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT:-}" && -d "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}" ]]; then
+  cmake_args+=("-DMATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}")
+fi
+
+cmake "${cmake_args[@]}"
 cmake --build "${BUILD_DIR}" --config Release
 ctest --test-dir "${BUILD_DIR}" --build-config Release --output-on-failure
 
