@@ -145,7 +145,20 @@ foreach ($candidate in @(
 if (-not $windeployqt) {
     $windeployqt = (Get-Command windeployqt.exe -ErrorAction Stop).Source
 }
-$qtBinDir = Split-Path -Parent $windeployqt
+$qtRuntimeBinDir = $null
+foreach ($candidate in @(
+    $(if ($env:QT_ROOT_DIR) { Join-Path $env:QT_ROOT_DIR "bin" }),
+    $(if ($env:QT_HOST_ROOT_DIR) { Join-Path $env:QT_HOST_ROOT_DIR "bin" }),
+    $(Split-Path -Parent $windeployqt)
+)) {
+    if ($candidate -and (Test-Path $candidate)) {
+        $qtRuntimeBinDir = (Resolve-Path $candidate).Path
+        break
+    }
+}
+if (-not $qtRuntimeBinDir) {
+    throw "Could not determine the Qt runtime bin directory."
+}
 
 if (Test-Path $stageDir) {
     Remove-Item -Recurse -Force $stageDir
@@ -170,7 +183,7 @@ foreach ($bundleDirName in @("kubo", "vlc")) {
     (Join-Path $stageDir "MatrixMediaShareClientQt.exe")
 
 foreach ($dllName in @("D3Dcompiler_47.dll", "opengl32sw.dll", "libEGL.dll", "libGLESv2.dll")) {
-    $dllPath = Join-Path $qtBinDir $dllName
+    $dllPath = Join-Path $qtRuntimeBinDir $dllName
     if (Test-Path $dllPath) {
         Copy-Item $dllPath $stageDir -Force
     }
