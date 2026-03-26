@@ -286,7 +286,7 @@ jobs:
           $vlcZip = Join-Path $env:RUNNER_TEMP "vlc-win64.zip"
           $vlcExtract = Join-Path $env:RUNNER_TEMP "vlc-win64"
           $vlcRoot = Join-Path $env:RUNNER_TEMP "vlc-runtime-win64"
-          Invoke-WebRequest -Uri "https://get.videolan.org/vlc/$env:VLC_VERSION/win64/vlc-$env:VLC_VERSION-win64.zip" -OutFile $vlcZip
+          curl.exe -fL --retry 3 --retry-all-errors "https://mirror.fcix.net/videolan-ftp/vlc/$env:VLC_VERSION/win64/vlc-$env:VLC_VERSION-win64.zip" --output $vlcZip
           Expand-Archive -Path $vlcZip -DestinationPath $vlcExtract -Force
           $sourceRoot = Get-ChildItem -Path $vlcExtract -Directory | Select-Object -First 1
           if (-not $sourceRoot) { throw "Expanded VLC archive did not contain a directory." }
@@ -367,7 +367,7 @@ jobs:
           $vlcZip = Join-Path $env:RUNNER_TEMP "vlc-winarm64.zip"
           $vlcExtract = Join-Path $env:RUNNER_TEMP "vlc-winarm64"
           $vlcRoot = Join-Path $env:RUNNER_TEMP "vlc-runtime-winarm64"
-          Invoke-WebRequest -Uri "https://get.videolan.org/vlc/$env:VLC_VERSION/winarm64/vlc-$env:VLC_VERSION-winarm64.zip" -OutFile $vlcZip
+          curl.exe -fL --retry 3 --retry-all-errors "https://mirror.fcix.net/videolan-ftp/vlc/$env:VLC_VERSION/winarm64/vlc-$env:VLC_VERSION-winarm64.zip" --output $vlcZip
           Expand-Archive -Path $vlcZip -DestinationPath $vlcExtract -Force
           $sourceRoot = Get-ChildItem -Path $vlcExtract -Directory | Select-Object -First 1
           if (-not $sourceRoot) { throw "Expanded VLC archive did not contain a directory." }
