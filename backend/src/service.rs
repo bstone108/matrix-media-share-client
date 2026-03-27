@@ -4676,6 +4676,33 @@ IPFS media: ipfs://bafybeicba7jmibru2lzxrm7wpy7ydkxgh2xmgko2cq5qwveytsz3p4wgnm";
             Some("mxc://example.org/media")
         );
     }
+
+    #[test]
+    fn video_thumbnail_rendition_only_uses_media_source_not_explicit_thumbnail_source() {
+        let discovery = AttachmentDiscovery {
+            room_id: "!room:example.org".to_owned(),
+            event_id: "$event".to_owned(),
+            origin_server_timestamp: Utc::now(),
+            source_kind: MediaSourceKind::Ipfs,
+            direct_url: Some("https://dweb.link/ipfs/bafyraw?download=1".to_owned()),
+            mxc_url: "https://dweb.link/ipfs/bafkpage".to_owned(),
+            fallback_source_url: Some("mxc://example.org/video".to_owned()),
+            thumbnail_source_url: Some("mxc://example.org/thumb".to_owned()),
+            thumbnail_cached_path: None,
+            original_filename: Some("Example.mp4".to_owned()),
+            mime_type: Some("video/mp4".to_owned()),
+            category: MediaCategory::Videos,
+        };
+
+        assert!(should_request_matrix_thumbnail_rendition(
+            &discovery,
+            "mxc://example.org/video"
+        ));
+        assert!(!should_request_matrix_thumbnail_rendition(
+            &discovery,
+            "mxc://example.org/thumb"
+        ));
+    }
 }
 
 fn should_cache_discovery_thumbnail(discovery: &AttachmentDiscovery) -> bool {
@@ -4983,8 +5010,22 @@ fn should_request_matrix_thumbnail_rendition(
     discovery: &AttachmentDiscovery,
     source: &str,
 ) -> bool {
-    !(source.starts_with("http://") || source.starts_with("https://"))
-        && matches!(discovery.category, MediaCategory::Videos)
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return false;
+    }
+    if !matches!(discovery.category, MediaCategory::Videos) {
+        return false;
+    }
+
+    let source = source.trim();
+    let primary_media_source = discovery.mxc_url.trim();
+    let fallback_media_source = discovery
+        .fallback_source_url
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+
+    source == primary_media_source || (!fallback_media_source.is_empty() && source == fallback_media_source)
 }
 
 async fn load_discovery_thumbnail_bytes(
