@@ -52,7 +52,7 @@ use crate::{
     domain::{
         ActiveDownloadSnapshot, AppLogLevel, AppSettings, AttachmentDiscovery, BotRuntimeSnapshot,
         ConnectionState, DownloadJobRecord, FailedJobRetentionUnit, LocalAssetSourceKind,
-        MediaCategory, MediaSourceKind, RoomCheckpoint, RoomHierarchySnapshot, RoomHistoryMode,
+        MediaCategory, MediaSourceKind, PendingUploadSnapshot, RoomCheckpoint, RoomHierarchySnapshot, RoomHistoryMode,
         RoomWorkerSnapshot, SpaceChildDescriptor, StoredSession, TrackedUploadRecord, ViewerSnapshot,
         ViewerState,
         VerificationEmoji, VerificationSnapshot, VerificationStatus,
@@ -81,6 +81,8 @@ const HASH_ROOT_DOWNLOADS: &str = "downloads";
 const HASH_ROOT_SHARED: &str = "shared";
 const MANAGED_SHARE_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 const MANAGED_SHARE_ITEM_DELAY: Duration = Duration::from_millis(500);
+const DEFAULT_MATRIX_PREVIEW_LIMIT_BYTES: i64 = 6 * 1024 * 1024;
+const MIN_MATRIX_PREVIEW_LIMIT_BYTES: i64 = 256 * 1024;
 
 pub enum CommandOutcome {
     Continue,
@@ -1015,6 +1017,12 @@ struct PreparedShareSource {
     bundle_path: PathBuf,
 }
 
+struct PreparedMatrixPreview {
+    path: PathBuf,
+    content_type: Mime,
+    display_name: String,
+}
+
 async fn queue_share_requests(
     context: &Arc<RunningContext>,
     room_id: &str,
@@ -1041,16 +1049,56 @@ async fn queue_share_requests(
             continue;
         }
 
+        let queue_id = Uuid::new_v4().to_string();
+        let file_name = Path::new(trimmed)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| trimmed.to_owned());
+        context
+            .runtime
+            .mutate(|runtime| {
+                runtime.pending_uploads.push(PendingUploadSnapshot {
+                    queue_id: queue_id.clone(),
+                    room_id: room_id.clone(),
+                    file_path: trimmed.to_owned(),
+                    file_name: file_name.clone(),
+                    state: "queued".to_owned(),
+                });
+            })
+            .await;
         queued_count += 1;
         let context = context.clone();
         let room_id = room_id.clone();
         let file_path = trimmed.to_owned();
+        let queue_id = queue_id.clone();
         tokio::spawn(async move {
             let permit = context.share_slots.clone().acquire_owned().await;
             let _permit = match permit {
                 Ok(permit) => permit,
-                Err(_) => return,
+                Err(_) => {
+                    context
+                        .runtime
+                        .mutate(|runtime| {
+                            runtime.pending_uploads.retain(|upload| upload.queue_id != queue_id);
+                        })
+                        .await;
+                    return;
+                }
             };
+
+            context
+                .runtime
+                .mutate(|runtime| {
+                    if let Some(upload) = runtime
+                        .pending_uploads
+                        .iter_mut()
+                        .find(|upload| upload.queue_id == queue_id)
+                    {
+                        upload.state = "uploading".to_owned();
+                    }
+                })
+                .await;
 
             if let Err(error) = share_local_file(&context, &room_id, Path::new(&file_path)).await {
                 let _ = context
@@ -1063,6 +1111,12 @@ async fn queue_share_requests(
                     .await;
             }
 
+            context
+                .runtime
+                .mutate(|runtime| {
+                    runtime.pending_uploads.retain(|upload| upload.queue_id != queue_id);
+                })
+                .await;
             sleep(SHARE_QUEUE_DELAY).await;
         });
     }
@@ -2067,6 +2121,217 @@ fn managed_share_landing_page_path(bundle_path: &Path) -> PathBuf {
     bundle_path.join("index.html")
 }
 
+fn managed_share_matrix_preview_path(bundle_path: &Path, extension: &str) -> PathBuf {
+    bundle_path.join(format!("matrix-preview.{extension}"))
+}
+
+fn preview_upload_limit(upload_limit: Option<i64>) -> i64 {
+    let effective_limit = upload_limit
+        .filter(|limit| *limit > MIN_MATRIX_PREVIEW_LIMIT_BYTES)
+        .unwrap_or(DEFAULT_MATRIX_PREVIEW_LIMIT_BYTES);
+    let safety_limit = effective_limit.saturating_mul(4) / 5;
+    safety_limit.clamp(MIN_MATRIX_PREVIEW_LIMIT_BYTES, DEFAULT_MATRIX_PREVIEW_LIMIT_BYTES)
+}
+
+fn preview_comment_for_category(category: MediaCategory) -> &'static str {
+    match category {
+        MediaCategory::Images => "low-quality image preview",
+        MediaCategory::Videos => "low-quality video preview (up to 2 minutes)",
+        MediaCategory::Audio => "audio preview",
+        _ => "low-quality preview",
+    }
+}
+
+fn looks_like_matrix_too_large_error(error_text: &str) -> bool {
+    let normalized = error_text.to_ascii_lowercase();
+    normalized.contains("m_too_large")
+        || normalized.contains("too large")
+        || normalized.contains("payload too large")
+        || normalized.contains("request entity too large")
+        || normalized.contains("content length")
+        || normalized.contains("413")
+}
+
+async fn prepare_matrix_share_preview(
+    prepared: &PreparedShareSource,
+    preview_limit: i64,
+) -> Result<Option<PreparedMatrixPreview>> {
+    if preview_limit <= 0 {
+        return Ok(None);
+    }
+
+    let display_stem = Path::new(&prepared.file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("preview");
+
+    match prepared.category {
+        MediaCategory::Images => {
+            let preview_path = managed_share_matrix_preview_path(&prepared.bundle_path, "jpg");
+            generate_matrix_image_preview_to_path(&prepared.source_path, &preview_path, preview_limit)
+                .await?;
+            Ok(Some(PreparedMatrixPreview {
+                path: preview_path,
+                content_type: mime::IMAGE_JPEG,
+                display_name: format!("{display_stem}.preview.jpg"),
+            }))
+        }
+        MediaCategory::Videos => {
+            let preview_path = managed_share_matrix_preview_path(&prepared.bundle_path, "mp4");
+            if generate_matrix_video_preview_to_path(
+                &prepared.source_path,
+                &preview_path,
+                preview_limit,
+            )
+            .await?
+            {
+                Ok(Some(PreparedMatrixPreview {
+                    path: preview_path,
+                    content_type: "video/mp4"
+                        .parse()
+                        .expect("video/mp4 should be a valid MIME type"),
+                    display_name: format!("{display_stem}.preview.mp4"),
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn generate_matrix_image_preview_to_path(
+    source_path: &Path,
+    destination: &Path,
+    preview_limit: i64,
+) -> Result<()> {
+    use image::{codecs::jpeg::JpegEncoder, imageops::FilterType};
+
+    let bytes = tokio_fs::read(source_path)
+        .await
+        .with_context(|| format!("Failed to read {}", source_path.display()))?;
+    let image = load_oriented_image_from_bytes(&bytes).context("Failed to decode preview image")?;
+    let size_targets = [1600u32, 1280, 960, 720, 480, 320];
+    let quality_targets = [82u8, 72, 62, 52, 42, 32];
+
+    if let Some(parent) = destination.parent() {
+        tokio_fs::create_dir_all(parent).await?;
+    }
+
+    for max_dimension in size_targets {
+        let resized = image.resize(max_dimension, max_dimension, FilterType::Triangle);
+        for quality in quality_targets {
+            let mut encoded = Vec::new();
+            let mut encoder = JpegEncoder::new_with_quality(&mut encoded, quality);
+            encoder
+                .encode_image(&resized)
+                .context("Failed to encode image preview")?;
+            if encoded.len() as i64 <= preview_limit {
+                tokio_fs::write(destination, encoded)
+                    .await
+                    .with_context(|| format!("Failed to write {}", destination.display()))?;
+                return Ok(());
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "Could not generate an image preview within the Matrix preview size limit."
+    ))
+}
+
+async fn generate_matrix_video_preview_to_path(
+    source_path: &Path,
+    destination: &Path,
+    preview_limit: i64,
+) -> Result<bool> {
+    let Some(ffmpeg) = which("ffmpeg").await? else {
+        return Ok(false);
+    };
+
+    if let Some(parent) = destination.parent() {
+        tokio_fs::create_dir_all(parent).await?;
+    }
+
+    let duration_seconds: i64 = 120;
+    let audio_kbps: i64 = 48;
+    let total_kbps = ((preview_limit.max(MIN_MATRIX_PREVIEW_LIMIT_BYTES) * 8)
+        / duration_seconds.max(1)
+        / 1000)
+        .max(128);
+    let initial_video_kbps = (total_kbps - audio_kbps).max(96);
+
+    let width_targets = [640i64, 480, 360, 240];
+    let bitrate_targets = [
+        initial_video_kbps,
+        (initial_video_kbps * 3 / 4).max(80),
+        (initial_video_kbps / 2).max(64),
+        48,
+    ];
+
+    for width in width_targets {
+        for video_kbps in bitrate_targets {
+            let _ = tokio_fs::remove_file(destination).await;
+            let output = tokio::process::Command::new(&ffmpeg)
+                .arg("-y")
+                .args(["-v", "error"])
+                .arg("-i")
+                .arg(source_path)
+                .args(["-t", "120"])
+                .args([
+                    "-vf",
+                    &format!("scale='min({width},iw)':-2:flags=lanczos"),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-profile:v",
+                    "baseline",
+                    "-level",
+                    "3.0",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                    "-b:v",
+                    &format!("{video_kbps}k"),
+                    "-maxrate",
+                    &format!("{video_kbps}k"),
+                    "-bufsize",
+                    &format!("{}k", video_kbps.saturating_mul(2)),
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    &format!("{audio_kbps}k"),
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "44100",
+                ])
+                .arg(destination)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .with_context(|| format!("Failed to run ffmpeg for {}", source_path.display()))?;
+            if !output.success() {
+                continue;
+            }
+
+            let Ok(metadata) = tokio_fs::metadata(destination).await else {
+                continue;
+            };
+            if metadata.len() as i64 <= preview_limit && metadata.len() > 0 {
+                return Ok(true);
+            }
+        }
+    }
+
+    let _ = tokio_fs::remove_file(destination).await;
+    Ok(false)
+}
+
 fn configured_destination_root(settings: &AppSettings, paths: &AppPaths) -> PathBuf {
     let configured = settings.destination_root_path.trim();
     if configured.is_empty() {
@@ -2254,6 +2519,7 @@ async fn share_local_file(
 
     let upload_limit = context.runtime.snapshot().await.upload_size_limit_bytes;
     let should_try_full_upload = upload_limit.is_none_or(|limit| prepared.file_size <= limit);
+    let mut should_try_matrix_preview = !should_try_full_upload;
 
     if should_try_full_upload {
         let file_bytes = tokio_fs::read(&prepared.source_path)
@@ -2280,6 +2546,8 @@ async fn share_local_file(
                 return Ok(());
             }
             Err(error) => {
+                let error_text = format!("{error:#}");
+                should_try_matrix_preview = looks_like_matrix_too_large_error(&error_text);
                 context
                     .database
                     .insert_log(
@@ -2295,6 +2563,44 @@ async fn share_local_file(
         }
     }
 
+    let preview_comment_message = format!(
+        "Preview attached: {}\n{}",
+        preview_comment_for_category(prepared.category),
+        comment_message
+    );
+    let preview_attachment_comment = Some(TextMessageEventContent::plain(preview_comment_message.clone()));
+
+    if should_try_matrix_preview {
+        let preview_limit = preview_upload_limit(upload_limit);
+        if let Some(preview) = prepare_matrix_share_preview(&prepared, preview_limit).await? {
+            if let Ok(preview_bytes) = tokio_fs::read(&preview.path).await {
+                if room
+                    .send_attachment(
+                        preview.display_name.clone(),
+                        &preview.content_type,
+                        preview_bytes,
+                        AttachmentConfig::new().caption(preview_attachment_comment.clone()),
+                    )
+                    .await
+                    .is_ok()
+                {
+                    context
+                        .database
+                        .insert_log(
+                            AppLogLevel::Info,
+                            "share",
+                            &format!(
+                                "Shared {} to {room_id} via Matrix preview and IPFS landing page {}.",
+                                prepared.file_name, published.landing_page_url
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     if let Some(thumbnail_path) = thumbnail_path.as_deref() {
         if let Ok(thumbnail_bytes) = tokio_fs::read(thumbnail_path).await {
             if room
@@ -2302,7 +2608,7 @@ async fn share_local_file(
                     format!("{}.preview.jpg", prepared.file_name),
                     &mime::IMAGE_JPEG,
                     thumbnail_bytes,
-                    AttachmentConfig::new().caption(attachment_comment.clone()),
+                    AttachmentConfig::new().caption(preview_attachment_comment.clone()),
                 )
                 .await
                 .is_ok()
@@ -2325,7 +2631,7 @@ async fn share_local_file(
 
     room.send(RoomMessageEventContent::text_plain(format!(
         "{}\n{}",
-        prepared.file_name, comment_message
+        prepared.file_name, preview_comment_message
     )))
         .await?;
     context

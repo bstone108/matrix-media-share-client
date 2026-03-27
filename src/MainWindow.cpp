@@ -289,6 +289,34 @@ QString transferProgressText(const qint64 receivedBytes, const qint64 totalBytes
     return QString();
 }
 
+int activePendingUploadCount(const QVector<PendingUploadSnapshot> &uploads)
+{
+    int count = 0;
+    for (const PendingUploadSnapshot &upload : uploads) {
+        if (upload.state == QStringLiteral("uploading")) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+QString pendingUploadSummaryText(const QVector<PendingUploadSnapshot> &uploads)
+{
+    if (uploads.isEmpty()) {
+        return QStringLiteral("Uploads: none");
+    }
+
+    const int activeCount = activePendingUploadCount(uploads);
+    const int queuedCount = qMax(0, uploads.size() - activeCount);
+    if (activeCount > 0 && queuedCount > 0) {
+        return QStringLiteral("Uploads: %1 active, %2 queued").arg(activeCount).arg(queuedCount);
+    }
+    if (activeCount > 0) {
+        return QStringLiteral("Uploads: %1 active").arg(activeCount);
+    }
+    return QStringLiteral("Uploads: %1 queued").arg(queuedCount);
+}
+
 QPixmap renderDiscoveryTile(
     const QSize &size,
     const QString &headline,
@@ -797,12 +825,14 @@ QWidget *MainWindow::buildBrowserPage()
     connectionLabel_ = new QLabel(browserPage_);
     ipfsStatusLabel_ = new QLabel(browserPage_);
     uploadLimitLabel_ = new QLabel(browserPage_);
+    pendingUploadsLabel_ = new QLabel(browserPage_);
     updateBannerLabel_ = new QLabel(browserPage_);
     updateBannerLabel_->setWordWrap(true);
     statusRow->addWidget(powerToggle_);
     statusRow->addWidget(connectionLabel_);
     statusRow->addWidget(ipfsStatusLabel_);
     statusRow->addWidget(uploadLimitLabel_);
+    statusRow->addWidget(pendingUploadsLabel_);
     statusRow->addWidget(updateBannerLabel_);
     statusRow->addStretch();
     layout->addLayout(statusRow);
@@ -970,6 +1000,9 @@ QWidget *MainWindow::buildTransfersPage()
 
     queueStatsLabel_ = new QLabel(page);
     layout->addWidget(queueStatsLabel_);
+
+    pendingUploadsList_ = new QListWidget(page);
+    layout->addWidget(pendingUploadsList_);
 
     activeDownloadsList_ = new QListWidget(page);
     layout->addWidget(activeDownloadsList_);
@@ -1283,6 +1316,7 @@ void MainWindow::populateBrowserPage()
     connectionLabel_->setText(QStringLiteral("Matrix: %1").arg(controller_->connectionStatusText()));
     ipfsStatusLabel_->setText(QStringLiteral("IPFS: %1").arg(ipfsRuntimeStateTitle(runtime.ipfs.state)));
     uploadLimitLabel_->setText(QStringLiteral("Upload Limit: %1").arg(uploadLimitText(runtime.uploadSizeLimitBytes)));
+    pendingUploadsLabel_->setText(pendingUploadSummaryText(runtime.pendingUploads));
     if (controller_->updateAvailable() || controller_->isUpdateCheckInProgress()) {
         updateBannerLabel_->setText(QStringLiteral("Updates: %1").arg(controller_->updateStatusText()));
     } else {
@@ -1471,10 +1505,29 @@ void MainWindow::populateRoomSidebar()
 
 void MainWindow::populateTransfersPage()
 {
+    const QVector<PendingUploadSnapshot> &pendingUploads = controller_->runtime().pendingUploads;
+    const int activeUploadCount = activePendingUploadCount(pendingUploads);
+    const int queuedUploadCount = qMax(0, pendingUploads.size() - activeUploadCount);
     queueStatsLabel_->setText(
-        QStringLiteral("Waiting: %1   Active: %2")
+        QStringLiteral("Downloads waiting: %1   Downloads active: %2   Uploads queued: %3   Uploads active: %4")
             .arg(controller_->waitingQueueCount())
-            .arg(controller_->runtime().activeDownloads.size()));
+            .arg(controller_->runtime().activeDownloads.size())
+            .arg(queuedUploadCount)
+            .arg(activeUploadCount));
+
+    if (pendingUploadsList_ != nullptr) {
+        pendingUploadsList_->clear();
+        for (const PendingUploadSnapshot &upload : pendingUploads) {
+            const QString displayName = upload.fileName.trimmed().isEmpty()
+                ? QFileInfo(upload.filePath).fileName()
+                : upload.fileName;
+            pendingUploadsList_->addItem(
+                QStringLiteral("%1 [%2] -> %3")
+                    .arg(displayName,
+                         upload.state.trimmed().isEmpty() ? QStringLiteral("queued") : upload.state,
+                         upload.roomId));
+        }
+    }
 
     activeDownloadsList_->clear();
     for (const ActiveDownloadSnapshot &download : controller_->runtime().activeDownloads) {

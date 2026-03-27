@@ -636,14 +636,25 @@ void AppController::shareLocalFiles(const QString &roomId, const QStringList &fi
         return;
     }
 
-    QString errorMessage;
-    if (!backend_->shareLocalFiles(roomId, cleanedPaths, errorMessage)) {
-        lastErrorMessage_ = errorMessage;
-        logError(QStringLiteral("share"), errorMessage);
-    } else {
+    int queuedCount = 0;
+    QStringList failures;
+    for (const QString &filePath : cleanedPaths) {
+        QString errorMessage;
+        if (backend_->shareLocalFile(roomId, filePath, errorMessage)) {
+            queuedCount += 1;
+        } else if (!errorMessage.trimmed().isEmpty()) {
+            failures.append(errorMessage.trimmed());
+            logError(QStringLiteral("share"), errorMessage);
+        }
+    }
+
+    if (queuedCount > 0) {
         logInfo(
             QStringLiteral("share"),
-            QStringLiteral("Queued %1 file(s) for sharing into %2.").arg(cleanedPaths.size()).arg(roomId));
+            QStringLiteral("Queued %1 file(s) for sharing into %2.").arg(queuedCount).arg(roomId));
+    }
+    if (!failures.isEmpty()) {
+        lastErrorMessage_ = failures.join(QStringLiteral("\n"));
     }
     refresh();
 }

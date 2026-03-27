@@ -284,6 +284,18 @@ BotRuntimeSnapshot parseRuntimeSnapshot(const QJsonObject &object)
         snapshot.activeDownloads.append(download);
     }
 
+    const QJsonArray pendingUploads = object.value(QStringLiteral("pendingUploads")).toArray();
+    for (const QJsonValue &value : pendingUploads) {
+        const QJsonObject uploadObject = value.toObject();
+        PendingUploadSnapshot upload;
+        upload.queueId = uploadObject.value(QStringLiteral("queueId")).toString();
+        upload.roomId = uploadObject.value(QStringLiteral("roomId")).toString();
+        upload.filePath = uploadObject.value(QStringLiteral("filePath")).toString();
+        upload.fileName = uploadObject.value(QStringLiteral("fileName")).toString();
+        upload.state = uploadObject.value(QStringLiteral("state")).toString();
+        snapshot.pendingUploads.append(upload);
+    }
+
     return snapshot;
 }
 
@@ -454,19 +466,21 @@ bool ProcessMatrixClientBackend::shareLocalFile(const QString &roomId, const QSt
 
 bool ProcessMatrixClientBackend::shareLocalFiles(const QString &roomId, const QStringList &filePaths, QString &errorMessage)
 {
-    QJsonArray files;
+    QStringList failures;
+    int queuedCount = 0;
     for (const QString &filePath : filePaths) {
-        files.append(filePath);
+        QString itemError;
+        if (shareLocalFile(roomId, filePath, itemError)) {
+            queuedCount += 1;
+        } else if (!itemError.trimmed().isEmpty()) {
+            failures.append(itemError.trimmed());
+        }
     }
 
-    return commandRequiringRunningProcess(
-        QJsonObject {
-            {QStringLiteral("type"), QStringLiteral("shareLocalFiles")},
-            {QStringLiteral("roomId"), roomId},
-            {QStringLiteral("filePaths"), files},
-        },
-        errorMessage,
-        180000);
+    if (!failures.isEmpty()) {
+        errorMessage = failures.join(QStringLiteral("\n"));
+    }
+    return queuedCount > 0 && failures.isEmpty();
 }
 
 bool ProcessMatrixClientBackend::importIpfsLink(const QString &link, QString &errorMessage)

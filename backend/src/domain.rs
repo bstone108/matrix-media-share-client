@@ -600,6 +600,16 @@ impl Default for ViewerSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingUploadSnapshot {
+    pub queue_id: String,
+    pub room_id: String,
+    pub file_path: String,
+    pub file_name: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BotRuntimeSnapshot {
     pub connection_state: ConnectionState,
     pub current_user_id: Option<String>,
@@ -612,6 +622,7 @@ pub struct BotRuntimeSnapshot {
     pub verification: VerificationSnapshot,
     pub worker_states: Vec<RoomWorkerSnapshot>,
     pub active_downloads: Vec<ActiveDownloadSnapshot>,
+    pub pending_uploads: Vec<PendingUploadSnapshot>,
 }
 
 impl Default for BotRuntimeSnapshot {
@@ -628,6 +639,7 @@ impl Default for BotRuntimeSnapshot {
             verification: VerificationSnapshot::default(),
             worker_states: Vec::new(),
             active_downloads: Vec::new(),
+            pending_uploads: Vec::new(),
         }
     }
 }

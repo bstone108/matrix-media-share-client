@@ -560,6 +560,14 @@ struct ActiveDownloadSnapshot {
     qint64 totalBytes = -1;
 };
 
+struct PendingUploadSnapshot {
+    QString queueId;
+    QString roomId;
+    QString filePath;
+    QString fileName;
+    QString state;
+};
+
 struct VerificationEmoji {
     QString symbol;
     QString description;
@@ -615,6 +623,7 @@ struct BotRuntimeSnapshot {
     VerificationSnapshot verification;
     QVector<RoomWorkerSnapshot> workerStates;
     QVector<ActiveDownloadSnapshot> activeDownloads;
+    QVector<PendingUploadSnapshot> pendingUploads;
 };
 
 struct GatewayStatusSnapshot {

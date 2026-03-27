@@ -1,9 +1,11 @@
+use crate::gateway_registry::page_url;
 use crate::gateway_registry::raw_file_url;
 
 pub fn render_landing_page(
     title: &str,
     file_cid: &str,
     thumbnail_cid: Option<&str>,
+    page_cid: Option<&str>,
     primary_gateway_url: &str,
     alternates: &[(&str, &str, bool)],
 ) -> String {
@@ -24,7 +26,13 @@ pub fn render_landing_page(
         .enumerate()
         .map(|(index, (label, gateway_url, supports_html))| {
             let note = if *supports_html { "" } else { " <span>(file only)</span>" };
-            let href = raw_file_url(gateway_url, file_cid);
+            let href = if *supports_html {
+                page_cid
+                    .map(|cid| page_url(gateway_url, cid))
+                    .unwrap_or_else(|| raw_file_url(gateway_url, file_cid))
+            } else {
+                raw_file_url(gateway_url, file_cid)
+            };
             format!(
                 "<li><a id=\"gateway-link-{index}\" data-gateway=\"{}\" data-supports-html=\"{}\" href=\"{}\">{} via {}</a>{}</li>",
                 escape_html(gateway_url),
@@ -147,6 +155,7 @@ mod tests {
             "Example",
             "bafyfile",
             Some("bafythumb"),
+            Some("bafypage"),
             "https://dweb.link",
             &[("Global", "https://ipfs.io", true), ("Global CDN", "https://4everland.io", false)],
         );
@@ -154,7 +163,8 @@ mod tests {
         assert!(html.contains("https://dweb.link/ipfs/bafyfile"));
         assert!(html.contains("window.location.pathname"));
         assert!(html.contains("data-gateway=\"https://ipfs.io\""));
-        assert!(html.contains("href=\"https://ipfs.io/ipfs/bafyfile\""));
+        assert!(html.contains("href=\"https://ipfs.io/ipfs/bafypage\""));
+        assert!(html.contains("href=\"https://4everland.io/ipfs/bafyfile\""));
         assert!(html.contains("file only"));
     }
 }

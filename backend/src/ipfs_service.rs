@@ -128,6 +128,7 @@ impl IpfsService {
             title,
             &file_cid,
             thumbnail_cid.as_deref(),
+            None,
             &primary_gateway,
             &alternate_gateways,
         );
@@ -145,6 +146,7 @@ impl IpfsService {
             title,
             &file_cid,
             thumbnail_cid.as_deref(),
+            Some(&page_cid),
             &primary_gateway,
             &alternate_gateways,
         ))

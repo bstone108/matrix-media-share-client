@@ -148,6 +148,7 @@ private:
     QLabel *connectionLabel_ = nullptr;
     QLabel *ipfsStatusLabel_ = nullptr;
     QLabel *uploadLimitLabel_ = nullptr;
+    QLabel *pendingUploadsLabel_ = nullptr;
     QLabel *updateBannerLabel_ = nullptr;
     QLabel *browserSelectedRoomLabel_ = nullptr;
     QLabel *browserDropHintLabel_ = nullptr;
@@ -162,6 +163,7 @@ private:
     QPushButton *deleteLibraryButton_ = nullptr;
 
     QLabel *queueStatsLabel_ = nullptr;
+    QListWidget *pendingUploadsList_ = nullptr;
     QListWidget *activeDownloadsList_ = nullptr;
     QTableWidget *waitingJobsTable_ = nullptr;
     QTableWidget *failedJobsTable_ = nullptr;
