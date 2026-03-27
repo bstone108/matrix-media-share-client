@@ -6,10 +6,12 @@
 #include "WebVideoWidget.h"
 
 #include <QAbstractItemView>
+#include <QApplication>
 #include <QBuffer>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDir>
 #include <QDesktopServices>
 #include <QDialog>
@@ -33,11 +35,13 @@
 #include <QMimeData>
 #include <QAudioOutput>
 #include <QMediaPlayer>
+#include <QMessageBox>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPalette>
 #include <QPlainTextEdit>
 #include <QPixmap>
 #include <QPushButton>
@@ -51,6 +55,7 @@
 #include <QSizePolicy>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QStyle>
 #include <QTableWidget>
 #include <QTextEdit>
 #include <QTimer>
@@ -76,6 +81,60 @@ constexpr int kBrowserThumbnailConcurrentRequests = 6;
 constexpr int kLogsPageSize = 200;
 constexpr int kLogsBufferedPages = 2;
 constexpr int kLogsMaxWindowPages = 5;
+
+struct ThemeBaseline {
+    bool captured = false;
+    QString styleName;
+    QPalette palette;
+};
+
+ThemeBaseline &themeBaseline()
+{
+    static ThemeBaseline baseline;
+    return baseline;
+}
+
+void captureThemeBaseline(QApplication *app)
+{
+    if (app == nullptr) {
+        return;
+    }
+    ThemeBaseline &baseline = themeBaseline();
+    if (baseline.captured) {
+        return;
+    }
+    if (app->style() != nullptr) {
+        baseline.styleName = app->style()->objectName();
+    }
+    baseline.palette = app->palette();
+    baseline.captured = true;
+}
+
+QPalette darkPalette()
+{
+    QPalette palette;
+    palette.setColor(QPalette::Window, QColor(QStringLiteral("#1b1f24")));
+    palette.setColor(QPalette::WindowText, QColor(QStringLiteral("#edf2f7")));
+    palette.setColor(QPalette::Base, QColor(QStringLiteral("#12161b")));
+    palette.setColor(QPalette::AlternateBase, QColor(QStringLiteral("#222831")));
+    palette.setColor(QPalette::ToolTipBase, QColor(QStringLiteral("#111827")));
+    palette.setColor(QPalette::ToolTipText, QColor(QStringLiteral("#edf2f7")));
+    palette.setColor(QPalette::Text, QColor(QStringLiteral("#edf2f7")));
+    palette.setColor(QPalette::Button, QColor(QStringLiteral("#2b3138")));
+    palette.setColor(QPalette::ButtonText, QColor(QStringLiteral("#edf2f7")));
+    palette.setColor(QPalette::BrightText, QColor(QStringLiteral("#ffffff")));
+    palette.setColor(QPalette::PlaceholderText, QColor(QStringLiteral("#8c96a3")));
+    palette.setColor(QPalette::Highlight, QColor(QStringLiteral("#2563eb")));
+    palette.setColor(QPalette::HighlightedText, QColor(QStringLiteral("#ffffff")));
+    palette.setColor(QPalette::Link, QColor(QStringLiteral("#60a5fa")));
+    palette.setColor(QPalette::LinkVisited, QColor(QStringLiteral("#93c5fd")));
+    palette.setColor(QPalette::Disabled, QPalette::WindowText, QColor(QStringLiteral("#7d8590")));
+    palette.setColor(QPalette::Disabled, QPalette::Text, QColor(QStringLiteral("#7d8590")));
+    palette.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(QStringLiteral("#7d8590")));
+    palette.setColor(QPalette::Disabled, QPalette::Highlight, QColor(QStringLiteral("#334155")));
+    palette.setColor(QPalette::Disabled, QPalette::HighlightedText, QColor(QStringLiteral("#cbd5e1")));
+    return palette;
+}
 
 QString jobTitle(const DownloadJobRecord &job)
 {
@@ -431,10 +490,16 @@ MainWindow::MainWindow(AppController *controller, QWidget *parent)
     : QMainWindow(parent)
     , controller_(controller)
 {
+    applyTheme(controller_->settings().darkModeEnabled);
     setWindowTitle(QStringLiteral("Matrix Media Share Client"));
     resize(1380, 860);
     setAcceptDrops(true);
     thumbnailNetworkManager_ = new QNetworkAccessManager(this);
+    windowConstraintTimer_ = new QTimer(this);
+    windowConstraintTimer_->setSingleShot(true);
+    connect(windowConstraintTimer_, &QTimer::timeout, this, [this]() {
+        constrainToAvailableGeometry();
+    });
 
     auto *central = new QWidget(this);
     auto *layout = new QHBoxLayout(central);
@@ -514,6 +579,9 @@ MainWindow::MainWindow(AppController *controller, QWidget *parent)
         }
     });
     connect(controller_, &AppController::stateChanged, this, &MainWindow::refreshView);
+    connect(controller_, &AppController::userNoticeRequested, this, [this](const QString &title, const QString &message) {
+        QMessageBox::warning(this, title, message);
+    });
 
     constrainToAvailableGeometry();
     sectionCombo_->setCurrentIndex(sectionIndex(AppSection::Browser));
@@ -539,19 +607,33 @@ void MainWindow::closeEvent(QCloseEvent *event)
 void MainWindow::showEvent(QShowEvent *event)
 {
     QMainWindow::showEvent(event);
-    constrainToAvailableGeometry();
+    scheduleWindowConstraint();
 }
 
 void MainWindow::moveEvent(QMoveEvent *event)
 {
     QMainWindow::moveEvent(event);
-    constrainToAvailableGeometry();
+    scheduleWindowConstraint();
 }
 
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
     QMainWindow::resizeEvent(event);
-    constrainToAvailableGeometry();
+    scheduleWindowConstraint();
+}
+
+void MainWindow::scheduleWindowConstraint()
+{
+    if (windowConstraintTimer_ == nullptr) {
+        constrainToAvailableGeometry();
+        return;
+    }
+
+#ifdef Q_OS_WIN
+    windowConstraintTimer_->start(120);
+#else
+    windowConstraintTimer_->start(0);
+#endif
 }
 
 void MainWindow::constrainToAvailableGeometry()
@@ -769,7 +851,15 @@ QWidget *MainWindow::buildBrowserPage()
     browserButtonRow->addStretch();
     layout->addLayout(browserButtonRow);
 
-    connect(powerToggle_, &QCheckBox::toggled, controller_, &AppController::togglePower);
+    connect(powerToggle_, &QCheckBox::toggled, this, [this](const bool enabled) {
+        if (enabled && settingsPageInitialized_ && settingsDirty_ && !saveSettingsFromUi(false)) {
+            powerToggle_->blockSignals(true);
+            powerToggle_->setChecked(false);
+            powerToggle_->blockSignals(false);
+            return;
+        }
+        controller_->togglePower(enabled);
+    });
     connect(refreshButton, &QPushButton::clicked, controller_, &AppController::refreshCatalog);
     connect(shareFilesButton_, &QPushButton::clicked, this, [this]() {
         const QString roomId = selectedBrowserRoomId();
@@ -979,6 +1069,7 @@ QWidget *MainWindow::buildSettingsPage()
     autostartCheck_ = new QCheckBox(content);
     minimizeToTrayCheck_ = new QCheckBox(content);
     startHiddenCheck_ = new QCheckBox(content);
+    darkModeCheck_ = new QCheckBox(content);
     archiveScanEnabledCheck_ = new QCheckBox(content);
     archiveHighPriorityCheck_ = new QCheckBox(content);
     selfHealCheck_ = new QCheckBox(content);
@@ -1060,6 +1151,7 @@ QWidget *MainWindow::buildSettingsPage()
     form->addRow(QStringLiteral("Autostart"), autostartCheck_);
     form->addRow(QStringLiteral("Minimize To Tray"), minimizeToTrayCheck_);
     form->addRow(QStringLiteral("Start Hidden"), startHiddenCheck_);
+    form->addRow(QStringLiteral("Dark Mode"), darkModeCheck_);
     form->addRow(QStringLiteral("Auto Join Space Rooms"), autoJoinSpacesCheck_);
     form->addRow(QStringLiteral("Auto Download New Media"), autoDownloadCheck_);
     contentLayout->addLayout(form);
@@ -1109,7 +1201,7 @@ QWidget *MainWindow::buildSettingsPage()
             markSettingsDirty();
         });
     }
-    for (QCheckBox *check : {archiveScanEnabledCheck_, archiveHighPriorityCheck_, selfHealCheck_, flatFolderLayoutCheck_, autostartCheck_, minimizeToTrayCheck_, startHiddenCheck_, autoJoinSpacesCheck_, autoDownloadCheck_}) {
+    for (QCheckBox *check : {archiveScanEnabledCheck_, archiveHighPriorityCheck_, selfHealCheck_, flatFolderLayoutCheck_, autostartCheck_, minimizeToTrayCheck_, startHiddenCheck_, darkModeCheck_, autoJoinSpacesCheck_, autoDownloadCheck_}) {
         connect(check, &QCheckBox::toggled, this, [this](bool) {
             markSettingsDirty();
         });
@@ -1325,6 +1417,9 @@ void MainWindow::populateRoomSidebar()
     const QString previousRoomId = section == AppSection::Browser
         ? browserSelectedRoomId_
         : roomsPageSelectedRoomId_;
+    const int previousScrollValue = roomsList_->verticalScrollBar() != nullptr
+        ? roomsList_->verticalScrollBar()->value()
+        : 0;
     roomsList_->blockSignals(true);
     roomsList_->clear();
     roomSidebarTitleLabel_->setText(section == AppSection::Browser
@@ -1369,6 +1464,9 @@ void MainWindow::populateRoomSidebar()
         roomsPageSelectedRoomId_.clear();
     }
     roomsList_->blockSignals(false);
+    if (roomsList_->verticalScrollBar() != nullptr) {
+        roomsList_->verticalScrollBar()->setValue(previousScrollValue);
+    }
 }
 
 void MainWindow::populateTransfersPage()
@@ -1497,6 +1595,7 @@ void MainWindow::populateSettingsPage()
     autostartCheck_->setChecked(settings.autostartEnabled);
     minimizeToTrayCheck_->setChecked(settings.minimizeToTray);
     startHiddenCheck_->setChecked(settings.startHidden);
+    darkModeCheck_->setChecked(settings.darkModeEnabled);
     autoJoinSpacesCheck_->setChecked(settings.autoJoinSpaceRooms);
     autoDownloadCheck_->setChecked(settings.autoDownloadNewMedia);
     populatingSettingsUi_ = false;
@@ -2127,6 +2226,7 @@ AppSettings MainWindow::gatherSettingsFromUi() const
     settings.autostartEnabled = autostartCheck_->isChecked();
     settings.minimizeToTray = minimizeToTrayCheck_->isChecked();
     settings.startHidden = startHiddenCheck_->isChecked();
+    settings.darkModeEnabled = darkModeCheck_->isChecked();
     settings.autoJoinSpaceRooms = autoJoinSpacesCheck_->isChecked();
     settings.autoDownloadNewMedia = autoDownloadCheck_->isChecked();
     return settings;
@@ -3229,6 +3329,7 @@ bool MainWindow::saveSettingsFromUi(const bool interactive)
         return false;
     }
 
+    applyTheme(controller_->settings().darkModeEnabled);
     settingsDirty_ = false;
     return true;
 }
@@ -3239,6 +3340,34 @@ void MainWindow::markSettingsDirty()
         return;
     }
     settingsDirty_ = true;
+}
+
+void MainWindow::applyTheme(const bool darkModeEnabled)
+{
+    QApplication *app = qobject_cast<QApplication *>(QCoreApplication::instance());
+    if (app == nullptr) {
+        return;
+    }
+
+    captureThemeBaseline(app);
+    const ThemeBaseline &baseline = themeBaseline();
+    if (darkModeEnabled) {
+        app->setStyle(QStringLiteral("Fusion"));
+        app->setPalette(darkPalette());
+        app->setStyleSheet(QStringLiteral(
+            "QToolTip {"
+            " color: #edf2f7;"
+            " background-color: #111827;"
+            " border: 1px solid #4b5563;"
+            " }"));
+        return;
+    }
+
+    if (!baseline.styleName.trimmed().isEmpty()) {
+        app->setStyle(baseline.styleName);
+    }
+    app->setPalette(baseline.palette);
+    app->setStyleSheet(QString());
 }
 
 QString MainWindow::roomDisplayTitle(const RoomRecord &room) const

@@ -287,6 +287,7 @@ AppSettings AppDatabase::loadSettings(const QString &defaultDestinationRootPath)
         settings.autostartEnabled = query.value(QStringLiteral("autostart_enabled")).toBool();
         settings.minimizeToTray = query.value(QStringLiteral("minimize_to_tray")).toBool();
         settings.startHidden = query.value(QStringLiteral("start_hidden")).toBool();
+        settings.darkModeEnabled = query.value(QStringLiteral("dark_mode_enabled")).toBool();
         settings.bandwidthLimitKiBPerSec = query.value(QStringLiteral("bandwidth_limit_kib_per_sec")).toInt();
         settings.previewWorkerCount = query.value(QStringLiteral("preview_worker_count")).toInt();
         settings.autoJoinSpaceRooms = query.value(QStringLiteral("auto_join_space_rooms")).toBool();
@@ -327,9 +328,9 @@ bool AppDatabase::saveSettings(const AppSettings &settings)
         "message_limit, time_window_value, time_window_unit, "
         "retry_cooldown_minutes, retry_limit, download_worker_count, "
         "failed_job_retention_value, failed_job_retention_unit, primary_gateway_url, preferred_gateway_urls, "
-        "autostart_enabled, minimize_to_tray, start_hidden, bandwidth_limit_kib_per_sec, preview_worker_count, "
+        "autostart_enabled, minimize_to_tray, start_hidden, dark_mode_enabled, bandwidth_limit_kib_per_sec, preview_worker_count, "
         "auto_join_space_rooms, auto_download_new_media, self_heal_enabled, desired_power_state, updated_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
     query.addBindValue(sanitizedSettings.homeserverUrl);
     query.addBindValue(sanitizedSettings.username);
     query.addBindValue(sanitizedSettings.ownerUserId);
@@ -353,6 +354,7 @@ bool AppDatabase::saveSettings(const AppSettings &settings)
     query.addBindValue(sanitizedSettings.autostartEnabled ? 1 : 0);
     query.addBindValue(sanitizedSettings.minimizeToTray ? 1 : 0);
     query.addBindValue(sanitizedSettings.startHidden ? 1 : 0);
+    query.addBindValue(sanitizedSettings.darkModeEnabled ? 1 : 0);
     query.addBindValue(sanitizedSettings.bandwidthLimitKiBPerSec);
     query.addBindValue(sanitizedSettings.previewWorkerCount);
     query.addBindValue(sanitizedSettings.autoJoinSpaceRooms ? 1 : 0);
@@ -799,6 +801,7 @@ void AppDatabase::initializeSchema()
         "autostart_enabled INTEGER NOT NULL DEFAULT 0,"
         "minimize_to_tray INTEGER NOT NULL DEFAULT 1,"
         "start_hidden INTEGER NOT NULL DEFAULT 0,"
+        "dark_mode_enabled INTEGER NOT NULL DEFAULT 0,"
         "bandwidth_limit_kib_per_sec INTEGER NOT NULL DEFAULT 0,"
         "preview_worker_count INTEGER NOT NULL DEFAULT 1,"
         "auto_join_space_rooms INTEGER NOT NULL DEFAULT 0,"
@@ -886,6 +889,10 @@ void AppDatabase::initializeSchema()
     if (!columnExists(database_, QStringLiteral("app_settings"), QStringLiteral("self_heal_enabled"))) {
         execute(QStringLiteral(
             "ALTER TABLE app_settings ADD COLUMN self_heal_enabled INTEGER NOT NULL DEFAULT 0"));
+    }
+    if (!columnExists(database_, QStringLiteral("app_settings"), QStringLiteral("dark_mode_enabled"))) {
+        execute(QStringLiteral(
+            "ALTER TABLE app_settings ADD COLUMN dark_mode_enabled INTEGER NOT NULL DEFAULT 0"));
     }
 
     execute(QStringLiteral(

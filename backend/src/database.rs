@@ -116,6 +116,7 @@ impl AppDatabase {
             autostart_enabled: false,
             minimize_to_tray: true,
             start_hidden: false,
+            dark_mode_enabled: false,
             bandwidth_limit_kib_per_sec: 0,
             preview_worker_count: 1,
             auto_join_space_rooms: false,
@@ -142,11 +143,11 @@ impl AppDatabase {
                 retry_cooldown_minutes, retry_limit, download_worker_count,
                 failed_job_retention_value, failed_job_retention_unit,
                 primary_gateway_url, preferred_gateway_urls,
-                autostart_enabled, minimize_to_tray, start_hidden,
+                autostart_enabled, minimize_to_tray, start_hidden, dark_mode_enabled,
                 bandwidth_limit_kib_per_sec, preview_worker_count,
                 auto_join_space_rooms, auto_download_new_media, self_heal_enabled,
                 desired_power_state, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
             params![
                 settings.homeserver_url,
                 settings.username,
@@ -171,6 +172,7 @@ impl AppDatabase {
                 if settings.autostart_enabled { 1 } else { 0 },
                 if settings.minimize_to_tray { 1 } else { 0 },
                 if settings.start_hidden { 1 } else { 0 },
+                if settings.dark_mode_enabled { 1 } else { 0 },
                 settings.bandwidth_limit_kib_per_sec,
                 settings.preview_worker_count,
                 if settings.auto_join_space_rooms { 1 } else { 0 },
@@ -1359,6 +1361,7 @@ impl AppDatabase {
                 autostart_enabled INTEGER NOT NULL DEFAULT 0,
                 minimize_to_tray INTEGER NOT NULL DEFAULT 1,
                 start_hidden INTEGER NOT NULL DEFAULT 0,
+                dark_mode_enabled INTEGER NOT NULL DEFAULT 0,
                 bandwidth_limit_kib_per_sec INTEGER NOT NULL DEFAULT 0,
                 preview_worker_count INTEGER NOT NULL DEFAULT 1,
                 auto_join_space_rooms INTEGER NOT NULL DEFAULT 0,
@@ -1575,6 +1578,12 @@ impl AppDatabase {
             "flat_folder_layout",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        if !column_exists(&connection, "app_settings", "dark_mode_enabled")? {
+            connection.execute(
+                "ALTER TABLE app_settings ADD COLUMN dark_mode_enabled INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -1653,6 +1662,7 @@ impl AppDatabase {
             autostart_enabled: row.get::<_, i64>("autostart_enabled")? != 0,
             minimize_to_tray: row.get::<_, i64>("minimize_to_tray")? != 0,
             start_hidden: row.get::<_, i64>("start_hidden")? != 0,
+            dark_mode_enabled: row.get::<_, i64>("dark_mode_enabled")? != 0,
             bandwidth_limit_kib_per_sec: row.get("bandwidth_limit_kib_per_sec")?,
             preview_worker_count: row.get("preview_worker_count")?,
             auto_join_space_rooms: row.get::<_, i64>("auto_join_space_rooms")? != 0,
@@ -1812,6 +1822,18 @@ fn collect_rows<T>(
         collected.push(row?);
     }
     Ok(collected)
+}
+
+fn column_exists(connection: &Connection, table_name: &str, column_name: &str) -> Result<bool> {
+    let mut statement =
+        connection.prepare(&format!("PRAGMA table_info({table_name})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in rows {
+        if column? == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn parse_datetime_required(value: String) -> rusqlite::Result<DateTime<Utc>> {

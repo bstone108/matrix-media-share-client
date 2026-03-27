@@ -82,11 +82,13 @@ public slots:
 
 signals:
     void stateChanged();
+    void userNoticeRequested(const QString &title, const QString &message);
 
 private:
     void logInfo(const QString &subsystem, const QString &message);
     void logWarning(const QString &subsystem, const QString &message);
     void logError(const QString &subsystem, const QString &message);
+    QString startupValidationError(const AppSettings &settings, const QString &password) const;
     void scheduleRefresh();
     void updateRefreshTimer();
     void shutdownBackendForExit();

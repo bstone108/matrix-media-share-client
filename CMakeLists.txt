@@ -201,6 +201,16 @@ if(NOT MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT)
     endif()
 endif()
 
+if(APPLE
+    AND MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT
+    AND NOT EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}"
+    AND EXISTS "/Applications/VLC.app/Contents/MacOS")
+    set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT
+        "/Applications/VLC.app/Contents/MacOS"
+        CACHE PATH "Path to a VLC runtime root containing lib/ and plugins/ to bundle with the app" FORCE
+    )
+endif()
+
 set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_VERSION "v0.38.2" CACHE STRING
     "Pinned Kubo version to bundle when building from source"
 )

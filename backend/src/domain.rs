@@ -273,6 +273,7 @@ pub struct AppSettings {
     pub autostart_enabled: bool,
     pub minimize_to_tray: bool,
     pub start_hidden: bool,
+    pub dark_mode_enabled: bool,
     pub bandwidth_limit_kib_per_sec: i32,
     pub preview_worker_count: i32,
     pub auto_join_space_rooms: bool,

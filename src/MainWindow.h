@@ -58,6 +58,7 @@ private:
     void dropEvent(QDropEvent *event) override;
 
     void constrainToAvailableGeometry();
+    void scheduleWindowConstraint();
     void refreshView();
     void populateSectionNavigation();
     void populateRoomSidebar();
@@ -127,6 +128,7 @@ private:
     bool isUploadableBrowserRoom(const QString &roomId) const;
     bool currentSectionUsesRoomSidebar() const;
     void updateRoomSidebarVisibility();
+    void applyTheme(bool darkModeEnabled);
 
     AppController *controller_ = nullptr;
 
@@ -135,6 +137,7 @@ private:
     QLabel *roomSidebarTitleLabel_ = nullptr;
     QStackedWidget *stack_ = nullptr;
     QNetworkAccessManager *thumbnailNetworkManager_ = nullptr;
+    QTimer *windowConstraintTimer_ = nullptr;
 
     QListWidget *roomsList_ = nullptr;
     QLineEdit *joinRoomEdit_ = nullptr;
@@ -190,6 +193,7 @@ private:
     QCheckBox *autostartCheck_ = nullptr;
     QCheckBox *minimizeToTrayCheck_ = nullptr;
     QCheckBox *startHiddenCheck_ = nullptr;
+    QCheckBox *darkModeCheck_ = nullptr;
     QCheckBox *archiveScanEnabledCheck_ = nullptr;
     QCheckBox *archiveHighPriorityCheck_ = nullptr;
     QCheckBox *selfHealCheck_ = nullptr;

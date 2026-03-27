@@ -392,13 +392,12 @@ void AppController::recordError(const QString &subsystem, const QString &message
 
 void AppController::togglePower(const bool enabled)
 {
-    settings_.desiredPowerState = enabled;
-    if (!database_.saveSettings(settings_)) {
-        lastErrorMessage_ = QStringLiteral("Failed to save power state: %1").arg(database_.lastErrorText().trimmed());
-        logError(QStringLiteral("settings"), lastErrorMessage_);
-    }
-
     if (!enabled) {
+        settings_.desiredPowerState = false;
+        if (!database_.saveSettings(settings_)) {
+            lastErrorMessage_ = QStringLiteral("Failed to save power state: %1").arg(database_.lastErrorText().trimmed());
+            logError(QStringLiteral("settings"), lastErrorMessage_);
+        }
         QString errorMessage;
         if (backend_->stop(runtime_, errorMessage)) {
             logInfo(QStringLiteral("matrix"), QStringLiteral("Power off requested."));
@@ -411,6 +410,27 @@ void AppController::togglePower(const bool enabled)
         return;
     }
 
+    const QString validationError = startupValidationError(settings_, password_);
+    if (!validationError.isEmpty()) {
+        settings_.desiredPowerState = false;
+        if (!database_.saveSettings(settings_)) {
+            lastErrorMessage_ = QStringLiteral("Failed to save power state: %1").arg(database_.lastErrorText().trimmed());
+            logError(QStringLiteral("settings"), lastErrorMessage_);
+        }
+        lastErrorMessage_ = validationError;
+        logWarning(QStringLiteral("matrix"), validationError);
+        emit userNoticeRequested(QStringLiteral("Connection Details Needed"), validationError);
+        updateRefreshTimer();
+        refresh();
+        return;
+    }
+
+    settings_.desiredPowerState = true;
+    if (!database_.saveSettings(settings_)) {
+        lastErrorMessage_ = QStringLiteral("Failed to save power state: %1").arg(database_.lastErrorText().trimmed());
+        logError(QStringLiteral("settings"), lastErrorMessage_);
+    }
+
     QString errorMessage;
     BotRuntimeSnapshot runtime;
     runtime.connectionState = ConnectionState::Starting;
@@ -418,9 +438,19 @@ void AppController::togglePower(const bool enabled)
         runtime_ = runtime;
         logInfo(QStringLiteral("matrix"), QStringLiteral("Power on requested."));
     } else {
+        settings_.desiredPowerState = false;
+        if (!database_.saveSettings(settings_)) {
+            logError(
+                QStringLiteral("settings"),
+                QStringLiteral("Failed to save power state after startup failure: %1").arg(database_.lastErrorText().trimmed()));
+        }
         runtime_ = runtime;
         lastErrorMessage_ = errorMessage;
         logError(QStringLiteral("matrix"), errorMessage);
+        const QString noticeMessage = errorMessage.trimmed().isEmpty()
+            ? QStringLiteral("The client could not connect with the current account details.")
+            : QStringLiteral("The client could not connect with the current account details.\n\n%1").arg(errorMessage.trimmed());
+        emit userNoticeRequested(QStringLiteral("Connection Failed"), noticeMessage);
     }
 
     updateRefreshTimer();
@@ -453,6 +483,23 @@ bool AppController::saveSettings(const AppSettings &settings, const QString &pas
     updateRefreshTimer();
     refresh();
     return true;
+}
+
+QString AppController::startupValidationError(const AppSettings &settings, const QString &password) const
+{
+    if (settings.homeserverUrl.trimmed().isEmpty()) {
+        return QStringLiteral("Enter your homeserver in Settings before starting the client.");
+    }
+    if (settings.username.trimmed().isEmpty()) {
+        return QStringLiteral("Enter your Matrix username in Settings before starting the client.");
+    }
+
+    const StoredSession storedSession = secretStore_.loadSession();
+    if (password.trimmed().isEmpty() && storedSession.accessToken.trimmed().isEmpty()) {
+        return QStringLiteral("Enter your password in Settings before starting the client.");
+    }
+
+    return QString();
 }
 
 void AppController::resetHistoryScans()

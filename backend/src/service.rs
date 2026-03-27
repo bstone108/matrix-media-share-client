@@ -3540,6 +3540,7 @@ mod tests {
             autostart_enabled: false,
             minimize_to_tray: true,
             start_hidden: false,
+            dark_mode_enabled: false,
             bandwidth_limit_kib_per_sec: 0,
             preview_worker_count: 1,
             auto_join_space_rooms: false,

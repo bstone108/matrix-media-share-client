@@ -383,6 +383,7 @@ struct AppSettings {
     bool autostartEnabled = false;
     bool minimizeToTray = true;
     bool startHidden = false;
+    bool darkModeEnabled = false;
     int bandwidthLimitKiBPerSec = 0;
     int previewWorkerCount = 1;
     bool autoJoinSpaceRooms = false;

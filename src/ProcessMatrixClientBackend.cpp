@@ -185,6 +185,7 @@ QJsonObject settingsToJson(const AppSettings &settings)
         {QStringLiteral("autostartEnabled"), settings.autostartEnabled},
         {QStringLiteral("minimizeToTray"), settings.minimizeToTray},
         {QStringLiteral("startHidden"), settings.startHidden},
+        {QStringLiteral("darkModeEnabled"), settings.darkModeEnabled},
         {QStringLiteral("bandwidthLimitKibPerSec"), settings.bandwidthLimitKiBPerSec},
         {QStringLiteral("previewWorkerCount"), settings.previewWorkerCount},
         {QStringLiteral("autoJoinSpaceRooms"), settings.autoJoinSpaceRooms},
