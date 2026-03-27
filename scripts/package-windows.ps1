@@ -101,6 +101,9 @@ $cmakeConfigureArgs = @(
 if ($env:MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT -and (Test-Path $env:MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT)) {
     $cmakeConfigureArgs += "-DMATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT=$((Resolve-Path $env:MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT).Path)"
 }
+if ($env:MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_ROOT -and (Test-Path $env:MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_ROOT)) {
+    $cmakeConfigureArgs += "-DMATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_ROOT=$((Resolve-Path $env:MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_ROOT).Path)"
+}
 if ($qtPrefixEntries.Count -gt 0) {
     $cmakeConfigureArgs += "-DCMAKE_PREFIX_PATH=$($qtPrefixEntries -join ';')"
 }

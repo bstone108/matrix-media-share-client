@@ -634,6 +634,46 @@ impl AppDatabase {
         Ok(())
     }
 
+    pub async fn remove_discovery_for_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<String>> {
+        let connection = self.inner.lock().await;
+        let thumbnail_cached_path = connection
+            .query_row(
+                "SELECT thumbnail_cached_path
+                 FROM discovered_attachments
+                 WHERE room_id = ?1 AND event_id = ?2",
+                params![room_id, event_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .context("Failed to load discovery thumbnail before removal")?
+            .flatten();
+
+        connection.execute(
+            "DELETE FROM discovered_attachments
+             WHERE room_id = ?1 AND event_id = ?2",
+            params![room_id, event_id],
+        )?;
+
+        connection.execute(
+            "DELETE FROM download_jobs
+             WHERE room_id = ?1
+               AND event_id = ?2
+               AND state NOT IN (?3, ?4)",
+            params![
+                room_id,
+                event_id,
+                DownloadJobState::Completed.as_storage_key(),
+                DownloadJobState::DuplicateCompleted.as_storage_key(),
+            ],
+        )?;
+
+        Ok(thumbnail_cached_path)
+    }
+
     pub async fn fetch_room_discoveries_missing_thumbnails(
         &self,
         room_id: &str,
@@ -2128,6 +2168,79 @@ mod tests {
         );
         assert!(ordered_jobs[2].next_eligible_at.is_some());
         assert!(ordered_jobs[2].last_failure_at.is_some());
+
+        drop(database);
+        remove_database_files(&path).await;
+    }
+
+    #[tokio::test]
+    async fn removing_discovery_prunes_incomplete_job_but_keeps_completed_file_record() {
+        let path = temp_database_path();
+        let database = AppDatabase::open(&path).await.expect("open test database");
+
+        let mut queued = sample_discovery("$queued");
+        queued.thumbnail_cached_path = Some("/tmp/queued-thumb.jpg".to_owned());
+        database
+            .enqueue_discovery(&queued, true)
+            .await
+            .expect("enqueue queued discovery");
+
+        let completed = sample_discovery("$completed");
+        database
+            .enqueue_discovery(&completed, true)
+            .await
+            .expect("enqueue completed discovery");
+
+        let jobs = database
+            .fetch_jobs(10, Utc::now())
+            .await
+            .expect("fetch jobs");
+        let completed_job = jobs
+            .iter()
+            .find(|job| job.event_id == "$completed")
+            .expect("completed job exists");
+        database
+            .mark_job_completed(completed_job.id, "abc123", "Downloads/test.bin", 42)
+            .await
+            .expect("mark completed");
+
+        let removed_thumbnail = database
+            .remove_discovery_for_event(&queued.room_id, &queued.event_id)
+            .await
+            .expect("remove queued discovery");
+
+        assert_eq!(removed_thumbnail.as_deref(), Some("/tmp/queued-thumb.jpg"));
+        assert!(
+            database
+                .discovery_record(&queued.room_id, &queued.event_id)
+                .await
+                .expect("load removed discovery")
+                .is_none()
+        );
+
+        let remaining_jobs = database
+            .fetch_jobs(10, Utc::now())
+            .await
+            .expect("fetch remaining jobs");
+        assert!(
+            remaining_jobs.iter().all(|job| job.event_id != "$queued"),
+            "queued job should be removed with its discovery"
+        );
+        let connection = database.inner.lock().await;
+        let completed_state: Option<String> = connection
+            .query_row(
+                "SELECT state FROM download_jobs WHERE room_id = ?1 AND event_id = ?2",
+                params![completed.room_id, completed.event_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("query completed job state");
+        drop(connection);
+        assert_eq!(
+            completed_state.as_deref(),
+            Some(DownloadJobState::Completed.as_storage_key()),
+            "completed download record should be preserved"
+        );
 
         drop(database);
         remove_database_files(&path).await;

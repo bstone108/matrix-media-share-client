@@ -24,6 +24,9 @@ set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_SOURCE "" CACHE FILEPATH
 set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT "" CACHE PATH
     "Path to a VLC runtime root containing lib/ and plugins/ to bundle with the app"
 )
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_ROOT "" CACHE PATH
+    "Path to an FFmpeg runtime root containing ffmpeg and ffprobe binaries to bundle with the app"
+)
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
@@ -263,9 +266,11 @@ if(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_LOWER STREQUAL "x86_64"
     OR MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_LOWER STREQUAL "amd64"
     OR MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_LOWER STREQUAL "x64")
     set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_GOARCH amd64)
+    set(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_NORMALIZED amd64)
 elseif(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_LOWER STREQUAL "arm64"
     OR MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_LOWER STREQUAL "aarch64")
     set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_GOARCH arm64)
+    set(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_NORMALIZED arm64)
 else()
     message(FATAL_ERROR
         "Unsupported architecture for bundled Kubo acquisition: ${MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH}"
@@ -292,6 +297,92 @@ add_custom_command(
 
 add_custom_target(MatrixMediaShareClientQtBundledKubo ALL
     DEPENDS ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_STAMP}
+)
+
+if(WIN32)
+    set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_NAME ffmpeg.exe)
+    set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_NAME ffprobe.exe)
+else()
+    set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_NAME ffmpeg)
+    set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_NAME ffprobe)
+endif()
+
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_DIR
+    ${CMAKE_CURRENT_BINARY_DIR}/bundled-ffmpeg
+)
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_BINARY
+    ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_DIR}/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_NAME}
+)
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_BINARY
+    ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_DIR}/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_NAME}
+)
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_STAMP
+    ${CMAKE_CURRENT_BINARY_DIR}/matrix_media_share_client_bundled_ffmpeg.stamp
+)
+
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_ARCHIVE_URL "")
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_BINARY_URL "")
+set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_BINARY_URL "")
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    if(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_NORMALIZED STREQUAL "amd64")
+        set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_BINARY_URL
+            "https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release/ffmpeg.zip"
+        )
+        set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_BINARY_URL
+            "https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release/ffprobe.zip"
+        )
+    elseif(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_NORMALIZED STREQUAL "arm64")
+        set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_BINARY_URL
+            "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip"
+        )
+        set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_BINARY_URL
+            "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffprobe.zip"
+        )
+    endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_NORMALIZED STREQUAL "amd64")
+        set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_ARCHIVE_URL
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+        )
+    elseif(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_NORMALIZED STREQUAL "arm64")
+        set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_ARCHIVE_URL
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
+        )
+    endif()
+elseif(WIN32)
+    if(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_NORMALIZED STREQUAL "amd64")
+        set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_ARCHIVE_URL
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+        )
+    elseif(MATRIX_MEDIA_SHARE_CLIENT_TARGET_ARCH_NORMALIZED STREQUAL "arm64")
+        set(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_ARCHIVE_URL
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-winarm64-gpl.zip"
+        )
+    endif()
+endif()
+
+add_custom_command(
+    OUTPUT ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_STAMP}
+    COMMAND ${CMAKE_COMMAND}
+        "-DFFMPEG_SOURCE_ROOT=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_ROOT}"
+        "-DFFMPEG_ARCHIVE_URL=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_ARCHIVE_URL}"
+        "-DFFMPEG_BINARY_URL=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_BINARY_URL}"
+        "-DFFPROBE_BINARY_URL=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_BINARY_URL}"
+        "-DFFMPEG_OUTPUT_DIR=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_DIR}"
+        "-DFFMPEG_OUTPUT_BINARY=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_BINARY}"
+        "-DFFPROBE_OUTPUT_BINARY=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_BINARY}"
+        "-DFFMPEG_OUTPUT_NAME=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_NAME}"
+        "-DFFPROBE_OUTPUT_NAME=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_NAME}"
+        "-DFFMPEG_STAMP=${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_STAMP}"
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/AcquireBundledFfmpeg.cmake
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/AcquireBundledFfmpeg.cmake
+    COMMENT "Bundling FFmpeg tools into Matrix Media Share Client"
+    VERBATIM
+)
+
+add_custom_target(MatrixMediaShareClientQtBundledFfmpeg ALL
+    DEPENDS ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_STAMP}
 )
 set(MATRIX_MEDIA_ARCHIVER_BACKEND_STAMP
     ${CMAKE_CURRENT_BINARY_DIR}/matrix_media_archiver_backend.stamp
@@ -376,6 +467,7 @@ qt_add_executable(MatrixMediaShareClientQt
 target_include_directories(MatrixMediaShareClientQt PRIVATE src)
 add_dependencies(MatrixMediaShareClientQt MatrixMediaShareClientQtBackend)
 add_dependencies(MatrixMediaShareClientQt MatrixMediaShareClientQtBundledKubo)
+add_dependencies(MatrixMediaShareClientQt MatrixMediaShareClientQtBundledFfmpeg)
 
 target_link_libraries(MatrixMediaShareClientQt
     PRIVATE
@@ -418,6 +510,17 @@ if(APPLE)
             $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/kubo/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_NAME}
         COMMENT "Copying bundled Kubo into MatrixMediaShareClientQt.app"
     )
+    add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/ffmpeg
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_BINARY}
+            $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/ffmpeg/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_NAME}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_BINARY}
+            $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/ffmpeg/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_NAME}
+        COMMENT "Copying bundled FFmpeg tools into MatrixMediaShareClientQt.app"
+    )
     if(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT
         AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/lib"
         AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/plugins")
@@ -447,6 +550,17 @@ else()
             ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_BINARY}
             $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/kubo/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_NAME}
         COMMENT "Copying bundled Kubo next to MatrixMediaShareClientQt"
+    )
+    add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/ffmpeg
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_BINARY}
+            $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/ffmpeg/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_NAME}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_BINARY}
+            $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/ffmpeg/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_NAME}
+        COMMENT "Copying bundled FFmpeg tools next to MatrixMediaShareClientQt"
     )
     if(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT
         AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/lib"
@@ -478,6 +592,11 @@ if(NOT APPLE)
     )
     install(PROGRAMS ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_BINARY}
         DESTINATION ${CMAKE_INSTALL_BINDIR}/kubo
+    )
+    install(PROGRAMS
+        ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFMPEG_BINARY}
+        ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_BINARY}
+        DESTINATION ${CMAKE_INSTALL_BINDIR}/ffmpeg
     )
     if(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT
         AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/lib"

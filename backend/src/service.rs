@@ -13,19 +13,23 @@ use eyeball_im::{Vector, VectorDiff};
 use filetime::{FileTime, set_file_mtime};
 use futures_util::StreamExt;
 use matrix_sdk::{
-    attachment::AttachmentConfig,
+    attachment::{AttachmentConfig, AttachmentInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo, Thumbnail},
     Client, Room,
     encryption::{
         VerificationState,
         verification::{SasVerification, VerificationRequest, VerificationRequestState},
     },
-    media::{MediaFormat, MediaRequestParameters},
+    media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
     ruma::{
         OwnedMxcUri, OwnedServerName, RoomAliasId, RoomOrAliasId, ServerName, UserId,
-        api::client::uiaa,
+        UInt, api::client::uiaa,
         events::room::{
             MediaSource,
-            message::{MessageType, RoomMessageEventContent, TextMessageEventContent},
+            ThumbnailInfo,
+            message::{
+                MessageType, RoomMessageEventContent, TextMessageEventContent, VideoInfo,
+                VideoMessageEventContent,
+            },
         },
     },
 };
@@ -35,14 +39,14 @@ use matrix_sdk_ui::{
 };
 use mime::Mime;
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self as tokio_fs, File as TokioFile},
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{Mutex, RwLock, Semaphore, mpsc},
     task::JoinHandle,
-    time::{sleep, timeout},
+    time::{Instant, sleep, timeout},
 };
 use uuid::Uuid;
 
@@ -115,6 +119,7 @@ struct RunningContext {
     ipfs: Arc<IpfsService>,
     downloads: Arc<DownloadManager>,
     share_slots: Arc<Semaphore>,
+    matrix_send_ready_at: Arc<Mutex<Instant>>,
     room_workers: Arc<Mutex<HashMap<String, RoomWorkerState>>>,
     focused_room_id: Arc<RwLock<Option<String>>>,
     handled_event_ids: Arc<Mutex<HashSet<String>>>,
@@ -465,6 +470,7 @@ impl BackendService {
             ipfs: ipfs.clone(),
             downloads: downloads.clone(),
             share_slots: share_slots.clone(),
+            matrix_send_ready_at: Arc::new(Mutex::new(Instant::now())),
             room_workers: Arc::new(Mutex::new(HashMap::new())),
             focused_room_id: Arc::new(RwLock::new(None)),
             handled_event_ids: Arc::new(Mutex::new(HashSet::new())),
@@ -928,37 +934,9 @@ async fn persist_current_session(secret_store: &SecretStore, _homeserver_url: &s
 }
 
 async fn detect_upload_limit(client: &Client) -> Option<i64> {
-    let session = client.session()?;
-    let access_token = match session {
-        matrix_sdk::AuthSession::Matrix(session) => session.tokens.access_token,
-        matrix_sdk::AuthSession::OAuth(session) => session.user.tokens.access_token,
-        _ => return None,
-    };
-
-    let http_client = reqwest::Client::builder().build().ok()?;
-    let homeserver = client.homeserver().to_string();
-    let homeserver = homeserver.trim_end_matches('/').to_owned();
-    let candidates = [
-        format!("{homeserver}/_matrix/media/v3/config"),
-        format!("{homeserver}/_matrix/client/v1/media/config"),
-    ];
-
-    for url in candidates {
-        let Ok(response) = http_client.get(&url).bearer_auth(&access_token).send().await else {
-            continue;
-        };
-        if !response.status().is_success() {
-            continue;
-        }
-        let Ok(payload) = response.json::<serde_json::Value>().await else {
-            continue;
-        };
-        if let Some(limit) = payload.get("m.upload.size").and_then(|value| value.as_i64()) {
-            return Some(limit);
-        }
-    }
-
-    None
+    let upload_size = client.load_or_fetch_max_upload_size().await.ok()?;
+    let upload_size: u64 = upload_size.into();
+    Some(upload_size.min(i64::MAX as u64) as i64)
 }
 
 fn stored_session_matches_settings_login(
@@ -1021,6 +999,103 @@ struct PreparedMatrixPreview {
     path: PathBuf,
     content_type: Mime,
     display_name: String,
+}
+
+#[derive(Clone)]
+enum PreparedAttachmentInfo {
+    Image {
+        width: Option<UInt>,
+        height: Option<UInt>,
+        size: Option<UInt>,
+    },
+    Video {
+        width: Option<UInt>,
+        height: Option<UInt>,
+        size: Option<UInt>,
+        duration: Option<Duration>,
+    },
+    File {
+        size: Option<UInt>,
+    },
+}
+
+impl PreparedAttachmentInfo {
+    fn into_matrix_attachment_info(self) -> AttachmentInfo {
+        match self {
+            PreparedAttachmentInfo::Image { width, height, size } => {
+                AttachmentInfo::Image(BaseImageInfo {
+                    height,
+                    width,
+                    size,
+                    blurhash: None,
+                    is_animated: None,
+                })
+            }
+            PreparedAttachmentInfo::Video {
+                width,
+                height,
+                size,
+                duration,
+            } => AttachmentInfo::Video(BaseVideoInfo {
+                duration,
+                height,
+                width,
+                size,
+                blurhash: None,
+            }),
+            PreparedAttachmentInfo::File { size } => {
+                AttachmentInfo::File(BaseFileInfo { size })
+            }
+        }
+    }
+
+    fn category(&self) -> MediaCategory {
+        match self {
+            PreparedAttachmentInfo::Image { .. } => MediaCategory::Images,
+            PreparedAttachmentInfo::Video { .. } => MediaCategory::Videos,
+            PreparedAttachmentInfo::File { .. } => MediaCategory::Other,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PreparedMatrixThumbnail {
+    data: Vec<u8>,
+    width: UInt,
+    height: UInt,
+    size: UInt,
+}
+
+impl PreparedMatrixThumbnail {
+    fn into_attachment_thumbnail(self) -> Thumbnail {
+        Thumbnail {
+            data: self.data,
+            content_type: mime::IMAGE_JPEG,
+            height: self.height,
+            width: self.width,
+            size: self.size,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct FfprobeOutput {
+    #[serde(default)]
+    streams: Vec<FfprobeStream>,
+    format: Option<FfprobeFormat>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeStream {
+    codec_type: Option<String>,
+    width: Option<u64>,
+    height: Option<u64>,
+    duration: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeFormat {
+    duration: Option<String>,
 }
 
 async fn queue_share_requests(
@@ -1095,12 +1170,12 @@ async fn queue_share_requests(
                         .iter_mut()
                         .find(|upload| upload.queue_id == queue_id)
                     {
-                        upload.state = "uploading".to_owned();
+                        upload.state = "preparing".to_owned();
                     }
                 })
                 .await;
 
-            if let Err(error) = share_local_file(&context, &room_id, Path::new(&file_path)).await {
+            if let Err(error) = share_local_file(&context, &room_id, Path::new(&file_path), Some(&queue_id)).await {
                 let _ = context
                     .database
                     .insert_log(
@@ -1117,7 +1192,6 @@ async fn queue_share_requests(
                     runtime.pending_uploads.retain(|upload| upload.queue_id != queue_id);
                 })
                 .await;
-            sleep(SHARE_QUEUE_DELAY).await;
         });
     }
 
@@ -1134,6 +1208,40 @@ async fn queue_share_requests(
         )
         .await?;
     Ok(())
+}
+
+async fn update_pending_upload_state(
+    context: &Arc<RunningContext>,
+    queue_id: &str,
+    state: &str,
+) {
+    context
+        .runtime
+        .mutate(|runtime| {
+            if let Some(upload) = runtime
+                .pending_uploads
+                .iter_mut()
+                .find(|upload| upload.queue_id == queue_id)
+            {
+                upload.state = state.to_owned();
+            }
+        })
+        .await;
+}
+
+async fn wait_for_matrix_send_window(context: &Arc<RunningContext>) -> Duration {
+    let ready_at = *context.matrix_send_ready_at.lock().await;
+    let now = Instant::now();
+    let wait_duration = ready_at.saturating_duration_since(now);
+    if !wait_duration.is_zero() {
+        sleep(wait_duration).await;
+    }
+    wait_duration
+}
+
+async fn note_matrix_send_attempt(context: &Arc<RunningContext>) {
+    let mut ready_at = context.matrix_send_ready_at.lock().await;
+    *ready_at = Instant::now() + SHARE_QUEUE_DELAY;
 }
 
 async fn archive_scan_loop(context: Arc<RunningContext>) {
@@ -2135,10 +2243,10 @@ fn preview_upload_limit(upload_limit: Option<i64>) -> i64 {
 
 fn preview_comment_for_category(category: MediaCategory) -> &'static str {
     match category {
-        MediaCategory::Images => "low-quality image preview",
-        MediaCategory::Videos => "low-quality video preview (up to 2 minutes)",
-        MediaCategory::Audio => "audio preview",
-        _ => "low-quality preview",
+        MediaCategory::Images => "Low-quality preview attached. Full image linked below.",
+        MediaCategory::Videos => "Up to a 2 minute preview attached. Full video linked below.",
+        MediaCategory::Audio => "Audio preview attached. Full audio linked below.",
+        _ => "Preview attached. Full file linked below.",
     }
 }
 
@@ -2281,7 +2389,7 @@ async fn generate_matrix_video_preview_to_path(
                 .args(["-t", "120"])
                 .args([
                     "-vf",
-                    &format!("scale='min({width},iw)':-2:flags=lanczos"),
+                    &format!("scale='min({width},iw)':-2:flags=lanczos,setsar=1"),
                     "-c:v",
                     "libx264",
                     "-preset",
@@ -2294,6 +2402,10 @@ async fn generate_matrix_video_preview_to_path(
                     "yuv420p",
                     "-movflags",
                     "+faststart",
+                    "-map_metadata",
+                    "-1",
+                    "-metadata:s:v:0",
+                    "rotate=0",
                     "-b:v",
                     &format!("{video_kbps}k"),
                     "-maxrate",
@@ -2483,7 +2595,54 @@ async fn share_local_file(
     context: &Arc<RunningContext>,
     room_id: &str,
     file_path: &Path,
+    queue_id: Option<&str>,
 ) -> Result<()> {
+    let original_file_size = tokio_fs::metadata(file_path)
+        .await
+        .with_context(|| format!("Failed to inspect {}", file_path.display()))?
+        .len() as i64;
+    let original_file_name = file_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| file_path.display().to_string());
+    let mut upload_limit = context.runtime.snapshot().await.upload_size_limit_bytes;
+    if upload_limit.is_none() {
+        upload_limit = detect_upload_limit(&context.client).await;
+        if let Some(limit) = upload_limit {
+            context
+                .runtime
+                .mutate(|runtime| {
+                    runtime.upload_size_limit_bytes = Some(limit);
+                    runtime.upload_size_limit_detected_at = Some(Utc::now());
+                })
+                .await;
+        }
+    }
+    let limit_decision = match upload_limit {
+        Some(limit) if original_file_size > limit => {
+            if let Some(queue_id) = queue_id {
+                update_pending_upload_state(context, queue_id, "previewing").await;
+            }
+            format!(
+                "Matrix upload limit is {} bytes; {} is {} bytes, so the client will skip the full Matrix upload and generate a preview first.",
+                limit, original_file_name, original_file_size
+            )
+        }
+        Some(limit) => format!(
+            "Matrix upload limit is {} bytes; {} is {} bytes, so the client will try the full Matrix upload first.",
+            limit, original_file_name, original_file_size
+        ),
+        None => format!(
+            "Matrix upload limit is unknown for {}; {} is {} bytes, so the client will try one full Matrix upload before falling back.",
+            room_id, original_file_name, original_file_size
+        ),
+    };
+    context
+        .database
+        .insert_log(AppLogLevel::Info, "share", &limit_decision)
+        .await?;
+
     let room = context
         .client
         .joined_rooms()
@@ -2491,9 +2650,44 @@ async fn share_local_file(
         .find(|room| room.room_id().as_str() == room_id)
         .ok_or_else(|| anyhow!("Room not found: {room_id}"))?;
     let prepared = share_source_from_archive_or_library(context, &room, file_path).await?;
+    let settings = context.settings.read().await.clone();
+    let should_try_full_upload = upload_limit.is_none_or(|limit| prepared.file_size <= limit);
+    let mut should_try_matrix_preview = !should_try_full_upload;
+    let mut prepared_preview: Option<PreparedMatrixPreview> = None;
+
+    if should_try_matrix_preview {
+        if let Some(queue_id) = queue_id {
+            update_pending_upload_state(context, queue_id, "previewing").await;
+        }
+        let preview_limit = preview_upload_limit(upload_limit);
+        match prepare_matrix_share_preview(&prepared, preview_limit).await {
+            Ok(preview) => {
+                prepared_preview = preview;
+            }
+            Err(error) => {
+                context
+                    .database
+                    .insert_log(
+                        AppLogLevel::Warning,
+                        "share",
+                        &format!(
+                            "Matrix preview generation failed for {}, falling back to thumbnail/text share: {error:#}",
+                            prepared.file_name
+                        ),
+                    )
+                    .await?;
+            }
+        }
+        if let Some(queue_id) = queue_id {
+            update_pending_upload_state(context, queue_id, "uploading").await;
+        }
+    }
+
+    if let Some(queue_id) = queue_id {
+        update_pending_upload_state(context, queue_id, "publishing").await;
+    }
     let thumbnail_path = prepare_managed_share_thumbnail(&prepared).await.ok();
     let landing_page_path = managed_share_landing_page_path(&prepared.bundle_path);
-    let settings = context.settings.read().await.clone();
     let preferred_gateway = if settings.primary_gateway_url.trim().is_empty() {
         BOOTSTRAP_PRIMARY_GATEWAY
     } else {
@@ -2516,25 +2710,58 @@ async fn share_local_file(
         published.landing_page_url, published.file_cid,
     );
     let attachment_comment = Some(TextMessageEventContent::plain(comment_message.clone()));
-
-    let upload_limit = context.runtime.snapshot().await.upload_size_limit_bytes;
-    let should_try_full_upload = upload_limit.is_none_or(|limit| prepared.file_size <= limit);
-    let mut should_try_matrix_preview = !should_try_full_upload;
+    let matrix_thumbnail = if let Some(path) = thumbnail_path.as_deref() {
+        matrix_thumbnail_from_path(path).await.ok().flatten()
+    } else {
+        None
+    };
+    let full_attachment_info =
+        attachment_info_for_path(&prepared.source_path, &prepared.content_type)
+            .await
+            .ok()
+            .flatten();
 
     if should_try_full_upload {
+        if let Some(queue_id) = queue_id {
+            update_pending_upload_state(context, queue_id, "uploading").await;
+        }
         let file_bytes = tokio_fs::read(&prepared.source_path)
             .await
             .with_context(|| format!("Failed to read {}", prepared.source_path.display()))?;
+        let wait_duration = wait_for_matrix_send_window(context).await;
+        if !wait_duration.is_zero() {
+            context
+                .database
+                .insert_log(
+                    AppLogLevel::Info,
+                    "share",
+                    &format!(
+                        "Waiting {}s before the next Matrix upload for {}.",
+                        wait_duration.as_secs(),
+                        prepared.file_name
+                    ),
+                )
+                .await?;
+        }
         match room
             .send_attachment(
                 prepared.file_name.clone(),
                 &prepared.content_type,
                 file_bytes,
-                AttachmentConfig::new().caption(attachment_comment.clone()),
+                {
+                    let mut config = AttachmentConfig::new()
+                        .caption(attachment_comment.clone())
+                        .thumbnail(matrix_thumbnail.clone().map(|thumbnail| thumbnail.into_attachment_thumbnail()));
+                    if let Some(info) = full_attachment_info.clone() {
+                        config = config.info(info.into_matrix_attachment_info());
+                    }
+                    config
+                },
             )
             .await
         {
             Ok(_) => {
+                note_matrix_send_attempt(context).await;
                 context
                     .database
                     .insert_log(
@@ -2546,6 +2773,7 @@ async fn share_local_file(
                 return Ok(());
             }
             Err(error) => {
+                note_matrix_send_attempt(context).await;
                 let error_text = format!("{error:#}");
                 should_try_matrix_preview = looks_like_matrix_too_large_error(&error_text);
                 context
@@ -2563,46 +2791,210 @@ async fn share_local_file(
         }
     }
 
-    let preview_comment_message = format!(
-        "Preview attached: {}\n{}",
-        preview_comment_for_category(prepared.category),
-        comment_message
-    );
+    let preview_caption_category = prepared_preview
+        .as_ref()
+        .map(|preview| match preview.content_type.type_() {
+            mime::VIDEO => MediaCategory::Videos,
+            mime::IMAGE => MediaCategory::Images,
+            mime::AUDIO => MediaCategory::Audio,
+            _ => prepared.category,
+        })
+        .unwrap_or(prepared.category);
+    let preview_comment_message = if should_try_matrix_preview {
+        match preview_caption_category {
+            MediaCategory::Videos | MediaCategory::Audio => format!(
+                "{}\n{}",
+                preview_comment_for_category(preview_caption_category),
+                comment_message
+            ),
+            _ => comment_message.clone(),
+        }
+    } else {
+        comment_message.clone()
+    };
     let preview_attachment_comment = Some(TextMessageEventContent::plain(preview_comment_message.clone()));
+    context
+        .database
+        .insert_log(
+            AppLogLevel::Info,
+            "share",
+            &format!(
+                "Preview send decision for {}: category={:?}, should_try_matrix_preview={}, preview_caption_category={:?}, preview_comment_message={}",
+                prepared.file_name,
+                prepared.category,
+                should_try_matrix_preview,
+                preview_caption_category,
+                preview_comment_message.replace('\n', "\\n")
+            ),
+        )
+        .await?;
+
+    if should_try_matrix_preview && prepared_preview.is_none() {
+        if let Some(queue_id) = queue_id {
+            update_pending_upload_state(context, queue_id, "previewing").await;
+        }
+        let preview_limit = preview_upload_limit(upload_limit);
+        match prepare_matrix_share_preview(&prepared, preview_limit).await {
+            Ok(preview) => {
+                prepared_preview = preview;
+            }
+            Err(error) => {
+                context
+                    .database
+                    .insert_log(
+                        AppLogLevel::Warning,
+                        "share",
+                        &format!(
+                            "Matrix preview generation failed for {}, falling back to thumbnail/text share: {error:#}",
+                            prepared.file_name
+                        ),
+                    )
+                    .await?;
+            }
+        }
+        if let Some(queue_id) = queue_id {
+            update_pending_upload_state(context, queue_id, "uploading").await;
+        }
+    }
 
     if should_try_matrix_preview {
-        let preview_limit = preview_upload_limit(upload_limit);
-        if let Some(preview) = prepare_matrix_share_preview(&prepared, preview_limit).await? {
-            if let Ok(preview_bytes) = tokio_fs::read(&preview.path).await {
-                if room
-                    .send_attachment(
-                        preview.display_name.clone(),
-                        &preview.content_type,
-                        preview_bytes,
-                        AttachmentConfig::new().caption(preview_attachment_comment.clone()),
-                    )
-                    .await
-                    .is_ok()
-                {
-                    context
-                        .database
-                        .insert_log(
-                            AppLogLevel::Info,
-                            "share",
-                            &format!(
-                                "Shared {} to {room_id} via Matrix preview and IPFS landing page {}.",
-                                prepared.file_name, published.landing_page_url
-                            ),
+        match prepared_preview {
+            Some(preview) => {
+                if let Ok(preview_bytes) = tokio_fs::read(&preview.path).await {
+                    if let Some(queue_id) = queue_id {
+                        update_pending_upload_state(context, queue_id, "uploading").await;
+                    }
+                    let wait_duration = wait_for_matrix_send_window(context).await;
+                    if !wait_duration.is_zero() {
+                        context
+                            .database
+                            .insert_log(
+                                AppLogLevel::Info,
+                                "share",
+                                &format!(
+                                    "Waiting {}s before the next Matrix upload for {}.",
+                                    wait_duration.as_secs(),
+                                    prepared.file_name
+                                ),
+                            )
+                            .await?;
+                    }
+                    let preview_result = if preview.content_type.type_() == mime::VIDEO {
+                        context
+                            .database
+                            .insert_log(
+                                AppLogLevel::Info,
+                                "share",
+                                &format!(
+                                    "Using explicit video preview sender for {} ({})",
+                                    prepared.file_name, preview.display_name
+                                ),
+                            )
+                            .await?;
+                        upload_matrix_video_preview_event(
+                            context,
+                            &room,
+                            &preview,
+                            preview_bytes,
+                            &preview_comment_message,
+                            matrix_thumbnail.clone(),
                         )
-                        .await?;
-                    return Ok(());
+                        .await
+                    } else {
+                        let preview_attachment_info =
+                            attachment_info_for_path(&preview.path, &preview.content_type)
+                                .await
+                                .ok()
+                                .flatten();
+                        room
+                            .send_attachment(
+                                preview.display_name.clone(),
+                                &preview.content_type,
+                                preview_bytes,
+                                {
+                                    let mut config = AttachmentConfig::new()
+                                        .caption(preview_attachment_comment.clone())
+                                        .thumbnail(matrix_thumbnail.clone().map(|thumbnail| thumbnail.into_attachment_thumbnail()));
+                                    if let Some(info) = preview_attachment_info {
+                                        config = config.info(info.into_matrix_attachment_info());
+                                    }
+                                    config
+                                },
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(Into::into)
+                    };
+                    if preview_result.is_ok() {
+                        note_matrix_send_attempt(context).await;
+                        context
+                            .database
+                            .insert_log(
+                                AppLogLevel::Info,
+                                "share",
+                                &format!(
+                                    "Shared {} to {room_id} via Matrix preview and IPFS landing page {}.",
+                                    prepared.file_name, published.landing_page_url
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                    note_matrix_send_attempt(context).await;
+                    if let Err(error) = preview_result {
+                        context
+                            .database
+                            .insert_log(
+                                AppLogLevel::Warning,
+                                "share",
+                                &format!(
+                                    "Matrix preview upload failed for {}: {error:#}",
+                                    prepared.file_name
+                                ),
+                            )
+                            .await?;
+                    }
                 }
+            }
+            None => {
+                if let Some(queue_id) = queue_id {
+                    update_pending_upload_state(context, queue_id, "uploading").await;
+                }
+                context
+                    .database
+                    .insert_log(
+                        AppLogLevel::Warning,
+                        "share",
+                        &format!(
+                            "Could not generate a Matrix preview for {}, falling back to thumbnail/text share.",
+                            prepared.file_name
+                        ),
+                    )
+                    .await?;
             }
         }
     }
 
     if let Some(thumbnail_path) = thumbnail_path.as_deref() {
         if let Ok(thumbnail_bytes) = tokio_fs::read(thumbnail_path).await {
+            if let Some(queue_id) = queue_id {
+                update_pending_upload_state(context, queue_id, "uploading").await;
+            }
+            let wait_duration = wait_for_matrix_send_window(context).await;
+            if !wait_duration.is_zero() {
+                context
+                    .database
+                    .insert_log(
+                        AppLogLevel::Info,
+                        "share",
+                        &format!(
+                            "Waiting {}s before the next Matrix upload for {}.",
+                            wait_duration.as_secs(),
+                            prepared.file_name
+                        ),
+                    )
+                    .await?;
+            }
             if room
                 .send_attachment(
                     format!("{}.preview.jpg", prepared.file_name),
@@ -2613,6 +3005,7 @@ async fn share_local_file(
                 .await
                 .is_ok()
             {
+                note_matrix_send_attempt(context).await;
                 context
                     .database
                     .insert_log(
@@ -2626,6 +3019,7 @@ async fn share_local_file(
                     .await?;
                 return Ok(());
             }
+            note_matrix_send_attempt(context).await;
         }
     }
 
@@ -2955,7 +3349,10 @@ fn preferred_message_discovery(
                 ipfs.category = matrix.category;
             }
             if ipfs.thumbnail_source_url.is_none() {
-                ipfs.thumbnail_source_url = matrix.thumbnail_source_url;
+                ipfs.thumbnail_source_url = matrix.thumbnail_source_url.or_else(|| {
+                    matches!(matrix.category, MediaCategory::Images | MediaCategory::Videos)
+                        .then(|| matrix.mxc_url.clone())
+                });
             }
             if ipfs.thumbnail_cached_path.is_none() {
                 ipfs.thumbnail_cached_path = matrix.thumbnail_cached_path;
@@ -3134,22 +3531,272 @@ async fn generate_preview_thumbnail_to_path(file_path: &Path, destination: &Path
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp" | "bmp" | "gif") {
-        return Err(anyhow!("Preview thumbnails are currently supported for image files only."));
+    if matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp" | "bmp" | "gif") {
+        let bytes = tokio_fs::read(file_path)
+            .await
+            .with_context(|| format!("Failed to read {}", file_path.display()))?;
+        let image = load_oriented_image_from_bytes(&bytes).context("Failed to decode the image")?;
+        let thumbnail = image.thumbnail(480, 480);
+        if let Some(parent) = destination.parent() {
+            tokio_fs::create_dir_all(parent).await?;
+        }
+        thumbnail
+            .save_with_format(destination, image::ImageFormat::Jpeg)
+            .with_context(|| format!("Failed to write {}", destination.display()))?;
+        return Ok(());
     }
 
-    let bytes = tokio_fs::read(file_path)
-        .await
-        .with_context(|| format!("Failed to read {}", file_path.display()))?;
-    let image = load_oriented_image_from_bytes(&bytes).context("Failed to decode the image")?;
-    let thumbnail = image.thumbnail(480, 480);
-    if let Some(parent) = destination.parent() {
-        tokio_fs::create_dir_all(parent).await?;
+    if matches!(extension.as_str(), "mp4" | "m4v" | "mov" | "webm" | "mkv" | "avi" | "wmv") {
+        let Some(ffmpeg) = which("ffmpeg").await? else {
+            return Err(anyhow!("Could not find ffmpeg to generate a video thumbnail."));
+        };
+        if let Some(parent) = destination.parent() {
+            tokio_fs::create_dir_all(parent).await?;
+        }
+
+        let seek_targets = ["1", "0"];
+        for seek in seek_targets {
+            let _ = tokio_fs::remove_file(destination).await;
+            let status = tokio::process::Command::new(&ffmpeg)
+                .arg("-y")
+                .args(["-v", "error"])
+                .args(["-ss", seek])
+                .arg("-i")
+                .arg(file_path)
+                .args([
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale='min(480,iw)':-2:flags=lanczos,setsar=1",
+                    "-q:v",
+                    "4",
+                ])
+                .arg(destination)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .with_context(|| format!("Failed to run ffmpeg for {}", file_path.display()))?;
+            if !status.success() {
+                continue;
+            }
+            if tokio_fs::metadata(destination).await.is_ok() {
+                return Ok(());
+            }
+        }
+
+        return Err(anyhow!(
+            "Could not generate a video thumbnail for {}.",
+            file_path.display()
+        ));
     }
-    thumbnail
-        .save_with_format(destination, image::ImageFormat::Jpeg)
-        .with_context(|| format!("Failed to write {}", destination.display()))?;
+
+    Err(anyhow!("Preview thumbnails are currently supported for image and video files only."))
+}
+
+async fn matrix_thumbnail_from_path(path: &Path) -> Result<Option<PreparedMatrixThumbnail>> {
+    let bytes = tokio_fs::read(path)
+        .await
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+
+    let (width, height) = image::image_dimensions(path)
+        .with_context(|| format!("Failed to read image dimensions from {}", path.display()))?;
+    let size = UInt::new(bytes.len() as u64)
+        .ok_or_else(|| anyhow!("Thumbnail size exceeded Matrix integer limits."))?;
+    let width = UInt::new(width as u64)
+        .ok_or_else(|| anyhow!("Thumbnail width exceeded Matrix integer limits."))?;
+    let height = UInt::new(height as u64)
+        .ok_or_else(|| anyhow!("Thumbnail height exceeded Matrix integer limits."))?;
+
+    Ok(Some(PreparedMatrixThumbnail {
+        data: bytes,
+        height,
+        width,
+        size,
+    }))
+}
+
+async fn attachment_info_for_path(
+    path: &Path,
+    content_type: &Mime,
+) -> Result<Option<PreparedAttachmentInfo>> {
+    let metadata = tokio_fs::metadata(path)
+        .await
+        .with_context(|| format!("Failed to inspect {}", path.display()))?;
+    let size = UInt::new(metadata.len())
+        .ok_or_else(|| anyhow!("Attachment size exceeded Matrix integer limits."))?;
+
+    match content_type.type_() {
+        mime::IMAGE => {
+            let (width, height) = image::image_dimensions(path)
+                .with_context(|| format!("Failed to read image dimensions from {}", path.display()))?;
+            Ok(Some(PreparedAttachmentInfo::Image {
+                width: UInt::new(width as u64),
+                height: UInt::new(height as u64),
+                size: Some(size),
+            }))
+        }
+        mime::VIDEO => Ok(Some(probe_video_attachment_info(path, size).await?)),
+        _ => Ok(Some(PreparedAttachmentInfo::File { size: Some(size) })),
+    }
+}
+
+async fn upload_matrix_video_preview_event(
+    context: &Arc<RunningContext>,
+    room: &Room,
+    preview: &PreparedMatrixPreview,
+    preview_bytes: Vec<u8>,
+    preview_caption: &str,
+    matrix_thumbnail: Option<PreparedMatrixThumbnail>,
+) -> Result<()> {
+    let uploaded_preview = context
+        .client
+        .media()
+        .upload(&preview.content_type, preview_bytes, None)
+        .await?;
+
+    let preview_info = attachment_info_for_path(&preview.path, &preview.content_type)
+        .await?
+        .unwrap_or(PreparedAttachmentInfo::Video {
+            width: None,
+            height: None,
+            size: None,
+            duration: None,
+        });
+
+    let mut content =
+        VideoMessageEventContent::plain(preview_caption.to_owned(), uploaded_preview.content_uri);
+    content.filename = Some(preview.display_name.clone());
+
+    let mut info = match preview_info {
+        PreparedAttachmentInfo::Video {
+            width,
+            height,
+            size,
+            duration,
+        } => {
+            let mut info = VideoInfo::new();
+            info.width = width;
+            info.height = height;
+            info.size = size;
+            info.duration = duration;
+            info.mimetype = Some(preview.content_type.to_string());
+            info
+        }
+        PreparedAttachmentInfo::Image { width, height, size } => {
+            let mut info = VideoInfo::new();
+            info.width = width;
+            info.height = height;
+            info.size = size;
+            info.mimetype = Some(preview.content_type.to_string());
+            info
+        }
+        PreparedAttachmentInfo::File { size } => {
+            let mut info = VideoInfo::new();
+            info.size = size;
+            info.mimetype = Some(preview.content_type.to_string());
+            info
+        }
+    };
+
+    if let Some(thumbnail) = matrix_thumbnail {
+        let uploaded_thumbnail = context
+            .client
+            .media()
+            .upload(&mime::IMAGE_JPEG, thumbnail.data.clone(), None)
+            .await?;
+        let mut thumbnail_info = ThumbnailInfo::new();
+        thumbnail_info.width = Some(thumbnail.width);
+        thumbnail_info.height = Some(thumbnail.height);
+        thumbnail_info.size = Some(thumbnail.size);
+        thumbnail_info.mimetype = Some(mime::IMAGE_JPEG.to_string());
+        info.thumbnail_info = Some(Box::new(thumbnail_info));
+        info.thumbnail_source = Some(MediaSource::Plain(uploaded_thumbnail.content_uri));
+    }
+
+    content.info = Some(Box::new(info));
+    if let Ok(serialized) = serde_json::to_string_pretty(&content) {
+        let _ = context
+            .database
+            .insert_log(
+                AppLogLevel::Info,
+                "share",
+                &format!(
+                    "Sending explicit Matrix video preview event for {} with content: {}",
+                    preview.display_name, serialized
+                ),
+            )
+            .await;
+    }
+    room.send(RoomMessageEventContent::new(MessageType::Video(content)))
+        .await?;
     Ok(())
+}
+
+async fn probe_video_attachment_info(
+    path: &Path,
+    size: UInt,
+) -> Result<PreparedAttachmentInfo> {
+    let Some(ffprobe) = which("ffprobe").await? else {
+        return Ok(PreparedAttachmentInfo::Video {
+            width: None,
+            height: None,
+            size: Some(size),
+            duration: None,
+        });
+    };
+
+    let output = tokio::process::Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("Failed to probe video metadata for {}", path.display()))?;
+
+    if !output.status.success() {
+        return Ok(PreparedAttachmentInfo::Video {
+            width: None,
+            height: None,
+            size: Some(size),
+            duration: None,
+        });
+    }
+
+    let parsed: FfprobeOutput = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("Failed to parse ffprobe output for {}", path.display()))?;
+    let stream = parsed
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"))
+        .or_else(|| parsed.streams.first());
+
+    let width = stream.and_then(|stream| stream.width).and_then(UInt::new);
+    let height = stream.and_then(|stream| stream.height).and_then(UInt::new);
+    let duration_seconds = stream
+        .and_then(|stream| stream.duration.as_deref())
+        .or(parsed.format.as_ref().and_then(|format| format.duration.as_deref()))
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value > 0.0);
+    let duration = duration_seconds.map(Duration::from_secs_f64);
+
+    Ok(PreparedAttachmentInfo::Video {
+        width,
+        height,
+        size: Some(size),
+        duration,
+    })
 }
 
 fn load_oriented_image_from_bytes(bytes: &[u8]) -> Result<image::DynamicImage> {
@@ -4066,6 +4713,18 @@ fn should_fetch_ipfs_landing_page_thumbnail(discovery: &AttachmentDiscovery) -> 
         && landing_page_url != direct_url
 }
 
+fn should_fetch_matrix_fallback_thumbnail(discovery: &AttachmentDiscovery) -> bool {
+    discovery.source_kind == MediaSourceKind::Ipfs
+        && discovery
+            .thumbnail_source_url
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && discovery
+            .fallback_source_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
 async fn cache_discovery_thumbnail(
     context: &Arc<RunningContext>,
     discovery: &AttachmentDiscovery,
@@ -4084,7 +4743,7 @@ async fn cache_discovery_thumbnail(
         return Ok(None);
     };
 
-    let thumbnail_bytes = load_discovery_thumbnail_bytes(&context.client, source).await?;
+    let thumbnail_bytes = load_discovery_thumbnail_bytes(&context.client, discovery, source).await?;
     let image = load_oriented_image_from_bytes(&thumbnail_bytes)
         .with_context(|| format!("Thumbnail bytes were not a valid image for {}", discovery.event_id))?;
     let thumbnail = image.thumbnail(384, 384);
@@ -4120,6 +4779,48 @@ async fn cache_discovery_thumbnail(
         )
         .await?;
     Ok(Some(cached_path))
+}
+
+async fn enrich_discovery_thumbnail_from_matrix_fallback(
+    context: &Arc<RunningContext>,
+    discovery: &AttachmentDiscovery,
+) -> Result<()> {
+    if !should_fetch_matrix_fallback_thumbnail(discovery) {
+        return Ok(());
+    }
+
+    let fallback_source = discovery
+        .fallback_source_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("Missing Matrix fallback thumbnail source."))?
+        .to_owned();
+
+    context
+        .database
+        .set_discovery_thumbnail_source_url(
+            &discovery.room_id,
+            &discovery.event_id,
+            Some(&fallback_source),
+        )
+        .await?;
+
+    let mut updated = discovery.clone();
+    updated.thumbnail_source_url = Some(fallback_source.clone());
+    let _ = cache_discovery_thumbnail(context, &updated).await;
+
+    context
+        .database
+        .insert_log(
+            AppLogLevel::Info,
+            "thumbnails",
+            &format!(
+                "Resolved Matrix fallback thumbnail for {} in {} from the room attachment.",
+                discovery.event_id, discovery.room_id
+            ),
+        )
+        .await?;
+    Ok(())
 }
 
 async fn enrich_ipfs_discovery_thumbnail_from_landing_page(
@@ -4187,6 +4888,34 @@ async fn warm_room_thumbnail_cache(
             }
 
             let mut current = discovery;
+            if should_fetch_matrix_fallback_thumbnail(&current) {
+                match enrich_discovery_thumbnail_from_matrix_fallback(&context, &current).await {
+                    Ok(()) => {
+                        if let Some(updated) = context
+                            .database
+                            .discovery_record(&current.room_id, &current.event_id)
+                            .await?
+                        {
+                            current = updated;
+                        }
+                        made_progress = true;
+                    }
+                    Err(error) => {
+                        let _ = context
+                            .database
+                            .insert_log(
+                                AppLogLevel::Warning,
+                                "thumbnails",
+                                &format!(
+                                    "Failed Matrix fallback thumbnail lookup for {} in {}: {error:#}",
+                                    current.event_id, current.room_id
+                                ),
+                            )
+                            .await;
+                    }
+                }
+            }
+
             if should_fetch_ipfs_landing_page_thumbnail(&current) {
                 match enrich_ipfs_discovery_thumbnail_from_landing_page(&context, &current).await {
                     Ok(()) => {
@@ -4250,7 +4979,19 @@ async fn warm_room_thumbnail_cache(
     Ok(())
 }
 
-async fn load_discovery_thumbnail_bytes(client: &Client, source: &str) -> Result<Vec<u8>> {
+fn should_request_matrix_thumbnail_rendition(
+    discovery: &AttachmentDiscovery,
+    source: &str,
+) -> bool {
+    !(source.starts_with("http://") || source.starts_with("https://"))
+        && matches!(discovery.category, MediaCategory::Videos)
+}
+
+async fn load_discovery_thumbnail_bytes(
+    client: &Client,
+    discovery: &AttachmentDiscovery,
+    source: &str,
+) -> Result<Vec<u8>> {
     if source.starts_with("http://") || source.starts_with("https://") {
         let response = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -4267,6 +5008,19 @@ async fn load_discovery_thumbnail_bytes(client: &Client, source: &str) -> Result
             ));
         }
         return Ok(response.bytes().await?.to_vec());
+    }
+
+    if should_request_matrix_thumbnail_rendition(discovery, source) {
+        let request = MediaRequestParameters {
+            source: decode_media_source(source)?,
+            format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(
+                UInt::new(384).expect("384 should fit in UInt"),
+                UInt::new(384).expect("384 should fit in UInt"),
+            )),
+        };
+        if let Ok(bytes) = client.media().get_media_content(&request, true).await {
+            return Ok(bytes);
+        }
     }
 
     let request = MediaRequestParameters {
@@ -4369,6 +5123,7 @@ async fn process_events(
             timestamp,
             command_body,
             discovery,
+            redacted,
         } = event;
 
         if let Some(cutoff) = cutoff {
@@ -4391,6 +5146,28 @@ async fn process_events(
         }
 
         if !is_space_room {
+            if redacted {
+                if let Some(removed_thumbnail_path) = context
+                    .database
+                    .remove_discovery_for_event(room_id, &event_id)
+                    .await?
+                {
+                    let _ = tokio_fs::remove_file(&removed_thumbnail_path).await;
+                    let _ = context
+                        .database
+                        .insert_log(
+                            AppLogLevel::Info,
+                            "browser",
+                            &format!(
+                                "Removed browser item {} from {} after the Matrix event was deleted.",
+                                event_id, room_id
+                            ),
+                        )
+                        .await;
+                }
+                continue;
+            }
+
             let ipfs_discovery = command_body.as_deref().and_then(|body| {
                 settings
                     .as_ref()
@@ -6041,6 +6818,7 @@ struct ObservedTimelineEvent {
     timestamp: DateTime<Utc>,
     command_body: Option<String>,
     discovery: Option<AttachmentDiscovery>,
+    redacted: bool,
 }
 
 impl ObservedTimelineEvent {
@@ -6059,6 +6837,7 @@ impl ObservedTimelineEvent {
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("remote-{}-{}", event.timestamp().get(), event.sender()));
         let sender = event.sender().to_string();
+        let redacted = event.content().is_redacted();
         let command_body = event
             .content()
             .as_message()
@@ -6071,6 +6850,7 @@ impl ObservedTimelineEvent {
             timestamp,
             command_body,
             discovery,
+            redacted,
         }))
     }
 }
@@ -6122,28 +6902,32 @@ fn timeline_discovery(
             mime_type: content.info.as_ref().and_then(|info| info.mimetype.clone()),
             category: MediaCategory::Images,
         }),
-        MessageType::Video(content) => Some(AttachmentDiscovery {
-            room_id: room_id.to_owned(),
-            event_id: event_id.to_owned(),
-            origin_server_timestamp: timestamp,
-            source_kind: MediaSourceKind::Matrix,
-            direct_url: None,
-            mxc_url: encode_media_source(&content.source)?,
-            fallback_source_url: None,
-            thumbnail_source_url: content
-                .info
-                .as_ref()
-                .and_then(|info| info.thumbnail_source.as_ref())
-                .map(encode_media_source)
-                .transpose()?,
-            thumbnail_cached_path: None,
-            original_filename: content
-                .filename
-                .clone()
-                .or_else(|| Some(content.body.clone())),
-            mime_type: content.info.as_ref().and_then(|info| info.mimetype.clone()),
-            category: MediaCategory::Videos,
-        }),
+        MessageType::Video(content) => {
+            let encoded_source = encode_media_source(&content.source)?;
+            Some(AttachmentDiscovery {
+                room_id: room_id.to_owned(),
+                event_id: event_id.to_owned(),
+                origin_server_timestamp: timestamp,
+                source_kind: MediaSourceKind::Matrix,
+                direct_url: None,
+                mxc_url: encoded_source.clone(),
+                fallback_source_url: None,
+                thumbnail_source_url: content
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.thumbnail_source.as_ref())
+                    .map(encode_media_source)
+                    .transpose()?
+                    .or_else(|| Some(encoded_source.clone())),
+                thumbnail_cached_path: None,
+                original_filename: content
+                    .filename
+                    .clone()
+                    .or_else(|| Some(content.body.clone())),
+                mime_type: content.info.as_ref().and_then(|info| info.mimetype.clone()),
+                category: MediaCategory::Videos,
+            })
+        }
         MessageType::Audio(content) => Some(AttachmentDiscovery {
             room_id: room_id.to_owned(),
             event_id: event_id.to_owned(),
@@ -6161,34 +6945,42 @@ fn timeline_discovery(
             mime_type: content.info.as_ref().and_then(|info| info.mimetype.clone()),
             category: MediaCategory::Audio,
         }),
-        MessageType::File(content) => Some(AttachmentDiscovery {
-            room_id: room_id.to_owned(),
-            event_id: event_id.to_owned(),
-            origin_server_timestamp: timestamp,
-            source_kind: MediaSourceKind::Matrix,
-            direct_url: None,
-            mxc_url: encode_media_source(&content.source)?,
-            fallback_source_url: None,
-            thumbnail_source_url: content
-                .info
-                .as_ref()
-                .and_then(|info| info.thumbnail_source.as_ref())
-                .map(encode_media_source)
-                .transpose()?,
-            thumbnail_cached_path: None,
-            original_filename: content
-                .filename
-                .clone()
-                .or_else(|| Some(content.body.clone())),
-            mime_type: content.info.as_ref().and_then(|info| info.mimetype.clone()),
-            category: media_classification::category(
+        MessageType::File(content) => {
+            let encoded_source = encode_media_source(&content.source)?;
+            let category = media_classification::category(
                 content.filename.as_deref().or(Some(content.body.as_str())),
                 content
                     .info
                     .as_ref()
                     .and_then(|info| info.mimetype.as_deref()),
-            ),
-        }),
+            );
+            Some(AttachmentDiscovery {
+                room_id: room_id.to_owned(),
+                event_id: event_id.to_owned(),
+                origin_server_timestamp: timestamp,
+                source_kind: MediaSourceKind::Matrix,
+                direct_url: None,
+                mxc_url: encoded_source.clone(),
+                fallback_source_url: None,
+                thumbnail_source_url: content
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.thumbnail_source.as_ref())
+                    .map(encode_media_source)
+                    .transpose()?
+                    .or_else(|| {
+                        matches!(category, MediaCategory::Images | MediaCategory::Videos)
+                            .then_some(encoded_source.clone())
+                    }),
+                thumbnail_cached_path: None,
+                original_filename: content
+                    .filename
+                    .clone()
+                    .or_else(|| Some(content.body.clone())),
+                mime_type: content.info.as_ref().and_then(|info| info.mimetype.clone()),
+                category,
+            })
+        }
         _ => None,
     };
 
@@ -6348,6 +7140,34 @@ async fn probe_with_external_tool(tool: &str, path: &Path) -> Result<bool> {
 }
 
 async fn which(name: &str) -> Result<Option<PathBuf>> {
+    if let Some(current_exe) = std::env::current_exe().ok() {
+        if let Some(executable_dir) = current_exe.parent() {
+            for bundled_root in bundled_tool_roots(executable_dir) {
+                for executable in candidate_executable_paths(&bundled_root, name) {
+                    let metadata = match tokio_fs::metadata(&executable).await {
+                        Ok(metadata) => metadata,
+                        Err(_) => continue,
+                    };
+                    if !metadata.is_file() {
+                        continue;
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if metadata.permissions().mode() & 0o111 == 0 {
+                            continue;
+                        }
+                    }
+
+                    let canonical = tokio_fs::canonicalize(&executable)
+                        .await
+                        .unwrap_or(executable);
+                    return Ok(Some(canonical));
+                }
+            }
+        }
+    }
+
     let Some(path_var) = std::env::var_os("PATH") else {
         return Ok(None);
     };
@@ -6379,6 +7199,18 @@ async fn which(name: &str) -> Result<Option<PathBuf>> {
         }
     }
     Ok(None)
+}
+
+fn bundled_tool_roots(executable_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        roots.push(executable_dir.join("../Resources/ffmpeg"));
+        roots.push(executable_dir.join("../Resources/kubo"));
+    }
+    roots.push(executable_dir.join("ffmpeg"));
+    roots.push(executable_dir.join("kubo"));
+    roots
 }
 
 fn candidate_executable_paths(path: &Path, name: &str) -> Vec<PathBuf> {

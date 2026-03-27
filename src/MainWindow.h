@@ -149,6 +149,7 @@ private:
     QLabel *ipfsStatusLabel_ = nullptr;
     QLabel *uploadLimitLabel_ = nullptr;
     QLabel *pendingUploadsLabel_ = nullptr;
+    QLabel *previewGenerationLabel_ = nullptr;
     QLabel *updateBannerLabel_ = nullptr;
     QLabel *browserSelectedRoomLabel_ = nullptr;
     QLabel *browserDropHintLabel_ = nullptr;

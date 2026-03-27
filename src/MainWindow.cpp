@@ -293,28 +293,39 @@ int activePendingUploadCount(const QVector<PendingUploadSnapshot> &uploads)
 {
     int count = 0;
     for (const PendingUploadSnapshot &upload : uploads) {
-        if (upload.state == QStringLiteral("uploading")) {
+        const QString state = upload.state.trimmed().toLower();
+        if (!state.isEmpty() && state != QStringLiteral("queued")) {
             count += 1;
         }
     }
     return count;
 }
 
-QString pendingUploadSummaryText(const QVector<PendingUploadSnapshot> &uploads)
+int previewGeneratingUploadCount(const QVector<PendingUploadSnapshot> &uploads)
+{
+    int count = 0;
+    for (const PendingUploadSnapshot &upload : uploads) {
+        if (upload.state == QStringLiteral("previewing")) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+QString browserUploadSummaryText(const QVector<PendingUploadSnapshot> &uploads)
 {
     if (uploads.isEmpty()) {
         return QStringLiteral("Uploads: none");
     }
+    return QStringLiteral("Uploads: %1").arg(uploads.size());
+}
 
-    const int activeCount = activePendingUploadCount(uploads);
-    const int queuedCount = qMax(0, uploads.size() - activeCount);
-    if (activeCount > 0 && queuedCount > 0) {
-        return QStringLiteral("Uploads: %1 active, %2 queued").arg(activeCount).arg(queuedCount);
+QString browserPreviewSummaryText(const QVector<PendingUploadSnapshot> &uploads)
+{
+    if (previewGeneratingUploadCount(uploads) > 0) {
+        return QStringLiteral("Preview: generating");
     }
-    if (activeCount > 0) {
-        return QStringLiteral("Uploads: %1 active").arg(activeCount);
-    }
-    return QStringLiteral("Uploads: %1 queued").arg(queuedCount);
+    return QStringLiteral("Preview: none");
 }
 
 QPixmap renderDiscoveryTile(
@@ -549,8 +560,23 @@ MainWindow::MainWindow(AppController *controller, QWidget *parent)
     sectionCombo_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     sectionCombo_->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
     sectionCombo_->setMinimumContentsLength(0);
+    pendingUploadsLabel_ = new QLabel(contentContainer);
+    previewGenerationLabel_ = new QLabel(contentContainer);
+    const QFontMetrics navMetrics(font());
+    pendingUploadsLabel_->setMinimumWidth(navMetrics.horizontalAdvance(QStringLiteral("Uploads: none")) + 20);
+    previewGenerationLabel_->setMinimumWidth(navMetrics.horizontalAdvance(QStringLiteral("Preview: generating")) + 20);
+    pendingUploadsLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    previewGenerationLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    pendingUploadsLabel_->setStyleSheet(QStringLiteral("font-weight: 600;"));
+    previewGenerationLabel_->setStyleSheet(QStringLiteral("font-weight: 600;"));
+    pendingUploadsLabel_->setWordWrap(false);
+    previewGenerationLabel_->setWordWrap(false);
+    pendingUploadsLabel_->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    previewGenerationLabel_->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
     navigationLabel->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
     navigationRow->addStretch();
+    navigationRow->addWidget(pendingUploadsLabel_);
+    navigationRow->addWidget(previewGenerationLabel_);
     navigationRow->addWidget(navigationLabel);
     navigationRow->addWidget(sectionCombo_);
 
@@ -825,14 +851,12 @@ QWidget *MainWindow::buildBrowserPage()
     connectionLabel_ = new QLabel(browserPage_);
     ipfsStatusLabel_ = new QLabel(browserPage_);
     uploadLimitLabel_ = new QLabel(browserPage_);
-    pendingUploadsLabel_ = new QLabel(browserPage_);
     updateBannerLabel_ = new QLabel(browserPage_);
     updateBannerLabel_->setWordWrap(true);
     statusRow->addWidget(powerToggle_);
     statusRow->addWidget(connectionLabel_);
     statusRow->addWidget(ipfsStatusLabel_);
     statusRow->addWidget(uploadLimitLabel_);
-    statusRow->addWidget(pendingUploadsLabel_);
     statusRow->addWidget(updateBannerLabel_);
     statusRow->addStretch();
     layout->addLayout(statusRow);
@@ -1316,7 +1340,8 @@ void MainWindow::populateBrowserPage()
     connectionLabel_->setText(QStringLiteral("Matrix: %1").arg(controller_->connectionStatusText()));
     ipfsStatusLabel_->setText(QStringLiteral("IPFS: %1").arg(ipfsRuntimeStateTitle(runtime.ipfs.state)));
     uploadLimitLabel_->setText(QStringLiteral("Upload Limit: %1").arg(uploadLimitText(runtime.uploadSizeLimitBytes)));
-    pendingUploadsLabel_->setText(pendingUploadSummaryText(runtime.pendingUploads));
+    pendingUploadsLabel_->setText(browserUploadSummaryText(runtime.pendingUploads));
+    previewGenerationLabel_->setText(browserPreviewSummaryText(runtime.pendingUploads));
     if (controller_->updateAvailable() || controller_->isUpdateCheckInProgress()) {
         updateBannerLabel_->setText(QStringLiteral("Updates: %1").arg(controller_->updateStatusText()));
     } else {
