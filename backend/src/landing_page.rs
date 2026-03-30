@@ -114,15 +114,36 @@ pub fn render_landing_page(
   </main>
   <script>
     (function() {{
-      const currentPath = window.location.pathname + window.location.search;
       const fileCid = {file_cid:?};
+      function resolveCurrentPagePath() {{
+        const path = window.location.pathname || '';
+        const search = window.location.search || '';
+        const pathMatch = path.match(/\\/ipfs\\/([^/?#]+)/);
+        if (pathMatch && pathMatch[1]) {{
+          return '/ipfs/' + pathMatch[1] + search;
+        }}
+
+        const host = window.location.hostname || '';
+        const hostMatch = host.match(/^([^.]+)\\.ipfs\\./);
+        if (hostMatch && hostMatch[1]) {{
+          return '/ipfs/' + hostMatch[1] + search;
+        }}
+
+        return null;
+      }}
+
+      const currentPagePath = resolveCurrentPagePath();
       document.querySelectorAll('a[data-gateway]').forEach(function(link) {{
         const gateway = (link.getAttribute('data-gateway') || '').replace(/\\/+$/, '');
         if (!gateway) {{
           return;
         }}
         const supportsHtml = link.getAttribute('data-supports-html') === '1';
-        link.href = supportsHtml ? (gateway + currentPath) : (gateway + '/ipfs/' + fileCid);
+        if (supportsHtml && currentPagePath) {{
+          link.href = gateway + currentPagePath;
+        }} else {{
+          link.href = gateway + '/ipfs/' + fileCid;
+        }}
       }});
     }})();
   </script>
@@ -161,7 +182,8 @@ mod tests {
         );
 
         assert!(html.contains("https://dweb.link/ipfs/bafyfile"));
-        assert!(html.contains("window.location.pathname"));
+        assert!(html.contains("resolveCurrentPagePath"));
+        assert!(html.contains("host.match(/^([^.]+)\\.ipfs\\./)"));
         assert!(html.contains("data-gateway=\"https://ipfs.io\""));
         assert!(html.contains("href=\"https://ipfs.io/ipfs/bafypage\""));
         assert!(html.contains("href=\"https://4everland.io/ipfs/bafyfile\""));

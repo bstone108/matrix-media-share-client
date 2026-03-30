@@ -494,23 +494,20 @@ if(APPLE)
     )
 endif()
 
-add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+set(MATRIX_MEDIA_SHARE_CLIENT_RUNTIME_SYNC_COMMANDS
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${MATRIX_MEDIA_ARCHIVER_BACKEND_BINARY}
         $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/${MATRIX_MEDIA_ARCHIVER_BACKEND_BINARY_NAME}
-    COMMENT "Copying Rust Matrix backend next to MatrixMediaShareClientQt"
 )
-
 if(APPLE)
-    add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+    list(APPEND MATRIX_MEDIA_SHARE_CLIENT_RUNTIME_SYNC_COMMANDS
         COMMAND ${CMAKE_COMMAND} -E make_directory
             $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/kubo
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_BINARY}
             $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/kubo/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_NAME}
-        COMMENT "Copying bundled Kubo into MatrixMediaShareClientQt.app"
     )
-    add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+    list(APPEND MATRIX_MEDIA_SHARE_CLIENT_RUNTIME_SYNC_COMMANDS
         COMMAND ${CMAKE_COMMAND} -E make_directory
             $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/ffmpeg
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -519,12 +516,11 @@ if(APPLE)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_BINARY}
             $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/ffmpeg/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_NAME}
-        COMMENT "Copying bundled FFmpeg tools into MatrixMediaShareClientQt.app"
     )
     if(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT
         AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/lib"
         AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/plugins")
-        add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+        list(APPEND MATRIX_MEDIA_SHARE_CLIENT_RUNTIME_SYNC_COMMANDS
             COMMAND ${CMAKE_COMMAND} -E rm -rf
                 $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/vlc
             COMMAND ${CMAKE_COMMAND} -E make_directory
@@ -539,19 +535,17 @@ if(APPLE)
                 -DVLC_LIB_DIR=$<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/vlc/lib
                 -DVLC_PLUGIN_DIR=$<TARGET_FILE_DIR:MatrixMediaShareClientQt>/../Resources/vlc/plugins
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/FixBundledVlcMac.cmake
-            COMMENT "Copying bundled VLC runtime into MatrixMediaShareClientQt.app"
         )
     endif()
 else()
-    add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+    list(APPEND MATRIX_MEDIA_SHARE_CLIENT_RUNTIME_SYNC_COMMANDS
         COMMAND ${CMAKE_COMMAND} -E make_directory
             $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/kubo
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_BINARY}
             $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/kubo/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_KUBO_NAME}
-        COMMENT "Copying bundled Kubo next to MatrixMediaShareClientQt"
     )
-    add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+    list(APPEND MATRIX_MEDIA_SHARE_CLIENT_RUNTIME_SYNC_COMMANDS
         COMMAND ${CMAKE_COMMAND} -E make_directory
             $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/ffmpeg
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -560,12 +554,11 @@ else()
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_BINARY}
             $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/ffmpeg/${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_FFPROBE_NAME}
-        COMMENT "Copying bundled FFmpeg tools next to MatrixMediaShareClientQt"
     )
     if(MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT
         AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/lib"
         AND EXISTS "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/plugins")
-        add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+        list(APPEND MATRIX_MEDIA_SHARE_CLIENT_RUNTIME_SYNC_COMMANDS
             COMMAND ${CMAKE_COMMAND} -E rm -rf
                 $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/vlc
             COMMAND ${CMAKE_COMMAND} -E make_directory
@@ -576,10 +569,20 @@ else()
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT}/plugins"
                 $<TARGET_FILE_DIR:MatrixMediaShareClientQt>/vlc/plugins
-            COMMENT "Copying bundled VLC runtime next to MatrixMediaShareClientQt"
         )
     endif()
 endif()
+
+add_custom_target(MatrixMediaShareClientQtRuntimeSync ALL
+    ${MATRIX_MEDIA_SHARE_CLIENT_RUNTIME_SYNC_COMMANDS}
+    DEPENDS
+        MatrixMediaShareClientQt
+        MatrixMediaShareClientQtBackend
+        MatrixMediaShareClientQtBundledKubo
+        MatrixMediaShareClientQtBundledFfmpeg
+    COMMENT "Syncing bundled Matrix Media Share Client runtime"
+    VERBATIM
+)
 
 install(TARGETS MatrixMediaShareClientQt
     BUNDLE DESTINATION .
