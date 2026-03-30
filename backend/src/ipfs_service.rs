@@ -132,8 +132,9 @@ impl IpfsService {
             &primary_gateway,
             &alternate_gateways,
         );
+        let html_bytes = html.clone().into_bytes();
         let page_cid = self
-            .add_named_bytes("index.html", html.into_bytes(), Some("text/html"))
+            .add_named_bytes("index.html", html_bytes.clone(), Some("text/html"))
             .await?;
         let landing_page_url = page_url(&primary_gateway, &page_cid);
 
@@ -142,14 +143,7 @@ impl IpfsService {
                 .await
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
-        fs::write(landing_page_output_path, render_landing_page(
-            title,
-            &file_cid,
-            thumbnail_cid.as_deref(),
-            Some(&page_cid),
-            &primary_gateway,
-            &alternate_gateways,
-        ))
+        fs::write(landing_page_output_path, html_bytes)
         .await
         .with_context(|| format!("Failed to persist {}", landing_page_output_path.display()))?;
 
