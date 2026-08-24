@@ -62,7 +62,7 @@ These scripts now expect the same bundled-VLC layout the GitHub workflow prepare
 
 ## GitHub Actions
 
-The desktop workflow is tag-only and publishes releases from `v*` tags after every platform build succeeds.
+The desktop workflow builds on pull requests that touch desktop sources, on `v*` tags, and on `workflow_dispatch`. It publishes GitHub releases from `v*` tags or `workflow_dispatch` after every platform build succeeds. macOS artifacts are Developer ID signed, notarized, and stapled.
 
 The workflow currently prepares platform runtimes like this:
 

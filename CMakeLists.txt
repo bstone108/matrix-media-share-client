@@ -490,7 +490,12 @@ if(APPLE)
         target_link_libraries(MatrixMediaShareClientQt PRIVATE ${MATRIX_MEDIA_ARCHIVER_WEBKIT_FRAMEWORK})
     endif()
     set_target_properties(MatrixMediaShareClientQt PROPERTIES
+        MACOSX_BUNDLE_BUNDLE_NAME "Matrix Media Share Client"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${MATRIX_MEDIA_ARCHIVER_APP_VERSION}"
+        MACOSX_BUNDLE_COPYRIGHT "Copyright © Brandon Browning Stone"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.bstone108.MatrixMediaShareClientQt"
         MACOSX_BUNDLE_ICON_FILE MatrixMediaArchiverQt.icns
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${MATRIX_MEDIA_ARCHIVER_APP_VERSION}"
     )
 endif()
 
