@@ -62,13 +62,15 @@ These scripts now expect the same bundled-VLC layout the GitHub workflow prepare
 
 ## Versioning
 
-`VERSION.txt` is the app version as `year.month.day.build` in America/Chicago (Central Time), with unpadded month and day. The first build on a given date is `.1`; later builds that same day increment the last component. A new date always starts over at `.1` and never continues the previous release's date.
+`VERSION.txt` is the last **shipped** app version: `year.month.day.build` in America/Chicago (Central Time), with unpadded month and day. The first release on a given date is `.1`; later releases that same day increment the last component. A new date always starts over at `.1` and never continues the previous release's date.
 
-Bump it with:
+Only bump `VERSION.txt` when cutting a GitHub Release. Pull requests, Desktop CI test packaging, and other non-release runs keep the last shipped version and must not consume a build number.
+
+When cutting a release:
 
 ```bash
-./scripts/next-version.py          # print the next version
-./scripts/next-version.py --write  # update VERSION.txt
+./scripts/next-version.py          # preview the next release version
+./scripts/next-version.py --write  # update VERSION.txt, then tag v{version}
 ```
 
 Release tags are `v{version}`, for example `v2026.8.24.1`. The Rust backend `Cargo.toml` version is independent and can stay `0.1.0`.

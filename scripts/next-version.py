@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Compute the next Matrix Media Share Client app version.
+"""Compute the next shipped app version at release time.
 
-Versions are year.month.day.build in America/Chicago, with unpadded month and
-day. The first build on a calendar day is .1; later builds that same day
-increment the last component. A new day always starts at .1 and never continues
-the previous release's date.
+App versions are year.month.day.build in America/Chicago, with unpadded month
+and day. They are assigned only when cutting a real GitHub Release (write
+VERSION.txt, then tag v{version}). Testing, pull-request CI, and other
+non-release packaging must not bump VERSION.txt or consume a build number.
+
+The first release on a calendar day is .1; later releases that same day
+increment the last component. A new day always starts at .1 and never
+continues the previous release's date.
 
 Examples:
   2026.8.24.1
   2026.8.24.2
 
-Default: print the next version to stdout.
---write: update VERSION.txt in the repository root.
+Default: print the next release version to stdout (does not write).
+--write: update VERSION.txt. Use this only when cutting a release, then
+tag v{version}.
 """
 
 from __future__ import annotations
@@ -148,7 +153,8 @@ def main() -> int:
     parser.add_argument(
         "--write",
         action="store_true",
-        help="Write the computed version to VERSION.txt",
+        help="Write VERSION.txt when cutting a release; then tag v{version}. "
+        "Do not use for PR/CI test packaging.",
     )
     parser.add_argument(
         "--date",
