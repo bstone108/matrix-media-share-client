@@ -171,10 +171,13 @@ PROFILE_FILE="/etc/profile.d/matrix-media-share-client-env.sh"
 ${SUDO} tee "${PROFILE_FILE}" >/dev/null <<EOF
 # Managed by .cursor/install.sh for Matrix Media Share Client
 export QT_ROOT_DIR="${QT_ROOT_DIR}"
-export CMAKE_PREFIX_PATH="${QT_ROOT_DIR}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}"
 export MATRIX_MEDIA_SHARE_CLIENT_BUNDLED_VLC_ROOT="${VLC_ROOT}"
 export CC=gcc
 export CXX=g++
+case ":\${CMAKE_PREFIX_PATH}:" in
+  *":${QT_ROOT_DIR}:"*) ;;
+  *) export CMAKE_PREFIX_PATH="${QT_ROOT_DIR}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}" ;;
+esac
 case ":\${PATH}:" in
   *":${QT_ROOT_DIR}/bin:"*) ;;
   *) export PATH="${QT_ROOT_DIR}/bin:/usr/local/go/bin:\${PATH}" ;;
