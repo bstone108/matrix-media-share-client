@@ -1,6 +1,20 @@
 name: Desktop CI
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/desktop-ci.yml"
+      - "ARM_BUILD_README.md"
+      - "CMakeLists.txt"
+      - "README.md"
+      - "VERSION.txt"
+      - "backend/**"
+      - "build-linux-arm64.command"
+      - "cmake/**"
+      - "packaging/**"
+      - "scripts/**"
+      - "src/**"
+      - "tests/**"
   push:
     tags:
       - "v*"
@@ -476,15 +490,37 @@ jobs:
           echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "${QT_ROOT_DIR}/bin" >> "$GITHUB_PATH"
 
-      - name: Package macOS zip
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: ./scripts/import-apple-signing-cert.sh
+
+      - name: Package macOS app and dmg
+        env:
+          MACOS_CODESIGN_IDENTITY: "Developer ID Application: BRANDON BROWNING STONE (K6N4J68LTY)"
+          MACOS_REQUIRE_NOTARIZATION: "1"
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: ./scripts/package-macos.sh
 
-      - name: Upload macOS zip
+      - name: Upload macOS artifacts
         uses: actions/upload-artifact@v6
         with:
           name: ${{ env.APP_NAME }}-${{ steps.version.outputs.app_version }}-macos-arm64
-          path: builds/${{ env.APP_NAME }}-${{ steps.version.outputs.app_version }}-macos-arm64.zip
+          path: |
+            builds/${{ env.APP_NAME }}-${{ steps.version.outputs.app_version }}-macos-arm64.zip
+            builds/${{ env.APP_NAME }}-${{ steps.version.outputs.app_version }}-macos-arm64.dmg
           if-no-files-found: error
+
+      - name: Delete signing keychain
+        if: always()
+        run: |
+          if [[ -n "${MACOS_SIGNING_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "${MACOS_SIGNING_KEYCHAIN_PATH}" || true
+          fi
+          rm -f "${MACOS_SIGNING_CERTIFICATE_PATH:-}"
 
   build-macos-intel:
     name: Build macOS (Intel)
@@ -550,15 +586,37 @@ jobs:
           echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
           echo "${QT_ROOT_DIR}/bin" >> "$GITHUB_PATH"
 
-      - name: Package macOS zip
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: ./scripts/import-apple-signing-cert.sh
+
+      - name: Package macOS app and dmg
+        env:
+          MACOS_CODESIGN_IDENTITY: "Developer ID Application: BRANDON BROWNING STONE (K6N4J68LTY)"
+          MACOS_REQUIRE_NOTARIZATION: "1"
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: ./scripts/package-macos.sh
 
-      - name: Upload macOS zip
+      - name: Upload macOS artifacts
         uses: actions/upload-artifact@v6
         with:
           name: ${{ env.APP_NAME }}-${{ steps.version.outputs.app_version }}-macos-x86_64
-          path: builds/${{ env.APP_NAME }}-${{ steps.version.outputs.app_version }}-macos-x86_64.zip
+          path: |
+            builds/${{ env.APP_NAME }}-${{ steps.version.outputs.app_version }}-macos-x86_64.zip
+            builds/${{ env.APP_NAME }}-${{ steps.version.outputs.app_version }}-macos-x86_64.dmg
           if-no-files-found: error
+
+      - name: Delete signing keychain
+        if: always()
+        run: |
+          if [[ -n "${MACOS_SIGNING_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "${MACOS_SIGNING_KEYCHAIN_PATH}" || true
+          fi
+          rm -f "${MACOS_SIGNING_CERTIFICATE_PATH:-}"
 
   publish-release:
     name: Publish GitHub release
@@ -575,6 +633,20 @@ jobs:
       contents: write
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Verify release tag matches VERSION.txt
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < VERSION.txt)"
+          expected="v${version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected}" ]]; then
+            echo "Git tag ${GITHUB_REF_NAME} does not match VERSION.txt (${expected})." >&2
+            exit 1
+          fi
+
       - name: Download Linux artifact
         uses: actions/download-artifact@v5
         with:

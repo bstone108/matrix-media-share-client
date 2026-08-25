@@ -60,9 +60,24 @@ Packaging helpers:
 
 These scripts now expect the same bundled-VLC layout the GitHub workflow prepares for each platform.
 
+## Versioning
+
+`VERSION.txt` is the last **shipped** app version: `year.month.day.build` in America/Chicago (Central Time), with unpadded month and day. The first release on a given date is `.1`; later releases that same day increment the last component. A new date always starts over at `.1` and never continues the previous release's date.
+
+Only bump `VERSION.txt` when cutting a GitHub Release. Pull requests, Desktop CI test packaging, and other non-release runs keep the last shipped version and must not consume a build number.
+
+When cutting a release:
+
+```bash
+./scripts/next-version.py          # preview the next release version
+./scripts/next-version.py --write  # update VERSION.txt, then tag v{version}
+```
+
+Release tags are `v{version}`, for example `v2026.8.24.1`. The Rust backend `Cargo.toml` version is independent and can stay `0.1.0`.
+
 ## GitHub Actions
 
-The desktop workflow is tag-only and publishes releases from `v*` tags after every platform build succeeds.
+The desktop workflow builds on pull requests that touch desktop sources, on `v*` tags, and on `workflow_dispatch`. It publishes GitHub releases from `v*` tags or `workflow_dispatch` after every platform build succeeds. macOS artifacts are Developer ID signed, notarized, and stapled. If the run was started from a `v*` tag, publish fails unless that tag matches `VERSION.txt`.
 
 The workflow currently prepares platform runtimes like this:
 
