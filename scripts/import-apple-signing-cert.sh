@@ -4,10 +4,22 @@ set -euo pipefail
 # Import a Developer ID Application .p12 into a temporary keychain for CI.
 # Expected env: APPLE_CERTIFICATE_BASE64, APPLE_CERTIFICATE_PASSWORD
 # Optional: RUNNER_TEMP (GitHub Actions), GITHUB_ENV
+#
+# GitHub Actions may only import this certificate for a real release: a v* tag
+# or workflow_dispatch that publishes GitHub Release files. Pull-request CI
+# must stay unsigned. The certificate material never belongs in git.
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "This script must run on macOS." >&2
   exit 1
+fi
+
+if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+  if [[ "${GITHUB_EVENT_NAME:-}" != "workflow_dispatch" && "${GITHUB_REF:-}" != refs/tags/v* ]]; then
+    echo "Refusing to import a Developer ID certificate on a non-release GitHub Actions run." >&2
+    echo "Import is allowed only for v* tags or workflow_dispatch." >&2
+    exit 1
+  fi
 fi
 
 : "${APPLE_CERTIFICATE_BASE64:?APPLE_CERTIFICATE_BASE64 is required}"

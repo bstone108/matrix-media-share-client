@@ -75,6 +75,22 @@ using_developer_id() {
   [[ -n "${CODESIGN_IDENTITY}" && "${CODESIGN_IDENTITY}" != "-" ]]
 }
 
+is_github_actions_release() {
+  [[ -n "${GITHUB_ACTIONS:-}" ]] && {
+    [[ "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" ]] || [[ "${GITHUB_REF:-}" == refs/tags/v* ]]
+  }
+}
+
+refuse_non_release_github_signing() {
+  if [[ -z "${GITHUB_ACTIONS:-}" ]] || is_github_actions_release; then
+    return 0
+  fi
+  if using_developer_id || [[ "${MACOS_REQUIRE_NOTARIZATION:-0}" == "1" ]]; then
+    echo "GitHub Actions may only Developer ID sign and notarize real releases (v* tags or workflow_dispatch)." >&2
+    exit 1
+  fi
+}
+
 list_macho_files() {
   local root="$1"
   python3 - "${root}" <<'PY'
@@ -284,6 +300,15 @@ notarize_artifact() {
 }
 
 should_notarize() {
+  # Pull-request / test CI must never call notarytool or stapler, even if Apple
+  # credentials happen to be present in the environment.
+  if [[ -n "${GITHUB_ACTIONS:-}" ]] && ! is_github_actions_release; then
+    return 1
+  fi
+  if [[ -n "${GITHUB_ACTIONS:-}" && "${MACOS_REQUIRE_NOTARIZATION:-0}" != "1" ]]; then
+    return 1
+  fi
+
   if [[ "${MACOS_REQUIRE_NOTARIZATION:-0}" == "1" ]]; then
     if ! using_developer_id; then
       echo "MACOS_REQUIRE_NOTARIZATION=1 requires MACOS_CODESIGN_IDENTITY." >&2
@@ -300,6 +325,8 @@ should_notarize() {
     && [[ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]] \
     && [[ -n "${APPLE_TEAM_ID:-}" ]]
 }
+
+refuse_non_release_github_signing
 
 ARCHIVE_PATH="${BUILDS_DIR}/${APP_NAME}-${APP_VERSION}-macos-${ARCH}.zip"
 DMG_PATH="${BUILDS_DIR}/${APP_NAME}-${APP_VERSION}-macos-${ARCH}.dmg"

@@ -77,7 +77,9 @@ Release tags are `v{version}`, for example `v2026.8.24.1`. The Rust backend `Car
 
 ## GitHub Actions
 
-The desktop workflow builds on pull requests that touch desktop sources, on `v*` tags, and on `workflow_dispatch`. It publishes GitHub releases from `v*` tags or `workflow_dispatch` after every platform build succeeds. macOS artifacts are Developer ID signed, notarized, and stapled. If the run was started from a `v*` tag, publish fails unless that tag matches `VERSION.txt`.
+The desktop workflow builds on pull requests that touch desktop sources, on `v*` tags, and on `workflow_dispatch`. Pull-request and other non-release compiles stay unsigned: they do not import the Developer ID certificate, do not set `MACOS_CODESIGN_IDENTITY`, and do not call `notarytool` or stapler.
+
+It publishes GitHub releases from `v*` tags or `workflow_dispatch` after every platform build succeeds. Only those real releases Developer ID sign (hardened runtime + timestamp), notarize, and staple the macOS `.app`, the `.dmg`, and the zip. The zip of the `.app` is the notary vehicle (`ditto -c -k --keepParent`); the ticket is stapled onto the `.app`, and that stapled `.app` is what ships in the release zip. If the run was started from a `v*` tag, publish fails unless that tag matches `VERSION.txt`.
 
 The workflow currently prepares platform runtimes like this:
 
