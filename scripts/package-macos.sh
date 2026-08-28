@@ -427,5 +427,28 @@ if should_notarize; then
   xcrun stapler validate "${DMG_PATH}"
 fi
 
+if is_github_actions_release; then
+  # Sparkle sign_update runs only on real releases. PR CI never sees the private key.
+  APPCAST_ARCH="${ARCH}"
+  if [[ "${APPCAST_ARCH}" == "amd64" ]]; then
+    APPCAST_ARCH="x86_64"
+  fi
+  SIGNATURE_PATH="${WORK_DIR}/sparkle-${APPCAST_ARCH}.edSignature"
+  APPCAST_PATH="${BUILDS_DIR}/appcast-macos-${APPCAST_ARCH}.xml"
+  "${SCRIPT_DIR}/sign-sparkle-zip.sh" \
+    --zip "${ARCHIVE_PATH}" \
+    --search-root "${BUILD_DIR}" \
+    --signature-out "${SIGNATURE_PATH}"
+  python3 "${SCRIPT_DIR}/generate-sparkle-appcast.py" \
+    --version "${APP_VERSION}" \
+    --release-url "https://github.com/bstone108/matrix-media-share-client/releases/tag/v${APP_VERSION}" \
+    --zip "${ARCHIVE_PATH}" \
+    --arch "${APPCAST_ARCH}" \
+    --signature-file "${SIGNATURE_PATH}" \
+    --output "${APPCAST_PATH}"
+  rm -f "${SIGNATURE_PATH}"
+  echo "Created ${APPCAST_PATH}"
+fi
+
 echo "Created ${ARCHIVE_PATH}"
 echo "Created ${DMG_PATH}"

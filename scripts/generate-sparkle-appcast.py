@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Generate Sparkle 2 appcasts for the macOS arm64 and x86_64 zip assets.
+"""Write Sparkle 2 appcasts from Sparkle sign_update signatures.
 
-The Sparkle EdDSA private key is read from SPARKLE_ED25519_PRIVATE_KEY and is
-never written to disk or printed. The public key embedded in the Mac app must
-match SPARKLE_PUBLIC_ED_KEY.
+This script never reads, prints, or stores the Sparkle private key. Release
+signing is done by Sparkle's sign_update tool on macOS.
 """
 
 from __future__ import annotations
@@ -27,42 +26,37 @@ def _fail(message: str) -> None:
     raise SystemExit(1)
 
 
-def _load_signing_key(raw_b64: str):
+def verify_generate_keys_matches_embedded_public(raw_b64: str) -> None:
+    """Check Sparkle generate_keys material against SUPublicEDKey without printing it."""
     try:
-        from nacl.signing import SigningKey
-    except ImportError:
-        _fail("PyNaCl is required to sign Sparkle appcasts (pip install pynacl).")
-
-    try:
-        raw = base64.b64decode(raw_b64, validate=True)
+        raw = base64.b64decode(raw_b64.strip(), validate=True)
     except Exception:
         _fail("SPARKLE_ED25519_PRIVATE_KEY is not valid base64.")
-
-    if len(raw) == 64:
-        seed = raw[:32]
-    elif len(raw) == 32:
-        seed = raw
-    else:
+    if len(raw) != 64:
         _fail("SPARKLE_ED25519_PRIVATE_KEY must be Sparkle generate_keys format.")
-
-    key = SigningKey(seed)
-    public_b64 = base64.b64encode(bytes(key.verify_key)).decode("ascii")
+    public_b64 = base64.b64encode(raw[32:]).decode("ascii")
     if public_b64 != SPARKLE_PUBLIC_ED_KEY:
         _fail("SPARKLE_ED25519_PRIVATE_KEY does not match the public key embedded in the Mac app.")
-    return key
-
-
-def _sign_file(key, path: Path) -> str:
-    data = path.read_bytes()
-    signature = key.sign(data).signature
-    return base64.b64encode(signature).decode("ascii")
 
 
 def _rfc822(timestamp: datetime) -> str:
     return formatdate(calendar.timegm(timestamp.utctimetuple()), usegmt=True)
 
 
-def _write_appcast(
+def normalize_ed_signature(signature: str) -> str:
+    cleaned = "".join(signature.split())
+    if not cleaned:
+        _fail("Sparkle sign_update returned an empty signature.")
+    try:
+        decoded = base64.b64decode(cleaned, validate=True)
+    except Exception:
+        _fail("Sparkle sign_update returned a signature that is not valid base64.")
+    if len(decoded) != 64:
+        _fail("Sparkle sign_update returned a signature that is not 64 decoded bytes.")
+    return cleaned
+
+
+def write_appcast(
     output_path: Path,
     *,
     version: str,
@@ -73,6 +67,7 @@ def _write_appcast(
     signature: str,
     pub_date: datetime,
 ) -> None:
+    signature = normalize_ed_signature(signature)
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="{html.escape(SPARKLE_NS, quote=True)}">
   <channel>
@@ -93,46 +88,107 @@ def _write_appcast(
     output_path.write_text(xml, encoding="utf-8")
 
 
+def _write_one(
+    *,
+    version: str,
+    html_url: str,
+    download_base: str,
+    zip_path: Path,
+    arch: str,
+    signature: str,
+    output_path: Path,
+    pub_date: datetime,
+) -> None:
+    if not zip_path.is_file():
+        _fail(f"macOS {arch} zip not found: {zip_path}")
+    title = f"Matrix Media Share Client {version}"
+    enclosure_url = f"{download_base}/{zip_path.name}"
+    write_appcast(
+        output_path,
+        version=version,
+        title=title,
+        html_url=html_url,
+        zip_path=zip_path,
+        enclosure_url=enclosure_url,
+        signature=signature,
+        pub_date=pub_date,
+    )
+    print(f"Wrote {output_path} for {zip_path.name}", file=sys.stderr)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--release-url", required=True)
-    parser.add_argument("--arm64-zip", required=True, type=Path)
-    parser.add_argument("--x86_64-zip", required=True, type=Path)
-    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--verify-env-key", action="store_true")
+    parser.add_argument("--version")
+    parser.add_argument("--release-url")
     parser.add_argument("--download-base-url", default="")
+    parser.add_argument("--zip", type=Path)
+    parser.add_argument("--arch")
+    parser.add_argument("--signature", default="")
+    parser.add_argument("--signature-file", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--arm64-zip", type=Path)
+    parser.add_argument("--x86_64-zip", type=Path)
+    parser.add_argument("--arm64-signature", default="")
+    parser.add_argument("--x86_64-signature", default="")
+    parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
 
-    private_key_b64 = os.environ.get("SPARKLE_ED25519_PRIVATE_KEY", "").strip()
-    if not private_key_b64:
-        _fail("SPARKLE_ED25519_PRIVATE_KEY is required to sign Sparkle appcasts.")
+    if args.verify_env_key:
+        raw_b64 = os.environ.get("SPARKLE_ED25519_PRIVATE_KEY", "").strip()
+        if not raw_b64:
+            _fail("SPARKLE_ED25519_PRIVATE_KEY is required to sign Sparkle appcasts.")
+        verify_generate_keys_matches_embedded_public(raw_b64)
+        return 0
 
-    key = _load_signing_key(private_key_b64)
+    if not args.version or not args.release_url:
+        _fail("--version and --release-url are required to write appcasts.")
+
     version = args.version.lstrip("v")
-    title = f"Matrix Media Share Client {version}"
     pub_date = datetime.now(timezone.utc)
     download_base = args.download_base_url.rstrip("/")
     if not download_base:
         download_base = f"https://github.com/bstone108/matrix-media-share-client/releases/download/v{version}"
 
-    for arch, zip_path in (("arm64", args.arm64_zip), ("x86_64", args.x86_64_zip)):
-        if not zip_path.is_file():
-            _fail(f"macOS {arch} zip not found: {zip_path}")
-        signature = _sign_file(key, zip_path)
-        enclosure_url = f"{download_base}/{zip_path.name}"
-        output_path = args.output_dir / f"appcast-macos-{arch}.xml"
-        _write_appcast(
-            output_path,
+    if args.zip is not None:
+        if not args.arch or args.output is None:
+            _fail("Single-zip mode requires --arch and --output.")
+        signature = args.signature
+        if args.signature_file is not None:
+            signature = args.signature_file.read_text(encoding="utf-8")
+        if not signature.strip():
+            _fail("A Sparkle sign_update signature is required.")
+        _write_one(
             version=version,
-            title=title,
             html_url=args.release_url,
-            zip_path=zip_path,
-            enclosure_url=enclosure_url,
+            download_base=download_base,
+            zip_path=args.zip,
+            arch=args.arch,
             signature=signature,
+            output_path=args.output,
             pub_date=pub_date,
         )
-        print(f"Wrote {output_path} for {zip_path.name}", file=sys.stderr)
+        return 0
 
+    if args.arm64_zip is None or args.x86_64_zip is None or args.output_dir is None:
+        _fail("Provide --zip/--arch/--output or both macOS zips with signatures and --output-dir.")
+    if not args.arm64_signature.strip() or not args.x86_64_signature.strip():
+        _fail("Sparkle sign_update signatures are required for both macOS zips.")
+
+    for arch, zip_path, signature in (
+        ("arm64", args.arm64_zip, args.arm64_signature),
+        ("x86_64", args.x86_64_zip, args.x86_64_signature),
+    ):
+        _write_one(
+            version=version,
+            html_url=args.release_url,
+            download_base=download_base,
+            zip_path=zip_path,
+            arch=arch,
+            signature=signature,
+            output_path=args.output_dir / f"appcast-macos-{arch}.xml",
+            pub_date=pub_date,
+        )
     return 0
 
 

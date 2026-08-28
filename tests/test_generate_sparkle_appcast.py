@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sign Sparkle appcasts with a throwaway Ed25519 key. Never uses the production private key."""
+"""Generate Sparkle appcast XML from provided signatures. Never uses the production private key."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "generate-sparkle-appcast.py"
 SPARKLE_NS = "http://www.andymatuschak.org/xml-namespaces/sparkle"
 PRODUCTION_PUBLIC_KEY = "t9iMCbw9VgjkeAVRokGcvFWD2dZFyU852Um2/7SwRfc="
+THROWAY_SIGNATURE = base64.b64encode(bytes(range(64))).decode("ascii")
 
 
 def _load_module():
@@ -26,29 +27,13 @@ def _load_module():
     return module
 
 
-def _throwaway_key():
-    from nacl.signing import SigningKey
-
-    key = SigningKey.generate()
-    private_b64 = base64.b64encode(bytes(key) + bytes(key.verify_key)).decode("ascii")
-    public_b64 = base64.b64encode(bytes(key.verify_key)).decode("ascii")
-    return private_b64, public_b64
-
-
 class GenerateSparkleAppcastTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        try:
-            import nacl.signing  # noqa: F401
-        except ImportError as exc:  # pragma: no cover
-            raise unittest.SkipTest("pynacl is required") from exc
-
-    def test_throwaway_key_writes_arch_appcasts(self):
+    def test_embedded_public_key_matches_sparkle_config(self):
         module = _load_module()
-        private_b64, public_b64 = _throwaway_key()
-        self.assertNotEqual(public_b64, PRODUCTION_PUBLIC_KEY)
-        module.SPARKLE_PUBLIC_ED_KEY = public_b64
+        self.assertEqual(module.SPARKLE_PUBLIC_ED_KEY, PRODUCTION_PUBLIC_KEY)
 
+    def test_writes_arch_appcasts_from_sign_update_signatures(self):
+        module = _load_module()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             arm64_zip = tmp_path / "MatrixMediaShareClientQt-2026.8.28.2-macos-arm64.zip"
@@ -57,8 +42,6 @@ class GenerateSparkleAppcastTests(unittest.TestCase):
             x86_zip.write_bytes(b"x86-zip-bytes")
             out_dir = tmp_path / "appcasts"
 
-            previous = os.environ.get("SPARKLE_ED25519_PRIVATE_KEY")
-            os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = private_b64
             argv = sys.argv
             try:
                 sys.argv = [
@@ -71,16 +54,16 @@ class GenerateSparkleAppcastTests(unittest.TestCase):
                     str(arm64_zip),
                     "--x86_64-zip",
                     str(x86_zip),
+                    "--arm64-signature",
+                    THROWAY_SIGNATURE,
+                    "--x86_64-signature",
+                    THROWAY_SIGNATURE,
                     "--output-dir",
                     str(out_dir),
                 ]
                 self.assertEqual(module.main(), 0)
             finally:
                 sys.argv = argv
-                if previous is None:
-                    os.environ.pop("SPARKLE_ED25519_PRIVATE_KEY", None)
-                else:
-                    os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = previous
 
             for arch, zip_name in (
                 ("arm64", arm64_zip.name),
@@ -92,7 +75,7 @@ class GenerateSparkleAppcastTests(unittest.TestCase):
                 enclosure = tree.find(".//enclosure")
                 self.assertIsNotNone(enclosure)
                 self.assertTrue(enclosure.attrib["url"].endswith(zip_name))
-                self.assertTrue(enclosure.attrib[f"{{{SPARKLE_NS}}}edSignature"])
+                self.assertEqual(enclosure.attrib[f"{{{SPARKLE_NS}}}edSignature"], THROWAY_SIGNATURE)
                 self.assertEqual(enclosure.attrib[f"{{{SPARKLE_NS}}}os"], "macos")
                 version = tree.find(f".//{{{SPARKLE_NS}}}version")
                 self.assertIsNotNone(version)
@@ -100,10 +83,22 @@ class GenerateSparkleAppcastTests(unittest.TestCase):
 
     def test_production_public_key_rejects_throwaway_private_key(self):
         module = _load_module()
-        private_b64, public_b64 = _throwaway_key()
-        self.assertNotEqual(public_b64, module.SPARKLE_PUBLIC_ED_KEY)
+        throwaway = base64.b64encode(os.urandom(64)).decode("ascii")
         with self.assertRaises(SystemExit):
-            module._load_signing_key(private_b64)
+            module.verify_generate_keys_matches_embedded_public(throwaway)
+
+    def test_verify_env_key_requires_secret(self):
+        module = _load_module()
+        previous = os.environ.pop("SPARKLE_ED25519_PRIVATE_KEY", None)
+        argv = sys.argv
+        try:
+            sys.argv = [str(SCRIPT), "--verify-env-key"]
+            with self.assertRaises(SystemExit):
+                module.main()
+        finally:
+            sys.argv = argv
+            if previous is not None:
+                os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = previous
 
 
 if __name__ == "__main__":
