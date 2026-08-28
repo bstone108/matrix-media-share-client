@@ -692,6 +692,27 @@ jobs:
           name: ${{ env.APP_NAME }}-${{ needs.build-macos-intel.outputs.app_version }}-macos-x86_64
           path: release-artifacts/macos-x86_64
 
+      - name: Generate Sparkle appcasts
+        env:
+          SPARKLE_ED25519_PRIVATE_KEY: ${{ secrets.SPARKLE_ED25519_PRIVATE_KEY }}
+          APP_VERSION: ${{ needs.build-linux.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user pynacl
+          arm64_zip="$(find release-artifacts/macos-arm64 -name '*-macos-arm64.zip' -print -quit)"
+          intel_zip="$(find release-artifacts/macos-x86_64 -name '*-macos-x86_64.zip' -print -quit)"
+          if [[ -z "${arm64_zip}" || -z "${intel_zip}" ]]; then
+            echo "macOS zip assets are required to sign Sparkle appcasts." >&2
+            exit 1
+          fi
+          mkdir -p release-artifacts/sparkle
+          python3 scripts/generate-sparkle-appcast.py \
+            --version "${APP_VERSION}" \
+            --release-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${APP_VERSION}" \
+            --arm64-zip "${arm64_zip}" \
+            --x86_64-zip "${intel_zip}" \
+            --output-dir release-artifacts/sparkle
+
       - name: Create or update latest release
         env:
           GH_TOKEN: ${{ github.token }}

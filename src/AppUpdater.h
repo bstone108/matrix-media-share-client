@@ -4,6 +4,10 @@
 #include "Domain.h"
 #include "UpdateUtilities.h"
 
+#ifdef Q_OS_MACOS
+#include "SparkleBridge.h"
+#endif
+
 #include <QObject>
 #include <QUrl>
 #include <functional>
@@ -55,6 +59,7 @@ private:
     bool verifyMacAppBundle(const QString &appBundle, QString *errorMessage) const;
     bool launchHelper(bool relaunchNow, QString *errorMessage);
     QString isRunningReason() const;
+    void ensureSparkleStarted();
     void logInfo(const QString &message);
     void logWarning(const QString &message);
     void logError(const QString &message);
@@ -73,4 +78,8 @@ private:
     qint64 downloadTotalBytes_ = -1;
     bool helperStarted_ = false;
     bool installOnExit_ = false;
+#ifdef Q_OS_MACOS
+    SparkleBridge *sparkle_ = nullptr;
+    bool sparkleStarted_ = false;
+#endif
 };

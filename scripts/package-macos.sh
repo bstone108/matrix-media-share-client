@@ -126,6 +126,11 @@ PY
 
 item_wants_entitlements() {
   local item="$1"
+  # Sparkle's nested XPC/Updater/Autoupdate binaries must not inherit this app's
+  # JIT entitlements. Sign them with hardened runtime only.
+  if [[ "${item}" == *"/Sparkle.framework/"* ]]; then
+    return 1
+  fi
   if [[ -d "${item}" && "${item}" == *.app ]]; then
     return 0
   fi
@@ -135,6 +140,23 @@ item_wants_entitlements() {
     return 1
   fi
   return 0
+}
+
+restore_sparkle_framework() {
+  local dest="${STAGED_APP}/Contents/Frameworks"
+  local src=""
+  mkdir -p "${dest}"
+  if [[ -d "${BUILD_DIR}/${APP_NAME}.app/Contents/Frameworks/Sparkle.framework" ]]; then
+    src="${BUILD_DIR}/${APP_NAME}.app/Contents/Frameworks/Sparkle.framework"
+  else
+    src="$(find "${BUILD_DIR}" -type d -name 'Sparkle.framework' | head -n 1 || true)"
+  fi
+  if [[ -z "${src}" || ! -d "${src}" ]]; then
+    echo "Sparkle.framework is missing after the Mac build." >&2
+    exit 1
+  fi
+  rm -rf "${dest}/Sparkle.framework"
+  cp -R "${src}" "${dest}/Sparkle.framework"
 }
 
 sign_item() {
@@ -380,6 +402,9 @@ if [[ -d "${MATRIX_MEDIA_ARCHIVER_SQLDRIVER_DIR}" ]]; then
 fi
 
 "${MACDEPLOYQT_BIN}" "${STAGED_APP}" -always-overwrite
+
+# macdeployqt can omit or rewrite non-Qt frameworks. Re-embed Sparkle before signing.
+restore_sparkle_framework
 
 # Clear Finder/resource metadata before signing. Leftover xattrs can produce a
 # malformed signature that Finder refuses to launch on Apple Silicon.

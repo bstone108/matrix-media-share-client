@@ -22,6 +22,9 @@ private slots:
     void unixHelperReplacesAppImageAfterPidExits();
     void unixHelperOverlaysDirectoryAfterPidExits();
     void linuxNonAppImageUsesDownloadLinkOnly();
+    void linuxWritableAppImageReplacesInPlace();
+    void windowsHelperElevatesInsteadOfOpeningABrowser();
+    void windowsHelperArgumentsAreNamed();
 };
 
 void UpdateUtilityTests::versionComparisonTreatsDateBuildTagsAsNewer()
@@ -225,6 +228,63 @@ void UpdateUtilityTests::linuxNonAppImageUsesDownloadLinkOnly()
 #else
     QSKIP("Linux-only install-mode check");
 #endif
+}
+
+void UpdateUtilityTests::linuxWritableAppImageReplacesInPlace()
+{
+#ifdef Q_OS_LINUX
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString appImage = dir.filePath(QStringLiteral("MatrixMediaShareClientQt-x86_64.AppImage"));
+    QFile file(appImage);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write("appimage");
+    file.close();
+    QVERIFY(QFile::setPermissions(
+        appImage,
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner));
+
+    qputenv("APPIMAGE", appImage.toUtf8());
+    QCOMPARE(UpdateUtilities::currentInstallMode(), UpdateInstallMode::ReplaceAppImage);
+    QCOMPARE(UpdateUtilities::currentInstallDestination(), QDir::cleanPath(appImage));
+    qunsetenv("APPIMAGE");
+#else
+    QSKIP("Linux-only AppImage replace check");
+#endif
+}
+
+void UpdateUtilityTests::windowsHelperElevatesInsteadOfOpeningABrowser()
+{
+    const QString script = UpdateUtilities::windowsUpdateHelperScript();
+    QVERIFY(script.contains(QStringLiteral("-Verb RunAs")));
+    QVERIFY(script.contains(QStringLiteral("Copy-Item")));
+    QVERIFY(!script.contains(QStringLiteral("http://"), Qt::CaseInsensitive));
+    QVERIFY(!script.contains(QStringLiteral("https://"), Qt::CaseInsensitive));
+    QVERIFY(!script.contains(QStringLiteral("explorer.exe"), Qt::CaseInsensitive));
+}
+
+void UpdateUtilityTests::windowsHelperArgumentsAreNamed()
+{
+    UpdateHelperSpec spec;
+    spec.pid = 42;
+    spec.sourcePath = QStringLiteral("C:/staged");
+    spec.destinationPath = QStringLiteral("C:/install");
+    spec.relaunch = true;
+    spec.relaunchPath = QStringLiteral("C:/install/MatrixMediaShareClientQt.exe");
+    const QStringList arguments = UpdateUtilities::windowsHelperArguments(spec);
+    QCOMPARE(arguments,
+             QStringList({
+                 QStringLiteral("-ProcessId"),
+                 QStringLiteral("42"),
+                 QStringLiteral("-Source"),
+                 QStringLiteral("C:/staged"),
+                 QStringLiteral("-Destination"),
+                 QStringLiteral("C:/install"),
+                 QStringLiteral("-Relaunch"),
+                 QStringLiteral("1"),
+                 QStringLiteral("-RelaunchPath"),
+                 QStringLiteral("C:/install/MatrixMediaShareClientQt.exe"),
+             }));
 }
 
 QTEST_MAIN(UpdateUtilityTests)

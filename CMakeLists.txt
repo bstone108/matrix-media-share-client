@@ -442,14 +442,21 @@ set(MATRIX_MEDIA_ARCHIVER_QT_SOURCES
 )
 
 if(APPLE)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AcquireSparkle.cmake)
     list(APPEND MATRIX_MEDIA_ARCHIVER_QT_SOURCES
         src/WebVideoWidget.mm
+        src/SparkleBridge.mm
+        src/SparkleBridge.h
         ${MATRIX_MEDIA_ARCHIVER_APP_ICON_ICNS}
     )
     set_source_files_properties(${MATRIX_MEDIA_ARCHIVER_APP_ICON_ICNS}
         PROPERTIES MACOSX_PACKAGE_LOCATION "Resources"
     )
     set_source_files_properties(src/WebVideoWidget.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_source_files_properties(src/SparkleBridge.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc -F${SPARKLE_ROOT}"
+        LANGUAGE OBJCXX
+    )
 else()
     list(APPEND MATRIX_MEDIA_ARCHIVER_QT_SOURCES
         src/WebVideoWidget.cpp
@@ -493,13 +500,44 @@ if(APPLE)
     if(MATRIX_MEDIA_ARCHIVER_WEBKIT_FRAMEWORK)
         target_link_libraries(MatrixMediaShareClientQt PRIVATE ${MATRIX_MEDIA_ARCHIVER_WEBKIT_FRAMEWORK})
     endif()
+    target_compile_options(MatrixMediaShareClientQt PRIVATE "-F${SPARKLE_ROOT}")
+    target_link_libraries(MatrixMediaShareClientQt PRIVATE
+        "-F${SPARKLE_ROOT}"
+        "-framework Sparkle"
+        "-framework Foundation"
+        "-framework AppKit"
+        "-Wl,-rpath,@executable_path/../Frameworks"
+    )
+    target_compile_definitions(MatrixMediaShareClientQt PRIVATE MATRIX_MEDIA_SHARE_CLIENT_USE_SPARKLE=1)
+    set(MACOSX_BUNDLE_EXECUTABLE_NAME "MatrixMediaShareClientQt")
+    set(MACOSX_BUNDLE_BUNDLE_NAME "Matrix Media Share Client")
+    set(MACOSX_BUNDLE_BUNDLE_VERSION "${MATRIX_MEDIA_ARCHIVER_APP_VERSION}")
+    set(MACOSX_BUNDLE_COPYRIGHT "Copyright © Brandon Browning Stone")
+    set(MACOSX_BUNDLE_GUI_IDENTIFIER "com.bstone108.MatrixMediaShareClientQt")
+    set(MACOSX_BUNDLE_ICON_FILE "MatrixMediaArchiverQt.icns")
+    set(MACOSX_BUNDLE_SHORT_VERSION_STRING "${MATRIX_MEDIA_ARCHIVER_APP_VERSION}")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/Info.plist.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
+        @ONLY
+    )
     set_target_properties(MatrixMediaShareClientQt PROPERTIES
-        MACOSX_BUNDLE_BUNDLE_NAME "Matrix Media Share Client"
-        MACOSX_BUNDLE_BUNDLE_VERSION "${MATRIX_MEDIA_ARCHIVER_APP_VERSION}"
-        MACOSX_BUNDLE_COPYRIGHT "Copyright © Brandon Browning Stone"
-        MACOSX_BUNDLE_GUI_IDENTIFIER "com.bstone108.MatrixMediaShareClientQt"
-        MACOSX_BUNDLE_ICON_FILE MatrixMediaArchiverQt.icns
-        MACOSX_BUNDLE_SHORT_VERSION_STRING "${MATRIX_MEDIA_ARCHIVER_APP_VERSION}"
+        MACOSX_BUNDLE_BUNDLE_NAME "${MACOSX_BUNDLE_BUNDLE_NAME}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${MACOSX_BUNDLE_BUNDLE_VERSION}"
+        MACOSX_BUNDLE_COPYRIGHT "${MACOSX_BUNDLE_COPYRIGHT}"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "${MACOSX_BUNDLE_GUI_IDENTIFIER}"
+        MACOSX_BUNDLE_ICON_FILE "${MACOSX_BUNDLE_ICON_FILE}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${MACOSX_BUNDLE_SHORT_VERSION_STRING}"
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
+    )
+    add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_BUNDLE_DIR:MatrixMediaShareClientQt>/Contents/Frameworks"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${SPARKLE_FRAMEWORK}"
+            "$<TARGET_BUNDLE_DIR:MatrixMediaShareClientQt>/Contents/Frameworks/Sparkle.framework"
+        COMMENT "Bundling Sparkle.framework"
+        VERBATIM
     )
 endif()
 
@@ -675,4 +713,12 @@ if(MATRIX_MEDIA_ARCHIVER_BUILD_TESTS)
     enable_testing()
     add_test(NAME MatrixMediaArchiverQtTests COMMAND MatrixMediaArchiverQtTests)
     add_test(NAME MatrixMediaShareClientUpdateTests COMMAND MatrixMediaShareClientUpdateTests)
+
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME GenerateSparkleAppcastTests
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_generate_sparkle_appcast.py
+        )
+    endif()
 endif()

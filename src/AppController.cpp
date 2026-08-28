@@ -102,6 +102,8 @@ AppController::AppController(QObject *parent)
         persistUpdateCheckState();
         if (forcePrompt || UpdateUtilities::shouldNagForVersion(version, currentVersion(), updateCheckState_.lastNotifiedVersion)) {
             emit stagedUpdateReady(version);
+        } else {
+            updater_->scheduleInstallOnExit();
         }
         emit stateChanged();
     });

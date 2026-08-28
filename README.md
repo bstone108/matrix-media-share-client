@@ -25,7 +25,7 @@ It is seeded from Matrix Media Archiver, but this app is now oriented around:
   - send Matrix upload when the file fits the detected limit
   - fall back to preview-plus-link behavior when it does not
 - `Rooms`, `Browser`, `Library`, `Transfers`, `Settings`, and `Verification` pages
-- in-app updates from GitHub Releases (about every two days): Mac/Windows auto-install on restart, Linux AppImage replace-in-place when writable
+- in-app updates from GitHub Releases (about every two days): macOS Sparkle auto-install, Windows in-app zip install (never a browser fallback), Linux AppImage replace-in-place when writable
 
 ## Build
 
@@ -80,7 +80,7 @@ Release tags are `v{version}`, for example `v2026.8.24.1`. The Rust backend `Car
 
 The desktop workflow builds on pull requests that touch desktop sources, on `v*` tags, and on `workflow_dispatch`. Pull-request and other non-release compiles stay unsigned: they do not import the Developer ID certificate, do not set `MACOS_CODESIGN_IDENTITY`, and do not call `notarytool` or stapler.
 
-It publishes GitHub releases from `v*` tags or `workflow_dispatch` after every platform build succeeds. Only those real releases Developer ID sign (hardened runtime + timestamp), notarize, and staple the macOS `.app`, the `.dmg`, and the zip. The zip of the `.app` is the notary vehicle (`ditto -c -k --keepParent`); the ticket is stapled onto the `.app`, and that stapled `.app` is what ships in the release zip. If the run was started from a `v*` tag, publish fails unless that tag matches `VERSION.txt`.
+It publishes GitHub releases from `v*` tags or `workflow_dispatch` after every platform build succeeds. Only those real releases Developer ID sign (hardened runtime + timestamp), notarize, and staple the macOS `.app`, the `.dmg`, and the zip. The zip of the `.app` is the notary vehicle (`ditto -c -k --keepParent`); the ticket is stapled onto the `.app`, and that stapled `.app` is what ships in the release zip. Publish also signs Sparkle appcasts (`appcast-macos-arm64.xml` and `appcast-macos-x86_64.xml`) with the `SPARKLE_ED25519_PRIVATE_KEY` Actions secret; pull-request CI never generates appcasts and never notarizes. If the run was started from a `v*` tag, publish fails unless that tag matches `VERSION.txt`.
 
 The workflow currently prepares platform runtimes like this:
 

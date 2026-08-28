@@ -399,18 +399,17 @@ How it works:
 
 - the app checks GitHub Releases about every two days, and also whenever you click `Check For Updates`
 - it compares the running `VERSION.txt` / app version against the latest published tag, for example `v2026.8.28.1`
-- when a newer version is available, it downloads the matching platform/arch artifact and stages it
-- a `Restart now` / `Later` prompt appears once that download is staged
-- `Restart now` quits, installs, and relaunches
+- a `Restart now` / `Later` prompt appears once an update is staged
+- `Restart now` installs immediately and relaunches
 - `Later` does not prompt again for that version; the staged update still installs the next time the app exits
 - the same version is never prompted twice
 
 Platform details:
 
-- macOS downloads the arch-specific zip of the stapled `.app` (`macos-arm64.zip` or `macos-x86_64.zip`), verifies the Developer ID signature, and replaces the running bundle on restart
-- Windows downloads the arch-specific zip (`windows-x64.zip` or `windows-arm64.zip`) and overlays the install folder after the app exits. This is an in-app install, not a browser download link
+- macOS uses Sparkle. It reads the arch-specific signed appcast (`appcast-macos-arm64.xml` or `appcast-macos-x86_64.xml`), downloads the matching Developer ID signed, notarized, and stapled zip, stages it, and shows `Restart now` / `Later`
+- Windows always auto-updates in-app: it downloads the matching arch zip (`windows-x64.zip` or `windows-arm64.zip`), stages it, and installs on `Restart now` or the next exit. If the install folder is not writable, the helper elevates. Windows never falls back to a browser download link
 - Linux AppImage replaces the running AppImage in place when that file is writable. If it is not writable, or you are not running an AppImage, you get a one-time notice with a GitHub download link for that version
-- `Open Latest Release` remains available as a manual fallback to the GitHub release page
+- `Open Latest Release` remains available as a manual way to open the GitHub release page
 
 ## Important Quirks And Behavior
 

@@ -265,17 +265,9 @@ bool canReplacePath(const QString &path)
 UpdateInstallMode currentInstallMode()
 {
 #if defined(Q_OS_MACOS)
-    const QString destination = currentInstallDestination();
-    if (destination.endsWith(QStringLiteral(".app"), Qt::CaseInsensitive) && QFileInfo(destination).isDir()) {
-        return UpdateInstallMode::ReplaceAppBundle;
-    }
-    return UpdateInstallMode::DownloadLinkOnly;
+    return UpdateInstallMode::ReplaceAppBundle;
 #elif defined(Q_OS_WIN)
-    const QString destination = currentInstallDestination();
-    if (!destination.isEmpty() && canReplacePath(destination)) {
-        return UpdateInstallMode::OverlayDirectory;
-    }
-    return UpdateInstallMode::DownloadLinkOnly;
+    return UpdateInstallMode::OverlayDirectory;
 #else
     if (isRunningFromAppImage() && canReplacePath(linuxAppImagePath())) {
         return UpdateInstallMode::ReplaceAppImage;
@@ -459,35 +451,64 @@ fi
 QString windowsUpdateHelperScript()
 {
     return QStringLiteral(
-        R"CMD(@echo off
-setlocal EnableExtensions
-set "PID=%~1"
-set "SRC=%~2"
-set "DST=%~3"
-set "RELAUNCH=%~4"
-set "RELAUNCH_PATH=%~5"
-
-if "%PID%"=="" exit /b 1
-if "%SRC%"=="" exit /b 1
-if "%DST%"=="" exit /b 1
-
-:wait
-tasklist /FI "PID eq %PID%" | findstr /I /C:" %PID% " >nul
-if not errorlevel 1 (
-  timeout /T 1 /NOBREAK >nul
-  goto wait
+        R"PS(# Matrix Media Share Client Windows update helper. Do not open a browser.
+param(
+    [Parameter(Mandatory = $true)][int]$ProcessId,
+    [Parameter(Mandatory = $true)][string]$Source,
+    [Parameter(Mandatory = $true)][string]$Destination,
+    [Parameter(Mandatory = $true)][string]$Relaunch,
+    [string]$RelaunchPath = ""
 )
 
-if not exist "%DST%" mkdir "%DST%"
-robocopy "%SRC%" "%DST%" /E /IS /IT /R:3 /W:1 >nul
-set "RC=%ERRORLEVEL%"
-if %RC% GEQ 8 exit /b %RC%
+function Wait-ForProcessExit {
+    param([int]$TargetPid)
+    for ($i = 0; $i -lt 240; $i++) {
+        if (-not (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue)) {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw "Timed out waiting for process $TargetPid to exit."
+}
 
-if "%RELAUNCH%"=="1" (
-  start "" "%RELAUNCH_PATH%"
-)
-exit /b 0
-)CMD");
+function Install-UpdatePayload {
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        New-Item -ItemType Directory -Path $Destination | Out-Null
+    }
+    Copy-Item -Path (Join-Path $Source '*') -Destination $Destination -Recurse -Force
+}
+
+Wait-ForProcessExit -TargetPid $ProcessId
+$installed = $false
+try {
+    Install-UpdatePayload
+    $installed = $true
+} catch {
+    $sourceLiteral = $Source.Replace("'", "''")
+    $destinationLiteral = $Destination.Replace("'", "''")
+    $elevated = @"
+if (-not (Test-Path -LiteralPath '$destinationLiteral')) { New-Item -ItemType Directory -Path '$destinationLiteral' | Out-Null }
+Copy-Item -Path (Join-Path '$sourceLiteral' '*') -Destination '$destinationLiteral' -Recurse -Force
+"@
+    $elevatedProcess = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-Command", $elevated
+    )
+    if ($null -eq $elevatedProcess -or $elevatedProcess.ExitCode -ne 0) {
+        throw "Elevated Windows update install failed."
+    }
+    $installed = $true
+}
+
+if (-not $installed) {
+    throw "Failed to install the staged Windows update."
+}
+
+if ($Relaunch -eq "1" -and $RelaunchPath) {
+    Start-Process -FilePath $RelaunchPath
+}
+)PS");
 }
 
 bool writeTextFile(const QString &path, const QString &contents, QString *errorMessage)
@@ -545,10 +566,15 @@ QStringList unixHelperArguments(const UpdateHelperSpec &spec)
 QStringList windowsHelperArguments(const UpdateHelperSpec &spec)
 {
     return {
+        QStringLiteral("-ProcessId"),
         QString::number(spec.pid),
+        QStringLiteral("-Source"),
         spec.sourcePath,
+        QStringLiteral("-Destination"),
         spec.destinationPath,
+        QStringLiteral("-Relaunch"),
         spec.relaunch ? QStringLiteral("1") : QStringLiteral("0"),
+        QStringLiteral("-RelaunchPath"),
         spec.relaunchPath,
     };
 }

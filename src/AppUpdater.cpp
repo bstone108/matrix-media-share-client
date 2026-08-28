@@ -28,6 +28,12 @@ AppUpdater::AppUpdater(const AppPaths &paths, QObject *parent)
     , network_(new QNetworkAccessManager(this))
     , installMode_(UpdateUtilities::currentInstallMode())
 {
+#ifdef Q_OS_MACOS
+    sparkle_ = new SparkleBridge(this);
+    connect(sparkle_, &SparkleBridge::stateChanged, this, &AppUpdater::stateChanged);
+    connect(sparkle_, &SparkleBridge::stagedUpdateReady, this, &AppUpdater::stagedUpdateReady);
+    connect(sparkle_, &SparkleBridge::updateFailed, this, &AppUpdater::updateFailed);
+#endif
 }
 
 void AppUpdater::setLogCallbacks(LogFn info, LogFn warning, LogFn error)
@@ -67,6 +73,18 @@ void AppUpdater::handleAvailableRelease(const UpdateCheckState &state, const boo
         return;
     }
 
+#ifdef Q_OS_MACOS
+    ensureSparkleStarted();
+    if (sparkle_ != nullptr) {
+        if (!sparkle_->isStarted()) {
+            emit updateFailed(QStringLiteral("Sparkle failed to start."));
+            return;
+        }
+        sparkle_->checkForUpdates(forcePrompt);
+        return;
+    }
+#endif
+
     if (installMode_ == UpdateInstallMode::DownloadLinkOnly) {
         emit downloadLinkNotice(
             UpdateUtilities::normalizeReleaseVersion(state.latestVersion),
@@ -77,18 +95,16 @@ void AppUpdater::handleAvailableRelease(const UpdateCheckState &state, const boo
     }
 
     if (hasStagedUpdate()
-        && UpdateUtilities::compareVersionStrings(stagedVersion_, state.latestVersion) == 0
-        && QFileInfo::exists(stagedPayloadPath_)) {
-        emit stagedUpdateReady(stagedVersion_, forcePrompt);
+        && UpdateUtilities::compareVersionStrings(stagedVersion(), state.latestVersion) == 0
+        && (stagedPayloadPath_.isEmpty() || QFileInfo::exists(stagedPayloadPath_))) {
+        emit stagedUpdateReady(stagedVersion(), forcePrompt);
         return;
     }
 
     if (state.latestAssetUrl.trimmed().isEmpty()) {
-        emit downloadLinkNotice(
-            UpdateUtilities::normalizeReleaseVersion(state.latestVersion),
-            QUrl(state.latestReleaseUrl),
-            QStringLiteral("No matching download was published for this platform."),
-            forcePrompt);
+        const QString message = QStringLiteral("No matching download was published for this platform.");
+        logError(message);
+        emit updateFailed(message);
         return;
     }
 
@@ -100,13 +116,23 @@ void AppUpdater::applyStagedUpdate(const bool relaunchNow)
     if (!startPendingInstallHelper(relaunchNow)) {
         return;
     }
+#ifdef Q_OS_MACOS
+    Q_UNUSED(relaunchNow);
+#else
     if (relaunchNow) {
         QCoreApplication::quit();
     }
+#endif
 }
 
 void AppUpdater::scheduleInstallOnExit()
 {
+#ifdef Q_OS_MACOS
+    if (sparkle_ != nullptr && sparkle_->hasStagedUpdate()) {
+        sparkle_->installLater();
+        return;
+    }
+#endif
     if (hasStagedUpdate()) {
         installOnExit_ = true;
     }
@@ -117,6 +143,17 @@ bool AppUpdater::startPendingInstallHelper(const bool relaunchNow)
     if (helperStarted_) {
         return true;
     }
+#ifdef Q_OS_MACOS
+    if (sparkle_ != nullptr && sparkle_->hasStagedUpdate()) {
+        if (relaunchNow) {
+            sparkle_->installNow();
+        } else {
+            sparkle_->installLater();
+        }
+        helperStarted_ = true;
+        return true;
+    }
+#endif
     if (!hasStagedUpdate()) {
         return false;
     }
@@ -138,26 +175,52 @@ bool AppUpdater::startPendingInstallHelper(const bool relaunchNow)
 
 bool AppUpdater::isBusy() const
 {
+#ifdef Q_OS_MACOS
+    if (sparkle_ != nullptr && sparkle_->isBusy()) {
+        return true;
+    }
+#endif
     return downloadReply_ != nullptr;
 }
 
 bool AppUpdater::isDownloading() const
 {
+#ifdef Q_OS_MACOS
+    if (sparkle_ != nullptr && sparkle_->isDownloading()) {
+        return true;
+    }
+#endif
     return downloadReply_ != nullptr;
 }
 
 bool AppUpdater::hasStagedUpdate() const
 {
+#ifdef Q_OS_MACOS
+    if (sparkle_ != nullptr && sparkle_->hasStagedUpdate()) {
+        return true;
+    }
+#endif
     return !stagedVersion_.isEmpty() && QFileInfo::exists(stagedPayloadPath_);
 }
 
 bool AppUpdater::canAutoInstall() const
 {
+#ifdef Q_OS_WIN
+    return true;
+#endif
+#ifdef Q_OS_MACOS
+    return true;
+#endif
     return installMode_ != UpdateInstallMode::DownloadLinkOnly;
 }
 
 QString AppUpdater::stagedVersion() const
 {
+#ifdef Q_OS_MACOS
+    if (sparkle_ != nullptr && !sparkle_->stagedVersion().isEmpty()) {
+        return sparkle_->stagedVersion();
+    }
+#endif
     return stagedVersion_;
 }
 
@@ -169,11 +232,18 @@ QString AppUpdater::stagedPayloadPath() const
 QString AppUpdater::statusText(const QString &currentVersion, const UpdateCheckState &state) const
 {
     if (isDownloading()) {
-        if (downloadTotalBytes_ > 0) {
+#ifdef Q_OS_MACOS
+        const qint64 received = sparkle_ != nullptr ? sparkle_->downloadReceivedBytes() : downloadReceivedBytes_;
+        const qint64 total = sparkle_ != nullptr ? sparkle_->downloadTotalBytes() : downloadTotalBytes_;
+#else
+        const qint64 received = downloadReceivedBytes_;
+        const qint64 total = downloadTotalBytes_;
+#endif
+        if (total > 0) {
             return QStringLiteral("Downloading update %1 (%2 / %3 MB)...")
                 .arg(UpdateUtilities::normalizeReleaseVersion(state.latestVersion))
-                .arg(QString::number(static_cast<double>(downloadReceivedBytes_) / (1024.0 * 1024.0), 'f', 1))
-                .arg(QString::number(static_cast<double>(downloadTotalBytes_) / (1024.0 * 1024.0), 'f', 1));
+                .arg(QString::number(static_cast<double>(received) / (1024.0 * 1024.0), 'f', 1))
+                .arg(QString::number(static_cast<double>(total) / (1024.0 * 1024.0), 'f', 1));
         }
         return QStringLiteral("Downloading update %1...")
             .arg(UpdateUtilities::normalizeReleaseVersion(state.latestVersion));
@@ -224,9 +294,23 @@ QString AppUpdater::extractPath() const
 QString AppUpdater::helperPath() const
 {
 #ifdef Q_OS_WIN
-    return QDir::temp().filePath(QStringLiteral("matrix-media-share-client-update.cmd"));
+    return QDir::temp().filePath(QStringLiteral("matrix-media-share-client-update.ps1"));
 #else
     return QDir::temp().filePath(QStringLiteral("matrix-media-share-client-update.sh"));
+#endif
+}
+
+void AppUpdater::ensureSparkleStarted()
+{
+#ifdef Q_OS_MACOS
+    if (sparkle_ == nullptr || sparkleStarted_) {
+        return;
+    }
+    sparkleStarted_ = true;
+    QString sparkleError;
+    if (!sparkle_->start(&sparkleError)) {
+        logWarning(sparkleError.isEmpty() ? QStringLiteral("Sparkle failed to start.") : sparkleError);
+    }
 #endif
 }
 
@@ -237,10 +321,6 @@ QString AppUpdater::isRunningReason() const
         return QStringLiteral("This Linux build is not a writable AppImage.");
     }
     return QStringLiteral("This AppImage is not writable.");
-#elif defined(Q_OS_WIN)
-    return QStringLiteral("The current Windows install folder is not writable.");
-#elif defined(Q_OS_MACOS)
-    return QStringLiteral("This Mac app bundle cannot be replaced automatically.");
 #else
     return QStringLiteral("This install cannot be replaced automatically.");
 #endif
@@ -455,8 +535,14 @@ bool AppUpdater::launchHelper(const bool relaunchNow, QString *errorMessage)
     spec.relaunchPath = UpdateUtilities::currentRelaunchPath();
 
 #ifdef Q_OS_WIN
-    const QString program = QStringLiteral("cmd.exe");
-    QStringList arguments = {QStringLiteral("/C"), helperPath()};
+    const QString program = QStringLiteral("powershell.exe");
+    QStringList arguments = {
+        QStringLiteral("-NoProfile"),
+        QStringLiteral("-ExecutionPolicy"),
+        QStringLiteral("Bypass"),
+        QStringLiteral("-File"),
+        helperPath(),
+    };
     arguments.append(UpdateUtilities::windowsHelperArguments(spec));
 #else
     const QString program = QStringLiteral("/bin/bash");
