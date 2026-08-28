@@ -11,9 +11,9 @@ from __future__ import annotations
 import argparse
 import base64
 import calendar
+import html
 import os
 import sys
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import formatdate
 from pathlib import Path
@@ -73,32 +73,24 @@ def _write_appcast(
     signature: str,
     pub_date: datetime,
 ) -> None:
-    ET.register_namespace("sparkle", SPARKLE_NS)
-    rss = ET.Element("rss", {"version": "2.0", "xmlns:sparkle": SPARKLE_NS})
-    channel = ET.SubElement(rss, "channel")
-    ET.SubElement(channel, "title").text = "Matrix Media Share Client"
-    ET.SubElement(channel, "link").text = html_url
-    item = ET.SubElement(channel, "item")
-    ET.SubElement(item, "title").text = title
-    ET.SubElement(item, "pubDate").text = _rfc822(pub_date)
-    ET.SubElement(item, f"{{{SPARKLE_NS}}}version").text = version
-    ET.SubElement(item, f"{{{SPARKLE_NS}}}shortVersionString").text = version
-    ET.SubElement(item, "link").text = html_url
-    ET.SubElement(
-        item,
-        "enclosure",
-        {
-            "url": enclosure_url,
-            "length": str(zip_path.stat().st_size),
-            "type": "application/octet-stream",
-            f"{{{SPARKLE_NS}}}edSignature": signature,
-            f"{{{SPARKLE_NS}}}os": "macos",
-        },
-    )
-    tree = ET.ElementTree(rss)
-    ET.indent(tree, space="  ")
+    xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="{html.escape(SPARKLE_NS, quote=True)}">
+  <channel>
+    <title>Matrix Media Share Client</title>
+    <link>{html.escape(html_url)}</link>
+    <item>
+      <title>{html.escape(title)}</title>
+      <pubDate>{html.escape(_rfc822(pub_date))}</pubDate>
+      <sparkle:version>{html.escape(version)}</sparkle:version>
+      <sparkle:shortVersionString>{html.escape(version)}</sparkle:shortVersionString>
+      <link>{html.escape(html_url)}</link>
+      <enclosure url="{html.escape(enclosure_url, quote=True)}" length="{zip_path.stat().st_size}" type="application/octet-stream" sparkle:edSignature="{html.escape(signature, quote=True)}" sparkle:os="macos" />
+    </item>
+  </channel>
+</rss>
+"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tree.write(output_path, encoding="utf-8", xml_declaration=True)
+    output_path.write_text(xml, encoding="utf-8")
 
 
 def main() -> int:
