@@ -428,6 +428,10 @@ set(MATRIX_MEDIA_ARCHIVER_QT_SOURCES
     src/ProcessMatrixClientBackend.h
     src/SecretStore.cpp
     src/SecretStore.h
+    src/UpdateUtilities.cpp
+    src/UpdateUtilities.h
+    src/AppUpdater.cpp
+    src/AppUpdater.h
     src/VideoFrameWidget.cpp
     src/VideoFrameWidget.h
     src/VlcPlayerWidget.cpp
@@ -654,6 +658,21 @@ if(MATRIX_MEDIA_ARCHIVER_BUILD_TESTS)
             Qt6::Test
     )
 
+    qt_add_executable(MatrixMediaShareClientUpdateTests
+        tests/UpdateUtilityTests.cpp
+        src/UpdateUtilities.cpp
+        src/UpdateUtilities.h
+    )
+
+    target_include_directories(MatrixMediaShareClientUpdateTests PRIVATE src)
+
+    target_link_libraries(MatrixMediaShareClientUpdateTests
+        PRIVATE
+            Qt6::Core
+            Qt6::Test
+    )
+
     enable_testing()
     add_test(NAME MatrixMediaArchiverQtTests COMMAND MatrixMediaArchiverQtTests)
+    add_test(NAME MatrixMediaShareClientUpdateTests COMMAND MatrixMediaShareClientUpdateTests)
 endif()

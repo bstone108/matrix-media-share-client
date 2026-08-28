@@ -382,7 +382,8 @@ UpdateCheckState AppDatabase::loadUpdateCheckState() const
 
     QSqlQuery query(database_);
     query.prepare(QStringLiteral(
-        "SELECT last_checked_at, latest_version, latest_release_url, latest_release_name, latest_published_at, last_error "
+        "SELECT last_checked_at, latest_version, latest_release_url, latest_release_name, latest_published_at, last_error, "
+        "latest_asset_name, latest_asset_url, latest_asset_size, last_notified_version, pending_install_version, pending_install_path "
         "FROM update_check_state WHERE id = 1"));
     if (!query.exec() || !query.next()) {
         return state;
@@ -394,6 +395,12 @@ UpdateCheckState AppDatabase::loadUpdateCheckState() const
     state.latestReleaseName = query.value(3).toString();
     state.latestPublishedAt = QDateTime::fromString(query.value(4).toString(), Qt::ISODateWithMs);
     state.lastError = query.value(5).toString();
+    state.latestAssetName = query.value(6).toString();
+    state.latestAssetUrl = query.value(7).toString();
+    state.latestAssetSize = query.value(8).isNull() ? -1 : query.value(8).toLongLong();
+    state.lastNotifiedVersion = query.value(9).toString();
+    state.pendingInstallVersion = query.value(10).toString();
+    state.pendingInstallPath = query.value(11).toString();
     return state;
 }
 
@@ -402,21 +409,34 @@ bool AppDatabase::saveUpdateCheckState(const UpdateCheckState &state)
     QSqlQuery query(database_);
     query.prepare(QStringLiteral(
         "INSERT INTO update_check_state ("
-        "id, last_checked_at, latest_version, latest_release_url, latest_release_name, latest_published_at, last_error"
-        ") VALUES (1, ?, ?, ?, ?, ?, ?) "
+        "id, last_checked_at, latest_version, latest_release_url, latest_release_name, latest_published_at, last_error, "
+        "latest_asset_name, latest_asset_url, latest_asset_size, last_notified_version, pending_install_version, pending_install_path"
+        ") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(id) DO UPDATE SET "
         "last_checked_at = excluded.last_checked_at, "
         "latest_version = excluded.latest_version, "
         "latest_release_url = excluded.latest_release_url, "
         "latest_release_name = excluded.latest_release_name, "
         "latest_published_at = excluded.latest_published_at, "
-        "last_error = excluded.last_error"));
+        "last_error = excluded.last_error, "
+        "latest_asset_name = excluded.latest_asset_name, "
+        "latest_asset_url = excluded.latest_asset_url, "
+        "latest_asset_size = excluded.latest_asset_size, "
+        "last_notified_version = excluded.last_notified_version, "
+        "pending_install_version = excluded.pending_install_version, "
+        "pending_install_path = excluded.pending_install_path"));
     query.addBindValue(state.lastCheckedAt.toUTC().toString(Qt::ISODateWithMs));
     query.addBindValue(state.latestVersion);
     query.addBindValue(state.latestReleaseUrl);
     query.addBindValue(state.latestReleaseName);
     query.addBindValue(state.latestPublishedAt.toUTC().toString(Qt::ISODateWithMs));
     query.addBindValue(state.lastError);
+    query.addBindValue(state.latestAssetName);
+    query.addBindValue(state.latestAssetUrl);
+    query.addBindValue(state.latestAssetSize);
+    query.addBindValue(state.lastNotifiedVersion);
+    query.addBindValue(state.pendingInstallVersion);
+    query.addBindValue(state.pendingInstallPath);
     return query.exec();
 }
 
@@ -949,8 +969,32 @@ void AppDatabase::initializeSchema()
         "latest_release_url TEXT NOT NULL DEFAULT '',"
         "latest_release_name TEXT NOT NULL DEFAULT '',"
         "latest_published_at TEXT,"
-        "last_error TEXT NOT NULL DEFAULT ''"
+        "last_error TEXT NOT NULL DEFAULT '',"
+        "latest_asset_name TEXT NOT NULL DEFAULT '',"
+        "latest_asset_url TEXT NOT NULL DEFAULT '',"
+        "latest_asset_size INTEGER,"
+        "last_notified_version TEXT NOT NULL DEFAULT '',"
+        "pending_install_version TEXT NOT NULL DEFAULT '',"
+        "pending_install_path TEXT NOT NULL DEFAULT ''"
         ")"));
+    if (!columnExists(database_, QStringLiteral("update_check_state"), QStringLiteral("latest_asset_name"))) {
+        execute(QStringLiteral("ALTER TABLE update_check_state ADD COLUMN latest_asset_name TEXT NOT NULL DEFAULT ''"));
+    }
+    if (!columnExists(database_, QStringLiteral("update_check_state"), QStringLiteral("latest_asset_url"))) {
+        execute(QStringLiteral("ALTER TABLE update_check_state ADD COLUMN latest_asset_url TEXT NOT NULL DEFAULT ''"));
+    }
+    if (!columnExists(database_, QStringLiteral("update_check_state"), QStringLiteral("latest_asset_size"))) {
+        execute(QStringLiteral("ALTER TABLE update_check_state ADD COLUMN latest_asset_size INTEGER"));
+    }
+    if (!columnExists(database_, QStringLiteral("update_check_state"), QStringLiteral("last_notified_version"))) {
+        execute(QStringLiteral("ALTER TABLE update_check_state ADD COLUMN last_notified_version TEXT NOT NULL DEFAULT ''"));
+    }
+    if (!columnExists(database_, QStringLiteral("update_check_state"), QStringLiteral("pending_install_version"))) {
+        execute(QStringLiteral("ALTER TABLE update_check_state ADD COLUMN pending_install_version TEXT NOT NULL DEFAULT ''"));
+    }
+    if (!columnExists(database_, QStringLiteral("update_check_state"), QStringLiteral("pending_install_path"))) {
+        execute(QStringLiteral("ALTER TABLE update_check_state ADD COLUMN pending_install_path TEXT NOT NULL DEFAULT ''"));
+    }
 
     execute(QStringLiteral(
         "CREATE TABLE IF NOT EXISTS tracked_uploads ("

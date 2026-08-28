@@ -263,6 +263,7 @@ private:
     int logTotalCount_ = 0;
     bool logsLoadingPage_ = false;
     bool logsProblemsOnly_ = false;
+    bool updatePromptVisible_ = false;
     QString sharedItemsSignature_;
     QHash<QString, QIcon> sharedItemIconCache_;
 };

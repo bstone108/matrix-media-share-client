@@ -25,6 +25,7 @@ It is seeded from Matrix Media Archiver, but this app is now oriented around:
   - send Matrix upload when the file fits the detected limit
   - fall back to preview-plus-link behavior when it does not
 - `Rooms`, `Browser`, `Library`, `Transfers`, `Settings`, and `Verification` pages
+- in-app updates from GitHub Releases (about every two days): Mac/Windows auto-install on restart, Linux AppImage replace-in-place when writable
 
 ## Build
 

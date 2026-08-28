@@ -12,6 +12,7 @@
 
 class QTimer;
 class QNetworkAccessManager;
+class AppUpdater;
 
 class AppController : public QObject
 {
@@ -45,6 +46,7 @@ public:
     const UpdateCheckState &updateCheckState() const;
     bool isUpdateCheckInProgress() const;
     bool updateAvailable() const;
+    bool hasStagedUpdate() const;
     QString updateStatusText() const;
     QString latestReleaseSummaryText() const;
     QString latestReleasePageUrl() const;
@@ -78,11 +80,16 @@ public slots:
     void declineVerification();
     void checkForUpdates(bool force = true);
     void openLatestReleasePage();
+    void applyStagedUpdate(bool relaunchNow);
+    void deferStagedUpdate();
+    void markUpdateNotified(const QString &version);
     void dismissError();
 
 signals:
     void stateChanged();
     void userNoticeRequested(const QString &title, const QString &message);
+    void stagedUpdateReady(const QString &version);
+    void updateDownloadLinkNotice(const QString &version, const QString &pageUrl, const QString &reason);
 
 private:
     void logInfo(const QString &subsystem, const QString &message);
@@ -92,6 +99,8 @@ private:
     void scheduleRefresh();
     void updateRefreshTimer();
     void shutdownBackendForExit();
+
+    void persistUpdateCheckState();
 
     AppPaths paths_;
     AppDatabase database_;
@@ -111,4 +120,5 @@ private:
     UpdateCheckState updateCheckState_;
     bool updateCheckInProgress_ = false;
     QNetworkAccessManager *updateNetworkManager_ = nullptr;
+    AppUpdater *updater_ = nullptr;
 };
