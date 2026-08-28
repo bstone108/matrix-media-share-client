@@ -25,3 +25,12 @@ tokio-stream = "0.1"
 url = "2.5"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["serde", "v4"] }
+
+# GHSA-cq8v-f236-94qc (rand unsound with a custom logger using rand::rng()).
+# Not used by this crate. These renamed pins force Cargo to unify the two
+# leftover vulnerable lines: 0.8.5 (matrix-sdk / ruma / vodozemac / oauth2 /
+# phf_generator) and 0.9.2 (ulid via matrix-sdk-crypto). default-features =
+# false avoids enabling extra features on top of what dependents already set.
+# 0.10.2 is already patched (>= 0.10.1).
+rand08 = { package = "rand", version = "0.8.6", default-features = false }
+rand09 = { package = "rand", version = "0.9.3", default-features = false }
