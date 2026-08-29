@@ -9,6 +9,10 @@ endif()
 
 project(MatrixMediaShareClientQt VERSION ${MATRIX_MEDIA_ARCHIVER_APP_VERSION} LANGUAGES CXX)
 
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
