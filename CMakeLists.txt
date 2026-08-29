@@ -537,7 +537,9 @@ if(APPLE)
     add_custom_command(TARGET MatrixMediaShareClientQt POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory
             "$<TARGET_BUNDLE_DIR:MatrixMediaShareClientQt>/Contents/Frameworks"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        COMMAND ${CMAKE_COMMAND} -E rm -rf
+            "$<TARGET_BUNDLE_DIR:MatrixMediaShareClientQt>/Contents/Frameworks/Sparkle.framework"
+        COMMAND ditto
             "${SPARKLE_FRAMEWORK}"
             "$<TARGET_BUNDLE_DIR:MatrixMediaShareClientQt>/Contents/Frameworks/Sparkle.framework"
         COMMENT "Bundling Sparkle.framework"

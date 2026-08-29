@@ -128,7 +128,7 @@ item_wants_entitlements() {
   local item="$1"
   # Sparkle's nested XPC/Updater/Autoupdate binaries must not inherit this app's
   # JIT entitlements. Sign them with hardened runtime only.
-  if [[ "${item}" == *"/Sparkle.framework/"* ]]; then
+  if [[ "${item}" == *"/Sparkle.framework" || "${item}" == *"/Sparkle.framework/"* ]]; then
     return 1
   fi
   if [[ -d "${item}" && "${item}" == *.app ]]; then
@@ -156,7 +156,11 @@ restore_sparkle_framework() {
     exit 1
   fi
   rm -rf "${dest}/Sparkle.framework"
-  cp -R "${src}" "${dest}/Sparkle.framework"
+  if command -v ditto >/dev/null 2>&1; then
+    ditto "${src}" "${dest}/Sparkle.framework"
+  else
+    cp -R "${src}" "${dest}/Sparkle.framework"
+  fi
 }
 
 sign_item() {
@@ -179,6 +183,34 @@ sign_item() {
   fi
 }
 
+sign_sparkle_nested_bundles() {
+  local app_bundle="$1"
+  local sparkle="${app_bundle}/Contents/Frameworks/Sparkle.framework"
+  if [[ ! -d "${sparkle}" ]]; then
+    return 0
+  fi
+
+  local version_dir="${sparkle}/Versions/B"
+  if [[ ! -d "${version_dir}" && -d "${sparkle}/Versions/Current" ]]; then
+    version_dir="${sparkle}/Versions/Current"
+  fi
+
+  if [[ -d "${version_dir}/XPCServices" ]]; then
+    shopt -s nullglob
+    for xpc in "${version_dir}/XPCServices"/*.xpc; do
+      sign_item "${xpc}"
+    done
+    shopt -u nullglob
+  fi
+  if [[ -d "${version_dir}/Updater.app" ]]; then
+    sign_item "${version_dir}/Updater.app"
+  fi
+  if [[ -e "${version_dir}/Autoupdate" ]]; then
+    sign_item "${version_dir}/Autoupdate"
+  fi
+  sign_item "${sparkle}"
+}
+
 sign_app_bundle() {
   local app_bundle="$1"
 
@@ -199,18 +231,19 @@ sign_app_bundle() {
       security find-identity -v -p codesigning >&2 || true
       exit 1
     fi
-
-    while IFS= read -r macho_path; do
-      [[ -z "${macho_path}" ]] && continue
-      sign_item "${macho_path}"
-    done < <(list_macho_files "${app_bundle}")
-
-    # Sign the bundle last so the sealed resources include nested signatures.
-    sign_item "${app_bundle}"
-  else
-    # Local/dev fallback: keep the previous ad-hoc deep sign.
-    codesign --force --deep --sign - "${app_bundle}"
   fi
+
+  # Never codesign --deep the app: Sparkle.framework contains Updater.app and
+  # XPC services, which makes --deep report an ambiguous bundle format.
+  while IFS= read -r macho_path; do
+    [[ -z "${macho_path}" ]] && continue
+    sign_item "${macho_path}"
+  done < <(list_macho_files "${app_bundle}")
+
+  sign_sparkle_nested_bundles "${app_bundle}"
+
+  # Sign the bundle last so the sealed resources include nested signatures.
+  sign_item "${app_bundle}"
 
   codesign --verify --deep --strict --verbose=2 "${app_bundle}"
 
