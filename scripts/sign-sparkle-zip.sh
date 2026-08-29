@@ -136,7 +136,9 @@ python3 "${SCRIPT_DIR}/generate-sparkle-appcast.py" --write-key-file "${KEYFILE}
 redact_and_print() {
   local raw="$1"
   # Redact in Python so base64 '/' in the secret cannot break bash substitution.
-  python3 - "${raw}" <<'PY'
+  # Also redact the written key file: a 64-byte env secret is stored as a
+  # 32-byte seed, which GitHub will not mask as SPARKLE_ED25519_PRIVATE_KEY.
+  python3 - "${raw}" "${KEYFILE:-}" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -145,6 +147,11 @@ path = Path(sys.argv[1])
 text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
 key = os.environ.get("SPARKLE_ED25519_PRIVATE_KEY", "")
 fragments = {key, key.strip(), "".join(key.split())}
+if len(sys.argv) > 2 and sys.argv[2]:
+    written = Path(sys.argv[2])
+    if written.is_file():
+        body = written.read_text(encoding="utf-8", errors="replace")
+        fragments.update({body, body.strip(), "".join(body.split())})
 for fragment in fragments:
     if fragment:
         text = text.replace(fragment, "[redacted]")

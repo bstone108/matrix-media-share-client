@@ -168,8 +168,44 @@ class GenerateSparkleAppcastTests(unittest.TestCase):
                     os.environ.pop("SPARKLE_ED25519_PRIVATE_KEY", None)
                 else:
                     os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = previous
-            self.assertEqual(key_path.read_text(encoding="utf-8"), key + "\n")
+            seed_b64 = base64.b64encode(bytes(range(32))).decode("ascii")
+            self.assertEqual(key_path.read_text(encoding="utf-8"), seed_b64 + "\n")
             self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+
+    def test_write_key_file_keeps_32_byte_seed_and_96_byte_legacy(self):
+        module = _load_module()
+        previous = os.environ.get("SPARKLE_ED25519_PRIVATE_KEY")
+        argv = sys.argv
+        seed = bytes(range(32))
+        seed_b64 = base64.b64encode(seed).decode("ascii")
+        old_96 = _matching_old_96_key()
+        with tempfile.TemporaryDirectory() as tmp:
+            seed_path = Path(tmp) / "seed.key"
+            old_path = Path(tmp) / "old.key"
+            try:
+                os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = seed_b64
+                sys.argv = [str(SCRIPT), "--write-key-file", str(seed_path)]
+                self.assertEqual(module.main(), 0)
+                os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = old_96
+                sys.argv = [str(SCRIPT), "--write-key-file", str(old_path)]
+                self.assertEqual(module.main(), 0)
+            finally:
+                sys.argv = argv
+                if previous is None:
+                    os.environ.pop("SPARKLE_ED25519_PRIVATE_KEY", None)
+                else:
+                    os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = previous
+            self.assertEqual(seed_path.read_text(encoding="utf-8"), seed_b64 + "\n")
+            self.assertEqual(old_path.read_text(encoding="utf-8"), old_96 + "\n")
+
+    def test_sign_update_secret_bytes_strips_public_half_from_64_byte_export(self):
+        module = _load_module()
+        seed = bytes(range(32))
+        public = base64.b64decode(PRODUCTION_PUBLIC_KEY)
+        self.assertEqual(module.sign_update_secret_bytes(seed), seed)
+        self.assertEqual(module.sign_update_secret_bytes(seed + public), seed)
+        blob_96 = bytes(range(64)) + public
+        self.assertEqual(module.sign_update_secret_bytes(blob_96), blob_96)
 
 
 class SignSparkleZipTests(unittest.TestCase):

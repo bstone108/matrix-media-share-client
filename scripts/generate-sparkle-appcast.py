@@ -78,11 +78,26 @@ def verify_generate_keys_matches_embedded_public(raw_b64: str) -> None:
         _fail("SPARKLE_ED25519_PRIVATE_KEY does not match the public key embedded in the Mac app.")
 
 
+def sign_update_secret_bytes(raw: bytes) -> bytes:
+    """Return the blob Sparkle 2.9.6 sign_update will actually import.
+
+    generate_keys currently stores a 32-byte seed. Older exports concatenated
+    seed||public (64 bytes). sign_update 2.9.6 rejects that 64-byte blob with
+    "Imported key must be 64 bytes or 96 bytes ... Instead it is 64 bytes"
+    even though generate_keys' own error text says 32 or 96. Pass the seed.
+    Legacy orlp material stays 96 bytes.
+    """
+    if len(raw) == 64:
+        return raw[:32]
+    return raw
+
+
 def write_cleaned_key_file(path: Path, raw_b64: str) -> None:
     """Verify the env-key format and write cleaned base64 for sign_update."""
-    cleaned = cleaned_sparkle_private_key_b64(raw_b64)
-    verify_generate_keys_matches_embedded_public(cleaned)
-    path.write_text(cleaned + "\n", encoding="utf-8")
+    raw = decode_sparkle_private_key(raw_b64)
+    verify_generate_keys_matches_embedded_public(raw_b64)
+    encoded = base64.b64encode(sign_update_secret_bytes(raw)).decode("ascii")
+    path.write_text(encoded + "\n", encoding="utf-8")
     os.chmod(path, 0o600)
 
 
@@ -190,9 +205,15 @@ def main() -> int:
         if args.write_key_file is not None:
             write_cleaned_key_file(args.write_key_file, raw_b64)
         raw = decode_sparkle_private_key(raw_b64)
-        if public_key_b64_from_private_blob(raw) is None:
+        if len(raw) == 32:
             print(
                 "Sparkle private key is a 32-byte seed; sign_update will validate it.",
+                file=sys.stderr,
+            )
+        elif len(raw) == 64:
+            print(
+                "Sparkle private key matches the embedded SUPublicEDKey; "
+                "writing the 32-byte seed for Sparkle 2.9.6 sign_update.",
                 file=sys.stderr,
             )
         else:
