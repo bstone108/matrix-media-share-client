@@ -151,7 +151,7 @@ class GenerateSparkleAppcastTests(unittest.TestCase):
             if previous is not None:
                 os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = previous
 
-    def test_write_key_file_strips_whitespace_and_does_not_echo(self):
+    def test_write_key_file_normalizes_seed_public_to_32_byte_seed(self):
         module = _load_module()
         key = _matching_expanded_key()
         previous = os.environ.get("SPARKLE_ED25519_PRIVATE_KEY")
@@ -168,8 +168,84 @@ class GenerateSparkleAppcastTests(unittest.TestCase):
                     os.environ.pop("SPARKLE_ED25519_PRIVATE_KEY", None)
                 else:
                     os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = previous
-            self.assertEqual(key_path.read_text(encoding="utf-8"), key + "\n")
+            written = key_path.read_bytes()
+            self.assertEqual(base64.b64decode(written), bytes(range(32)))
             self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn(key.encode("ascii"), written)
+
+
+class NormalizeSparkleEdKeyTests(unittest.TestCase):
+    HELPER = ROOT / "scripts" / "normalize-sparkle-ed-key.py"
+
+    def _run(self, secret_b64: str):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "normalized.b64"
+            result = subprocess.run(
+                [sys.executable, str(self.HELPER), PRODUCTION_PUBLIC_KEY, str(out)],
+                input=secret_b64,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            body = out.read_bytes() if out.is_file() else b""
+            return result.returncode, result.stdout, result.stderr, body
+
+    def test_64_byte_seed_public_becomes_32_byte_seed(self):
+        public = base64.b64decode(PRODUCTION_PUBLIC_KEY)
+        secret = bytes(range(32)) + public
+        key = base64.b64encode(secret).decode("ascii")
+        self.assertEqual(len(key), 88)
+        rc, stdout, stderr, body = self._run(key)
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(stdout, "")
+        self.assertEqual(base64.b64decode(body), bytes(range(32)))
+        self.assertIn("decoded 64 bytes -> seed (32 bytes)", stderr)
+        self.assertNotIn(key, stdout)
+        self.assertNotIn(key, stderr)
+        self.assertNotIn(body.decode("ascii"), stderr)
+
+    def test_64_byte_expanded_becomes_old_96(self):
+        public = base64.b64decode(PRODUCTION_PUBLIC_KEY)
+        expanded = bytes([0x42]) * 64
+        key = base64.b64encode(expanded).decode("ascii")
+        rc, stdout, stderr, body = self._run(key)
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(stdout, "")
+        got = base64.b64decode(body)
+        self.assertEqual(len(got), 96)
+        self.assertEqual(got[:64], expanded)
+        self.assertEqual(got[64:], public)
+        self.assertIn("decoded 64 bytes -> old-96 (96 bytes)", stderr)
+        self.assertNotIn(key, stdout)
+        self.assertNotIn(key, stderr)
+        self.assertNotIn(body.decode("ascii"), stderr)
+
+    def test_32_and_96_pass_through(self):
+        public = base64.b64decode(PRODUCTION_PUBLIC_KEY)
+        seed = base64.b64encode(bytes(range(32))).decode("ascii")
+        rc, stdout, stderr, body = self._run(seed)
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(stdout, "")
+        self.assertEqual(base64.b64decode(body), bytes(range(32)))
+        self.assertIn("decoded 32 bytes -> seed (32 bytes)", stderr)
+        self.assertNotIn(seed, stderr)
+
+        old = base64.b64encode(bytes([0x42]) * 64 + public).decode("ascii")
+        rc, stdout, stderr, body = self._run(old)
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(base64.b64decode(body)), 96)
+        self.assertIn("decoded 96 bytes -> old-96 (96 bytes)", stderr)
+        self.assertNotIn(old, stderr)
+
+    def test_refuses_other_lengths_without_echoing_secret(self):
+        key = base64.b64encode(b"too-short").decode("ascii")
+        rc, stdout, stderr, body = self._run(key)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn("unsupported length", stderr)
+        self.assertNotIn(key, stderr)
+        self.assertEqual(body, b"")
 
 
 class SignSparkleZipTests(unittest.TestCase):
@@ -216,6 +292,7 @@ class SignSparkleZipTests(unittest.TestCase):
         text = SIGN_ZIP.read_text(encoding="utf-8")
         self.assertNotRegex(text, r"\$\(\s*\"\$\{SIGN_UPDATE\}\"")
         self.assertIn("Never capture sign_update in a command substitution", text)
+        self.assertIn("normalize-sparkle-ed-key.py", text)
 
     def test_print_tool_fails_when_only_old_dsa_scripts_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
