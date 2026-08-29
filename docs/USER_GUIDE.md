@@ -397,9 +397,19 @@ These are for the built-in update checker.
 
 How it works:
 
-- the app checks GitHub releases about once a week
-- if a check is overdue, it checks on startup
-- the `Open Latest Release` button opens the release page in your browser
+- the app checks GitHub Releases about every two days, and also whenever you click `Check For Updates`
+- it compares the running `VERSION.txt` / app version against the latest published tag, for example `v2026.8.28.1`
+- a `Restart now` / `Later` prompt appears once an update is staged
+- `Restart now` installs immediately and relaunches
+- `Later` does not prompt again for that version; the staged update still installs the next time the app exits
+- the same version is never prompted twice
+
+Platform details:
+
+- macOS uses Sparkle. It reads the arch-specific signed appcast (`appcast-macos-arm64.xml` or `appcast-macos-x86_64.xml`), downloads the matching Developer ID signed, notarized, and stapled zip, stages it, and shows `Restart now` / `Later`
+- Windows always auto-updates in-app: it downloads the matching arch zip (`windows-x64.zip` or `windows-arm64.zip`), stages it, and installs on `Restart now` or the next exit. If the install folder is not writable, the helper elevates. Windows never falls back to a browser download link
+- Linux AppImage replaces the running AppImage in place when that file is writable. If it is not writable, or you are not running an AppImage, you get a one-time notice with a GitHub download link for that version
+- `Open Latest Release` remains available as a manual way to open the GitHub release page
 
 ## Important Quirks And Behavior
 

@@ -1,7 +1,9 @@
 #include "AppController.h"
 
+#include "AppUpdater.h"
 #include "MatrixClientBackend.h"
 #include "ProcessMatrixClientBackend.h"
+#include "UpdateUtilities.h"
 
 #include <QCoreApplication>
 #include <QDesktopServices>
@@ -17,10 +19,6 @@
 #include <QUrl>
 
 namespace {
-constexpr auto kLatestReleaseApiUrl = "https://api.github.com/repos/bstone108/matrix-media-share-client/releases/latest";
-constexpr auto kReleasesPageUrl = "https://github.com/bstone108/matrix-media-share-client/releases";
-constexpr qint64 kWeeklyUpdateCheckIntervalSeconds = 7LL * 24LL * 60LL * 60LL;
-
 QString defaultDestinationRootPath()
 {
     QString downloads = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
@@ -28,59 +26,6 @@ QString defaultDestinationRootPath()
         downloads = QDir::homePath() + QStringLiteral("/Downloads");
     }
     return downloads + QStringLiteral("/Matrix Media Share Client");
-}
-
-QString normalizeReleaseVersion(QString version)
-{
-    version = version.trimmed();
-    if (version.startsWith(QLatin1Char('v'), Qt::CaseInsensitive)) {
-        version.remove(0, 1);
-    }
-    return version;
-}
-
-QVector<int> parseVersionParts(const QString &version)
-{
-    QVector<int> parts;
-    for (const QString &segment : normalizeReleaseVersion(version).split(QLatin1Char('.'), Qt::SkipEmptyParts)) {
-        bool ok = false;
-        const int value = segment.toInt(&ok);
-        if (!ok) {
-            return {};
-        }
-        parts.append(value);
-    }
-    return parts;
-}
-
-int compareVersionStrings(const QString &lhs, const QString &rhs)
-{
-    const QVector<int> lhsParts = parseVersionParts(lhs);
-    const QVector<int> rhsParts = parseVersionParts(rhs);
-    if (lhsParts.isEmpty() || rhsParts.isEmpty()) {
-        return QString::compare(normalizeReleaseVersion(lhs), normalizeReleaseVersion(rhs), Qt::CaseInsensitive);
-    }
-
-    const int segmentCount = qMax(lhsParts.size(), rhsParts.size());
-    for (int index = 0; index < segmentCount; ++index) {
-        const int lhsValue = index < lhsParts.size() ? lhsParts.at(index) : 0;
-        const int rhsValue = index < rhsParts.size() ? rhsParts.at(index) : 0;
-        if (lhsValue < rhsValue) {
-            return -1;
-        }
-        if (lhsValue > rhsValue) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-bool isUpdateCheckDue(const UpdateCheckState &state)
-{
-    if (!state.lastCheckedAt.isValid()) {
-        return true;
-    }
-    return state.lastCheckedAt.secsTo(QDateTime::currentDateTimeUtc()) >= kWeeklyUpdateCheckIntervalSeconds;
 }
 
 QString releaseSummaryText(const UpdateCheckState &state)
@@ -119,6 +64,7 @@ AppController::AppController(QObject *parent)
     , backend_(std::make_unique<ProcessMatrixClientBackend>(paths_, this))
     , refreshTimer_(new QTimer(this))
     , updateNetworkManager_(new QNetworkAccessManager(this))
+    , updater_(new AppUpdater(paths_, this))
 {
     refreshTimer_->setInterval(1000);
     connect(refreshTimer_, &QTimer::timeout, this, &AppController::refresh);
@@ -137,8 +83,45 @@ AppController::AppController(QObject *parent)
         updateRefreshTimer();
         scheduleRefresh();
     });
+    updater_->setLogCallbacks(
+        [this](const QString &message) {
+            logInfo(QStringLiteral("updates"), message);
+        },
+        [this](const QString &message) {
+            logWarning(QStringLiteral("updates"), message);
+        },
+        [this](const QString &message) {
+            logError(QStringLiteral("updates"), message);
+        });
+    connect(updater_, &AppUpdater::stateChanged, this, [this]() {
+        emit stateChanged();
+    });
+    connect(updater_, &AppUpdater::stagedUpdateReady, this, [this](const QString &version, const bool forcePrompt) {
+        updateCheckState_.pendingInstallVersion = version;
+        updateCheckState_.pendingInstallPath = updater_->stagedPayloadPath();
+        persistUpdateCheckState();
+        if (forcePrompt || UpdateUtilities::shouldNagForVersion(version, currentVersion(), updateCheckState_.lastNotifiedVersion)) {
+            emit stagedUpdateReady(version);
+        } else {
+            updater_->scheduleInstallOnExit();
+        }
+        emit stateChanged();
+    });
+    connect(updater_, &AppUpdater::downloadLinkNotice, this, [this](const QString &version, const QUrl &pageUrl, const QString &reason, const bool forcePrompt) {
+        if (forcePrompt || UpdateUtilities::shouldNagForVersion(version, currentVersion(), updateCheckState_.lastNotifiedVersion)) {
+            emit updateDownloadLinkNotice(version, pageUrl.toString(), reason);
+        }
+        emit stateChanged();
+    });
+    connect(updater_, &AppUpdater::updateFailed, this, [this](const QString &message) {
+        lastErrorMessage_ = message;
+        emit stateChanged();
+    });
     connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, this, [this]() {
         shutdownBackendForExit();
+        if (updater_ != nullptr && updater_->hasStagedUpdate()) {
+            updater_->startPendingInstallHelper(false);
+        }
     });
 }
 
@@ -152,6 +135,7 @@ void AppController::initialize()
     settings_ = database_.loadSettings(defaultDestinationRootPath());
     password_ = secretStore_.loadPassword();
     updateCheckState_ = database_.loadUpdateCheckState();
+    updater_->restoreFromState(updateCheckState_);
     logInfo(QStringLiteral("app"), QStringLiteral("Application initialized."));
     logInfo(
         QStringLiteral("settings"),
@@ -168,7 +152,7 @@ void AppController::initialize()
         togglePower(true);
     }
 
-    if (isUpdateCheckDue(updateCheckState_)) {
+    if (UpdateUtilities::isUpdateCheckDue(updateCheckState_.lastCheckedAt)) {
         QTimer::singleShot(0, this, [this]() {
             checkForUpdates(false);
         });
@@ -307,16 +291,27 @@ const UpdateCheckState &AppController::updateCheckState() const
 
 bool AppController::isUpdateCheckInProgress() const
 {
-    return updateCheckInProgress_;
+    return updateCheckInProgress_ || (updater_ != nullptr && updater_->isBusy());
 }
 
 bool AppController::updateAvailable() const
 {
-    return compareVersionStrings(updateCheckState_.latestVersion, currentVersion()) > 0;
+    return UpdateUtilities::isNewerVersion(updateCheckState_.latestVersion, currentVersion());
+}
+
+bool AppController::hasStagedUpdate() const
+{
+    return updater_ != nullptr && updater_->hasStagedUpdate();
 }
 
 QString AppController::updateStatusText() const
 {
+    if (updater_ != nullptr) {
+        const QString updaterText = updater_->statusText(currentVersion(), updateCheckState_);
+        if (!updaterText.isEmpty()) {
+            return updaterText;
+        }
+    }
     if (updateCheckInProgress_) {
         return QStringLiteral("Checking GitHub releases...");
     }
@@ -330,7 +325,7 @@ QString AppController::updateStatusText() const
         return QStringLiteral("No published GitHub release yet.");
     }
 
-    const int comparison = compareVersionStrings(updateCheckState_.latestVersion, currentVersion());
+    const int comparison = UpdateUtilities::compareVersionStrings(updateCheckState_.latestVersion, currentVersion());
     if (comparison > 0) {
         return QStringLiteral("Update available: %1").arg(updateCheckState_.latestVersion);
     }
@@ -350,7 +345,7 @@ QString AppController::latestReleasePageUrl() const
     if (!updateCheckState_.latestReleaseUrl.trimmed().isEmpty()) {
         return updateCheckState_.latestReleaseUrl.trimmed();
     }
-    return QString::fromLatin1(kReleasesPageUrl);
+    return QString::fromLatin1(UpdateUtilities::kGithubReleasesPageUrl);
 }
 
 QString AppController::settingsDatabasePath() const
@@ -770,57 +765,70 @@ void AppController::declineVerification()
 
 void AppController::checkForUpdates(const bool force)
 {
-    if (updateCheckInProgress_) {
+    if (updateCheckInProgress_ || (updater_ != nullptr && updater_->isBusy())) {
         return;
     }
-    if (!force && !isUpdateCheckDue(updateCheckState_)) {
+    if (!force && !UpdateUtilities::isUpdateCheckDue(updateCheckState_.lastCheckedAt)) {
+        if (updater_ != nullptr && UpdateUtilities::isNewerVersion(updateCheckState_.latestVersion, currentVersion())) {
+            updater_->handleAvailableRelease(updateCheckState_, false);
+        }
         return;
     }
 
     updateCheckInProgress_ = true;
     emit stateChanged();
 
-    QNetworkRequest request(QUrl(QString::fromLatin1(kLatestReleaseApiUrl)));
+    QNetworkRequest request(QUrl(QString::fromLatin1(UpdateUtilities::kGithubReleasesApiUrl)));
     request.setHeader(
         QNetworkRequest::UserAgentHeader,
         QStringLiteral("MatrixMediaShareClientQt/%1").arg(currentVersion()));
     request.setRawHeader("Accept", "application/vnd.github+json");
     request.setRawHeader("X-GitHub-Api-Version", "2022-11-28");
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
 
     QNetworkReply *reply = updateNetworkManager_->get(request);
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, force]() {
         const QByteArray payload = reply->readAll();
         const int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         UpdateCheckState nextState = updateCheckState_;
         nextState.lastCheckedAt = QDateTime::currentDateTimeUtc();
         nextState.lastError.clear();
 
+        bool shouldInstall = false;
         if (reply->error() == QNetworkReply::NoError && httpStatus >= 200 && httpStatus < 300) {
-            const QJsonDocument document = QJsonDocument::fromJson(payload);
-            const QJsonObject object = document.object();
-            nextState.latestVersion = normalizeReleaseVersion(object.value(QStringLiteral("tag_name")).toString());
-            nextState.latestReleaseUrl = object.value(QStringLiteral("html_url")).toString().trimmed();
-            nextState.latestReleaseName = object.value(QStringLiteral("name")).toString().trimmed();
-            nextState.latestPublishedAt = QDateTime::fromString(
-                object.value(QStringLiteral("published_at")).toString(),
-                Qt::ISODate);
-
-            if (!nextState.latestVersion.isEmpty() && compareVersionStrings(nextState.latestVersion, currentVersion()) > 0) {
-                logInfo(
-                    QStringLiteral("updates"),
-                    QStringLiteral("Update available: %1 (current: %2).").arg(nextState.latestVersion, currentVersion()));
-            } else if (!nextState.latestVersion.isEmpty()) {
-                logInfo(
-                    QStringLiteral("updates"),
-                    QStringLiteral("Update check complete. Latest published release is %1.").arg(nextState.latestVersion));
+            GithubReleaseInfo release;
+            if (!UpdateUtilities::parseGithubRelease(QJsonDocument::fromJson(payload).object(), UpdateUtilities::currentPackageKind(), &release)
+                || release.version.isEmpty()) {
+                nextState.lastError = QStringLiteral("GitHub release response was missing a version tag.");
+                logWarning(QStringLiteral("updates"), nextState.lastError);
             } else {
-                logInfo(QStringLiteral("updates"), QStringLiteral("Update check complete. No published release found."));
+                nextState.latestVersion = release.version;
+                nextState.latestReleaseUrl = release.htmlUrl;
+                nextState.latestReleaseName = release.name;
+                nextState.latestPublishedAt = release.publishedAt;
+                nextState.latestAssetName = release.assetName;
+                nextState.latestAssetUrl = release.assetUrl;
+                nextState.latestAssetSize = release.assetSize;
+                shouldInstall = UpdateUtilities::isNewerVersion(nextState.latestVersion, currentVersion());
+
+                if (shouldInstall) {
+                    logInfo(
+                        QStringLiteral("updates"),
+                        QStringLiteral("Update available: %1 (current: %2).").arg(nextState.latestVersion, currentVersion()));
+                } else {
+                    logInfo(
+                        QStringLiteral("updates"),
+                        QStringLiteral("Update check complete. Latest published release is %1.").arg(nextState.latestVersion));
+                }
             }
         } else if (httpStatus == 404 || replyMessage(payload) == QStringLiteral("Not Found")) {
             nextState.latestVersion.clear();
             nextState.latestReleaseUrl.clear();
             nextState.latestReleaseName.clear();
             nextState.latestPublishedAt = {};
+            nextState.latestAssetName.clear();
+            nextState.latestAssetUrl.clear();
+            nextState.latestAssetSize = -1;
             logInfo(QStringLiteral("updates"), QStringLiteral("No published GitHub release found yet."));
         } else {
             const QString message = replyMessage(payload);
@@ -830,17 +838,58 @@ void AppController::checkForUpdates(const bool force)
                 QStringLiteral("Update check failed: %1").arg(nextState.lastError));
         }
 
-        database_.saveUpdateCheckState(nextState);
         updateCheckState_ = nextState;
+        persistUpdateCheckState();
         updateCheckInProgress_ = false;
         reply->deleteLater();
         emit stateChanged();
+
+        if (shouldInstall && updater_ != nullptr) {
+            updater_->handleAvailableRelease(updateCheckState_, force);
+        }
     });
 }
 
 void AppController::openLatestReleasePage()
 {
     QDesktopServices::openUrl(QUrl(latestReleasePageUrl()));
+}
+
+void AppController::applyStagedUpdate(const bool relaunchNow)
+{
+    if (updater_ == nullptr) {
+        return;
+    }
+    markUpdateNotified(updater_->stagedVersion());
+    updater_->applyStagedUpdate(relaunchNow);
+}
+
+void AppController::deferStagedUpdate()
+{
+    if (updater_ == nullptr) {
+        return;
+    }
+    markUpdateNotified(updater_->stagedVersion());
+    updater_->scheduleInstallOnExit();
+}
+
+void AppController::markUpdateNotified(const QString &version)
+{
+    const QString normalized = UpdateUtilities::normalizeReleaseVersion(version);
+    if (normalized.isEmpty() || updateCheckState_.lastNotifiedVersion == normalized) {
+        return;
+    }
+    updateCheckState_.lastNotifiedVersion = normalized;
+    persistUpdateCheckState();
+}
+
+void AppController::persistUpdateCheckState()
+{
+    if (updater_ != nullptr && updater_->hasStagedUpdate()) {
+        updateCheckState_.pendingInstallVersion = updater_->stagedVersion();
+        updateCheckState_.pendingInstallPath = updater_->stagedPayloadPath();
+    }
+    database_.saveUpdateCheckState(updateCheckState_);
 }
 
 void AppController::dismissError()

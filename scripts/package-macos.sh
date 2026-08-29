@@ -126,6 +126,11 @@ PY
 
 item_wants_entitlements() {
   local item="$1"
+  # Sparkle's nested XPC/Updater/Autoupdate binaries must not inherit this app's
+  # JIT entitlements. Sign them with hardened runtime only.
+  if [[ "${item}" == *"/Sparkle.framework" || "${item}" == *"/Sparkle.framework/"* ]]; then
+    return 1
+  fi
   if [[ -d "${item}" && "${item}" == *.app ]]; then
     return 0
   fi
@@ -135,6 +140,27 @@ item_wants_entitlements() {
     return 1
   fi
   return 0
+}
+
+restore_sparkle_framework() {
+  local dest="${STAGED_APP}/Contents/Frameworks"
+  local src=""
+  mkdir -p "${dest}"
+  if [[ -d "${BUILD_DIR}/${APP_NAME}.app/Contents/Frameworks/Sparkle.framework" ]]; then
+    src="${BUILD_DIR}/${APP_NAME}.app/Contents/Frameworks/Sparkle.framework"
+  else
+    src="$(find "${BUILD_DIR}" -type d -name 'Sparkle.framework' | head -n 1 || true)"
+  fi
+  if [[ -z "${src}" || ! -d "${src}" ]]; then
+    echo "Sparkle.framework is missing after the Mac build." >&2
+    exit 1
+  fi
+  rm -rf "${dest}/Sparkle.framework"
+  if command -v ditto >/dev/null 2>&1; then
+    ditto "${src}" "${dest}/Sparkle.framework"
+  else
+    cp -R "${src}" "${dest}/Sparkle.framework"
+  fi
 }
 
 sign_item() {
@@ -157,6 +183,34 @@ sign_item() {
   fi
 }
 
+sign_sparkle_nested_bundles() {
+  local app_bundle="$1"
+  local sparkle="${app_bundle}/Contents/Frameworks/Sparkle.framework"
+  if [[ ! -d "${sparkle}" ]]; then
+    return 0
+  fi
+
+  local version_dir="${sparkle}/Versions/B"
+  if [[ ! -d "${version_dir}" && -d "${sparkle}/Versions/Current" ]]; then
+    version_dir="${sparkle}/Versions/Current"
+  fi
+
+  if [[ -d "${version_dir}/XPCServices" ]]; then
+    shopt -s nullglob
+    for xpc in "${version_dir}/XPCServices"/*.xpc; do
+      sign_item "${xpc}"
+    done
+    shopt -u nullglob
+  fi
+  if [[ -d "${version_dir}/Updater.app" ]]; then
+    sign_item "${version_dir}/Updater.app"
+  fi
+  if [[ -e "${version_dir}/Autoupdate" ]]; then
+    sign_item "${version_dir}/Autoupdate"
+  fi
+  sign_item "${sparkle}"
+}
+
 sign_app_bundle() {
   local app_bundle="$1"
 
@@ -177,18 +231,19 @@ sign_app_bundle() {
       security find-identity -v -p codesigning >&2 || true
       exit 1
     fi
-
-    while IFS= read -r macho_path; do
-      [[ -z "${macho_path}" ]] && continue
-      sign_item "${macho_path}"
-    done < <(list_macho_files "${app_bundle}")
-
-    # Sign the bundle last so the sealed resources include nested signatures.
-    sign_item "${app_bundle}"
-  else
-    # Local/dev fallback: keep the previous ad-hoc deep sign.
-    codesign --force --deep --sign - "${app_bundle}"
   fi
+
+  # Never codesign --deep the app: Sparkle.framework contains Updater.app and
+  # XPC services, which makes --deep report an ambiguous bundle format.
+  while IFS= read -r macho_path; do
+    [[ -z "${macho_path}" ]] && continue
+    sign_item "${macho_path}"
+  done < <(list_macho_files "${app_bundle}")
+
+  sign_sparkle_nested_bundles "${app_bundle}"
+
+  # Sign the bundle last so the sealed resources include nested signatures.
+  sign_item "${app_bundle}"
 
   codesign --verify --deep --strict --verbose=2 "${app_bundle}"
 
@@ -381,6 +436,9 @@ fi
 
 "${MACDEPLOYQT_BIN}" "${STAGED_APP}" -always-overwrite
 
+# macdeployqt can omit or rewrite non-Qt frameworks. Re-embed Sparkle before signing.
+restore_sparkle_framework
+
 # Clear Finder/resource metadata before signing. Leftover xattrs can produce a
 # malformed signature that Finder refuses to launch on Apple Silicon.
 sign_app_bundle "${STAGED_APP}"
@@ -400,6 +458,29 @@ if should_notarize; then
   notarize_artifact "${DMG_PATH}" "disk image"
   xcrun stapler staple "${DMG_PATH}"
   xcrun stapler validate "${DMG_PATH}"
+fi
+
+if is_github_actions_release; then
+  # Sparkle sign_update runs only on real releases. PR CI never sees the private key.
+  APPCAST_ARCH="${ARCH}"
+  if [[ "${APPCAST_ARCH}" == "amd64" ]]; then
+    APPCAST_ARCH="x86_64"
+  fi
+  SIGNATURE_PATH="${WORK_DIR}/sparkle-${APPCAST_ARCH}.edSignature"
+  APPCAST_PATH="${BUILDS_DIR}/appcast-macos-${APPCAST_ARCH}.xml"
+  "${SCRIPT_DIR}/sign-sparkle-zip.sh" \
+    --zip "${ARCHIVE_PATH}" \
+    --search-root "${BUILD_DIR}" \
+    --signature-out "${SIGNATURE_PATH}"
+  python3 "${SCRIPT_DIR}/generate-sparkle-appcast.py" \
+    --version "${APP_VERSION}" \
+    --release-url "https://github.com/bstone108/matrix-media-share-client/releases/tag/v${APP_VERSION}" \
+    --zip "${ARCHIVE_PATH}" \
+    --arch "${APPCAST_ARCH}" \
+    --signature-file "${SIGNATURE_PATH}" \
+    --output "${APPCAST_PATH}"
+  rm -f "${SIGNATURE_PATH}"
+  echo "Created ${APPCAST_PATH}"
 fi
 
 echo "Created ${ARCHIVE_PATH}"

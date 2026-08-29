@@ -5,6 +5,7 @@
 #include "VlcPlayerWidget.h"
 #include "WebVideoWidget.h"
 
+#include <QAbstractButton>
 #include <QAbstractItemView>
 #include <QApplication>
 #include <QBuffer>
@@ -635,6 +636,48 @@ MainWindow::MainWindow(AppController *controller, QWidget *parent)
     connect(controller_, &AppController::stateChanged, this, &MainWindow::refreshView);
     connect(controller_, &AppController::userNoticeRequested, this, [this](const QString &title, const QString &message) {
         QMessageBox::warning(this, title, message);
+    });
+    connect(controller_, &AppController::stagedUpdateReady, this, [this](const QString &version) {
+        if (updatePromptVisible_) {
+            return;
+        }
+        updatePromptVisible_ = true;
+        QMessageBox box(this);
+        box.setIcon(QMessageBox::Information);
+        box.setWindowTitle(QStringLiteral("Update Ready"));
+        box.setText(QStringLiteral("Version %1 is downloaded and ready to install.").arg(version));
+        box.setInformativeText(
+            QStringLiteral("Restart now to install it immediately. If you choose Later, it will install the next time the app exits."));
+        auto *restartButton = box.addButton(QStringLiteral("Restart now"), QMessageBox::AcceptRole);
+        box.addButton(QStringLiteral("Later"), QMessageBox::RejectRole);
+        box.exec();
+        if (box.clickedButton() == restartButton) {
+            controller_->applyStagedUpdate(true);
+        } else {
+            controller_->deferStagedUpdate();
+        }
+        updatePromptVisible_ = false;
+    });
+    connect(controller_, &AppController::updateDownloadLinkNotice, this, [this](const QString &version, const QString &pageUrl, const QString &reason) {
+        if (updatePromptVisible_) {
+            return;
+        }
+        updatePromptVisible_ = true;
+        QMessageBox box(this);
+        box.setIcon(QMessageBox::Information);
+        box.setWindowTitle(QStringLiteral("Update Available"));
+        box.setText(QStringLiteral("Version %1 is available.").arg(version));
+        box.setInformativeText(
+            QStringLiteral("%1\n\nThis notice is shown once per version. Open the GitHub release to download it.")
+                .arg(reason));
+        auto *openButton = box.addButton(QStringLiteral("Open download page"), QMessageBox::AcceptRole);
+        box.addButton(QStringLiteral("OK"), QMessageBox::RejectRole);
+        box.exec();
+        controller_->markUpdateNotified(version);
+        if (box.clickedButton() == openButton && !pageUrl.trimmed().isEmpty()) {
+            QDesktopServices::openUrl(QUrl(pageUrl));
+        }
+        updatePromptVisible_ = false;
     });
 
     constrainToAvailableGeometry();
@@ -1342,7 +1385,7 @@ void MainWindow::populateBrowserPage()
     uploadLimitLabel_->setText(QStringLiteral("Upload Limit: %1").arg(uploadLimitText(runtime.uploadSizeLimitBytes)));
     pendingUploadsLabel_->setText(browserUploadSummaryText(runtime.pendingUploads));
     previewGenerationLabel_->setText(browserPreviewSummaryText(runtime.pendingUploads));
-    if (controller_->updateAvailable() || controller_->isUpdateCheckInProgress()) {
+    if (controller_->updateAvailable() || controller_->isUpdateCheckInProgress() || controller_->hasStagedUpdate()) {
         updateBannerLabel_->setText(QStringLiteral("Updates: %1").arg(controller_->updateStatusText()));
     } else {
         updateBannerLabel_->clear();

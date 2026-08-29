@@ -646,4 +646,10 @@ struct UpdateCheckState {
     QString latestReleaseName;
     QDateTime latestPublishedAt;
     QString lastError;
+    QString latestAssetName;
+    QString latestAssetUrl;
+    qint64 latestAssetSize = -1;
+    QString lastNotifiedVersion;
+    QString pendingInstallVersion;
+    QString pendingInstallPath;
 };
