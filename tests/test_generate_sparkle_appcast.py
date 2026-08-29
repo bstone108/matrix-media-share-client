@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -99,6 +100,44 @@ class GenerateSparkleAppcastTests(unittest.TestCase):
             sys.argv = argv
             if previous is not None:
                 os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = previous
+
+    def test_sign_update_resolver_skips_dsym_and_old_dsa(self):
+        script = ROOT / "scripts" / "sign-sparkle-zip.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sparkle = root / "Sparkle-2.9.6"
+            dwarf = sparkle / "Symbols" / "sign_update.dSYM" / "Contents" / "Resources" / "DWARF" / "sign_update"
+            old_dsa = sparkle / "bin" / "old_dsa_scripts" / "sign_update"
+            cli = sparkle / "bin" / "sign_update"
+            dwarf.parent.mkdir(parents=True)
+            old_dsa.parent.mkdir(parents=True)
+            # Create the tarball's extra basename collisions first, matching
+            # Sparkle-2.9.6.tar.xz extract order.
+            dwarf.write_text("dwarf-debug-file\n", encoding="utf-8")
+            old_dsa.write_text("old-dsa-helper\n", encoding="utf-8")
+            cli.write_text("official-cli\n", encoding="utf-8")
+
+            resolved = subprocess.check_output(
+                ["bash", str(script), "--resolve-tool", str(root)],
+                text=True,
+            ).strip()
+            self.assertEqual(Path(resolved).resolve(), cli.resolve())
+
+    def test_sign_update_resolver_errors_when_cli_missing(self):
+        script = ROOT / "scripts" / "sign-sparkle-zip.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dwarf = root / "Sparkle-2.9.6" / "Symbols" / "sign_update.dSYM" / "Contents" / "Resources" / "DWARF" / "sign_update"
+            dwarf.parent.mkdir(parents=True)
+            dwarf.write_text("dwarf-debug-file\n", encoding="utf-8")
+            completed = subprocess.run(
+                ["bash", str(script), "--resolve-tool", str(root)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout.strip(), "")
 
 
 if __name__ == "__main__":

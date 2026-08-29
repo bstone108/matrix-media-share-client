@@ -468,6 +468,7 @@ if is_github_actions_release; then
   fi
   SIGNATURE_PATH="${WORK_DIR}/sparkle-${APPCAST_ARCH}.edSignature"
   APPCAST_PATH="${BUILDS_DIR}/appcast-macos-${APPCAST_ARCH}.xml"
+  echo "Signing Sparkle appcast for macOS ${APPCAST_ARCH}."
   "${SCRIPT_DIR}/sign-sparkle-zip.sh" \
     --zip "${ARCHIVE_PATH}" \
     --search-root "${BUILD_DIR}" \

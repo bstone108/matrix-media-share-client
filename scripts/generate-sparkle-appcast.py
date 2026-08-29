@@ -22,7 +22,7 @@ SPARKLE_NS = "http://www.andymatuschak.org/xml-namespaces/sparkle"
 
 
 def _fail(message: str) -> None:
-    print(message, file=sys.stderr)
+    print(message, file=sys.stderr, flush=True)
     raise SystemExit(1)
 
 
@@ -139,6 +139,7 @@ def main() -> int:
         if not raw_b64:
             _fail("SPARKLE_ED25519_PRIVATE_KEY is required to sign Sparkle appcasts.")
         verify_generate_keys_matches_embedded_public(raw_b64)
+        print("Sparkle EdDSA secret matches the embedded SUPublicEDKey.", file=sys.stderr)
         return 0
 
     if not args.version or not args.release_url:
