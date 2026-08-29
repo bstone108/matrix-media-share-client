@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "generate-sparkle-appcast.py"
+SIGN_ZIP = ROOT / "scripts" / "sign-sparkle-zip.sh"
 SPARKLE_NS = "http://www.andymatuschak.org/xml-namespaces/sparkle"
 PRODUCTION_PUBLIC_KEY = "t9iMCbw9VgjkeAVRokGcvFWD2dZFyU852Um2/7SwRfc="
 THROWAY_SIGNATURE = base64.b64encode(bytes(range(64))).decode("ascii")
@@ -25,6 +27,18 @@ def _load_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _matching_expanded_key() -> str:
+    public = base64.b64decode(PRODUCTION_PUBLIC_KEY)
+    seed = bytes(range(32))
+    return base64.b64encode(seed + public).decode("ascii")
+
+
+def _matching_old_96_key() -> str:
+    public = base64.b64decode(PRODUCTION_PUBLIC_KEY)
+    blob = bytes(range(64)) + public
+    return base64.b64encode(blob).decode("ascii")
 
 
 class GenerateSparkleAppcastTests(unittest.TestCase):
@@ -84,8 +98,45 @@ class GenerateSparkleAppcastTests(unittest.TestCase):
     def test_production_public_key_rejects_throwaway_private_key(self):
         module = _load_module()
         throwaway = base64.b64encode(os.urandom(64)).decode("ascii")
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(SystemExit) as raised:
             module.verify_generate_keys_matches_embedded_public(throwaway)
+        self.assertNotIn(throwaway, str(raised.exception))
+
+    def test_accepts_length_88_expanded_ed25519_matching_public_key(self):
+        module = _load_module()
+        key = _matching_expanded_key()
+        self.assertEqual(len(key), 88)
+        module.verify_generate_keys_matches_embedded_public(key)
+        self.assertEqual(len(module.decode_sparkle_private_key(key)), 64)
+
+    def test_accepts_old_96_byte_generate_keys_format(self):
+        module = _load_module()
+        key = _matching_old_96_key()
+        self.assertEqual(len(key), 128)
+        module.verify_generate_keys_matches_embedded_public(key)
+        self.assertEqual(len(module.decode_sparkle_private_key(key)), 96)
+
+    def test_accepts_32_byte_seed_without_echoing_it(self):
+        module = _load_module()
+        seed = base64.b64encode(bytes(range(32))).decode("ascii")
+        self.assertGreaterEqual(len(seed), 43)
+        module.verify_generate_keys_matches_embedded_public(seed)
+
+    def test_accepts_whitespace_and_missing_padding(self):
+        module = _load_module()
+        key = _matching_expanded_key()
+        wrapped = key[:40] + "\n" + key[40:]
+        module.verify_generate_keys_matches_embedded_public(wrapped)
+        unpadded = key.rstrip("=")
+        module.verify_generate_keys_matches_embedded_public(unpadded)
+
+    def test_rejects_too_short_secret_without_echoing_it(self):
+        module = _load_module()
+        short = "YWJjZA=="
+        with self.assertRaises(SystemExit) as raised:
+            module.verify_generate_keys_matches_embedded_public(short)
+        message = str(raised.exception)
+        self.assertNotIn(short, message)
 
     def test_verify_env_key_requires_secret(self):
         module = _load_module()
@@ -99,6 +150,86 @@ class GenerateSparkleAppcastTests(unittest.TestCase):
             sys.argv = argv
             if previous is not None:
                 os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = previous
+
+    def test_write_key_file_strips_whitespace_and_does_not_echo(self):
+        module = _load_module()
+        key = _matching_expanded_key()
+        previous = os.environ.get("SPARKLE_ED25519_PRIVATE_KEY")
+        argv = sys.argv
+        with tempfile.TemporaryDirectory() as tmp:
+            key_path = Path(tmp) / "ed.key"
+            os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = f"\n{key[:40]}\n{key[40:]}\n"
+            try:
+                sys.argv = [str(SCRIPT), "--write-key-file", str(key_path)]
+                self.assertEqual(module.main(), 0)
+            finally:
+                sys.argv = argv
+                if previous is None:
+                    os.environ.pop("SPARKLE_ED25519_PRIVATE_KEY", None)
+                else:
+                    os.environ["SPARKLE_ED25519_PRIVATE_KEY"] = previous
+            self.assertEqual(key_path.read_text(encoding="utf-8"), key + "\n")
+            self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+
+
+class SignSparkleZipTests(unittest.TestCase):
+    def _write_tool(self, path: Path, marker: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"#!/bin/sh\necho {marker}\n", encoding="utf-8")
+        path.chmod(0o755)
+
+    def test_print_tool_prefers_bin_sign_update_over_old_dsa_scripts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = root / "Sparkle-2.9.6" / "bin" / "old_dsa_scripts" / "sign_update"
+            new = root / "Sparkle-2.9.6" / "bin" / "sign_update"
+            self._write_tool(old, "old-dsa")
+            self._write_tool(new, "ed25519")
+            result = subprocess.run(
+                [str(SIGN_ZIP), "--print-tool", "--search-root", str(root)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(Path(result.stdout.strip()), new)
+            self.assertNotIn("old_dsa_scripts", result.stdout)
+
+    def test_print_tool_ignores_old_dsa_scripts_when_it_would_be_find_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # A nested old_dsa_scripts path that naive find -print -quit can hit first.
+            old = root / "aaa" / "bin" / "old_dsa_scripts" / "sign_update"
+            new = root / "zzz" / "bin" / "sign_update"
+            self._write_tool(old, "old-dsa")
+            self._write_tool(new, "ed25519")
+            result = subprocess.run(
+                [str(SIGN_ZIP), "--print-tool", "--search-root", str(root)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(Path(result.stdout.strip()), new)
+
+    def test_script_does_not_capture_sign_update_in_command_substitution(self):
+        text = SIGN_ZIP.read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"\$\(\s*\"\$\{SIGN_UPDATE\}\"")
+        self.assertIn("Never capture sign_update in a command substitution", text)
+
+    def test_print_tool_fails_when_only_old_dsa_scripts_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = root / "Sparkle-2.9.6" / "bin" / "old_dsa_scripts" / "sign_update"
+            self._write_tool(old, "old-dsa")
+            result = subprocess.run(
+                [str(SIGN_ZIP), "--print-tool", "--search-root", str(root)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("old_dsa_scripts", result.stderr)
 
 
 if __name__ == "__main__":
