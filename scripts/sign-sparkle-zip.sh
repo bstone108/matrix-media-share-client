@@ -127,16 +127,31 @@ if command -v xattr >/dev/null 2>&1; then
 fi
 echo "Using Sparkle sign_update at ${SIGN_UPDATE}" >&2
 
+PUBLIC_KEY="t9iMCbw9VgjkeAVRokGcvFWD2dZFyU852Um2/7SwRfc="
+
 # Do not print the private key. Disable xtrace around any expansion of it.
 set +x
+python3 "${SCRIPT_DIR}/generate-sparkle-appcast.py" --verify-env-key
 KEYFILE="$(mktemp "${TMPDIR:-/tmp}/sparkle-ed25519.XXXXXX")"
 chmod 600 "${KEYFILE}"
-python3 "${SCRIPT_DIR}/generate-sparkle-appcast.py" --write-key-file "${KEYFILE}"
+# Sparkle 2.9.6 sign_update rejects 64-byte decoded secrets:
+# "Imported key must be 64 bytes or 96 bytes ... Instead it is 64 bytes decoded."
+# That error is wrong; decodePrivateAndPublicKeys only accepts 32 or 96 bytes.
+# Reshape 64-byte secrets (never print them) before invoking sign_update.
+set +e
+python3 -c 'import os,sys; sys.stdout.write("".join(os.environ.get("SPARKLE_ED25519_PRIVATE_KEY","").split()))' \
+  | python3 "${SCRIPT_DIR}/normalize-sparkle-ed-key.py" "${PUBLIC_KEY}" "${KEYFILE}"
+norm_rc=$?
+set -euo pipefail
+if [[ "${norm_rc}" -ne 0 || ! -s "${KEYFILE}" ]]; then
+  echo "failed to normalize Sparkle EdDSA secret for sign_update" >&2
+  exit 1
+fi
 
 redact_and_print() {
   local raw="$1"
   # Redact in Python so base64 '/' in the secret cannot break bash substitution.
-  python3 - "${raw}" <<'PY'
+  python3 - "${raw}" "${KEYFILE}" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -145,6 +160,9 @@ path = Path(sys.argv[1])
 text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
 key = os.environ.get("SPARKLE_ED25519_PRIVATE_KEY", "")
 fragments = {key, key.strip(), "".join(key.split())}
+norm_path = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+if norm_path is not None and norm_path.is_file():
+    fragments.add(norm_path.read_text(encoding="utf-8", errors="replace").strip())
 for fragment in fragments:
     if fragment:
         text = text.replace(fragment, "[redacted]")

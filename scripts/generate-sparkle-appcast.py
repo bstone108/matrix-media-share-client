@@ -79,10 +79,24 @@ def verify_generate_keys_matches_embedded_public(raw_b64: str) -> None:
 
 
 def write_cleaned_key_file(path: Path, raw_b64: str) -> None:
-    """Verify the env-key format and write cleaned base64 for sign_update."""
+    """Verify the env-key, then write a sign_update-accepted 32- or 96-byte secret."""
+    import subprocess
+
     cleaned = cleaned_sparkle_private_key_b64(raw_b64)
     verify_generate_keys_matches_embedded_public(cleaned)
-    path.write_text(cleaned + "\n", encoding="utf-8")
+    helper = Path(__file__).resolve().parent / "normalize-sparkle-ed-key.py"
+    result = subprocess.run(
+        [sys.executable, str(helper), SPARKLE_PUBLIC_ED_KEY, str(path)],
+        input=cleaned.encode("ascii"),
+        capture_output=True,
+        check=False,
+    )
+    if result.stderr:
+        sys.stderr.write(result.stderr.decode("utf-8", errors="replace"))
+        if not result.stderr.endswith(b"\n"):
+            sys.stderr.write("\n")
+    if result.returncode != 0 or not path.is_file() or path.stat().st_size == 0:
+        _fail("failed to normalize Sparkle EdDSA secret for sign_update")
     os.chmod(path, 0o600)
 
 
