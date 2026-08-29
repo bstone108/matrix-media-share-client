@@ -12,6 +12,7 @@ import base64
 import calendar
 import html
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from email.utils import formatdate
@@ -19,6 +20,11 @@ from pathlib import Path
 
 SPARKLE_PUBLIC_ED_KEY = "t9iMCbw9VgjkeAVRokGcvFWD2dZFyU852Um2/7SwRfc="
 SPARKLE_NS = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+# Sparkle generate_keys / sign_update secrets are typically:
+#   32-byte seed (~44 chars), 64-byte seed+pub (~88 chars), or 96-byte old (~128).
+_MIN_KEY_CHARS = 43
+_MAX_KEY_CHARS = 128
+_KEY_CHARSET = re.compile(r"^[A-Za-z0-9+/_-]+=*$")
 
 
 def _fail(message: str) -> None:
@@ -26,17 +32,58 @@ def _fail(message: str) -> None:
     raise SystemExit(1)
 
 
-def verify_generate_keys_matches_embedded_public(raw_b64: str) -> None:
-    """Check Sparkle generate_keys material against SUPublicEDKey without printing it."""
+def cleaned_sparkle_private_key_b64(raw_b64: str) -> str:
+    """Strip whitespace from a Sparkle generate_keys secret. Never logs the value."""
+    return "".join(raw_b64.split())
+
+
+def decode_sparkle_private_key(raw_b64: str) -> bytes:
+    """Decode Sparkle generate_keys material without printing it."""
+    cleaned = cleaned_sparkle_private_key_b64(raw_b64)
+    if not cleaned:
+        _fail("SPARKLE_ED25519_PRIVATE_KEY is required to sign Sparkle appcasts.")
+    # Coarse length gate only (never print the value). sign_update is the
+    # cryptographic validator; do not invent a narrower allowlist than Sparkle.
+    if not (_MIN_KEY_CHARS <= len(cleaned) <= _MAX_KEY_CHARS):
+        _fail(f"SPARKLE_ED25519_PRIVATE_KEY has unexpected length {len(cleaned)}.")
+    if _KEY_CHARSET.fullmatch(cleaned) is None:
+        _fail("SPARKLE_ED25519_PRIVATE_KEY is not valid base64.")
+    std = cleaned.replace("-", "+").replace("_", "/")
+    pad = (-len(std)) % 4
+    if pad:
+        std += "=" * pad
     try:
-        raw = base64.b64decode(raw_b64.strip(), validate=True)
+        raw = base64.b64decode(std, validate=False)
     except Exception:
         _fail("SPARKLE_ED25519_PRIVATE_KEY is not valid base64.")
-    if len(raw) != 64:
+    if len(raw) not in (32, 64, 96):
         _fail("SPARKLE_ED25519_PRIVATE_KEY must be Sparkle generate_keys format.")
-    public_b64 = base64.b64encode(raw[32:]).decode("ascii")
+    return raw
+
+
+def public_key_b64_from_private_blob(raw: bytes) -> str | None:
+    """Return SUPublicEDKey material when the blob includes the public half."""
+    if len(raw) in (64, 96):
+        return base64.b64encode(raw[-32:]).decode("ascii")
+    return None
+
+
+def verify_generate_keys_matches_embedded_public(raw_b64: str) -> None:
+    """Check Sparkle generate_keys material against SUPublicEDKey without printing it."""
+    raw = decode_sparkle_private_key(raw_b64)
+    public_b64 = public_key_b64_from_private_blob(raw)
+    if public_b64 is None:
+        return
     if public_b64 != SPARKLE_PUBLIC_ED_KEY:
         _fail("SPARKLE_ED25519_PRIVATE_KEY does not match the public key embedded in the Mac app.")
+
+
+def write_cleaned_key_file(path: Path, raw_b64: str) -> None:
+    """Verify the env-key format and write cleaned base64 for sign_update."""
+    cleaned = cleaned_sparkle_private_key_b64(raw_b64)
+    verify_generate_keys_matches_embedded_public(cleaned)
+    path.write_text(cleaned + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
 
 
 def _rfc822(timestamp: datetime) -> str:
@@ -119,6 +166,7 @@ def _write_one(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verify-env-key", action="store_true")
+    parser.add_argument("--write-key-file", type=Path)
     parser.add_argument("--version")
     parser.add_argument("--release-url")
     parser.add_argument("--download-base-url", default="")
@@ -134,11 +182,24 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
 
-    if args.verify_env_key:
-        raw_b64 = os.environ.get("SPARKLE_ED25519_PRIVATE_KEY", "").strip()
-        if not raw_b64:
+    if args.verify_env_key or args.write_key_file is not None:
+        raw_b64 = os.environ.get("SPARKLE_ED25519_PRIVATE_KEY", "")
+        if not cleaned_sparkle_private_key_b64(raw_b64):
             _fail("SPARKLE_ED25519_PRIVATE_KEY is required to sign Sparkle appcasts.")
         verify_generate_keys_matches_embedded_public(raw_b64)
+        if args.write_key_file is not None:
+            write_cleaned_key_file(args.write_key_file, raw_b64)
+        raw = decode_sparkle_private_key(raw_b64)
+        if public_key_b64_from_private_blob(raw) is None:
+            print(
+                "Sparkle private key is a 32-byte seed; sign_update will validate it.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Sparkle private key matches the public key embedded in the Mac app.",
+                file=sys.stderr,
+            )
         return 0
 
     if not args.version or not args.release_url:

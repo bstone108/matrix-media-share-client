@@ -462,6 +462,7 @@ fi
 
 if is_github_actions_release; then
   # Sparkle sign_update runs only on real releases. PR CI never sees the private key.
+  echo "Signing Sparkle zip with sign_update: ${ARCHIVE_PATH}"
   APPCAST_ARCH="${ARCH}"
   if [[ "${APPCAST_ARCH}" == "amd64" ]]; then
     APPCAST_ARCH="x86_64"
